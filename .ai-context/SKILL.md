@@ -53,4 +53,6 @@ mns report
 
 8 source modules, single binary, no frontend yet (future Svelte 5).
 
+Data flow: `sentiment` → `db` → `strategy` (sell→buy→risk) → `report`
+
 See `references/ARCHITECTURE.md` for details.
