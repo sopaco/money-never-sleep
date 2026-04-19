@@ -295,10 +295,10 @@ async fn cmd_report() -> Result<()> {
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
 
-    // 策略计算
+    // 策略计算（先算风险警告，再算买入建议以实现联动）
     let sell_suggestions = strategy::calculate_sell_suggestions(&config, score, &positions);
-    let buy_suggestion = strategy::calculate_buy_suggestions(&config, score, cash, &positions, &sell_suggestions);
     let risk_warnings = strategy::check_risk_warnings(&config, score, &positions);
+    let buy_suggestion = strategy::calculate_buy_suggestions(&config, score, cash, &positions, &sell_suggestions, &risk_warnings);
 
     // 生成报告
     let report = report::generate_report(

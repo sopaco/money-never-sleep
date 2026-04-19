@@ -36,6 +36,8 @@ impl Position {
 
     /// 年化收益计算，可指定最小持仓天数门槛
     /// 持仓天数不足门槛时不返回年化值，避免短期收益被放大失真
+    /// 正收益：使用复利公式 (current/cost)^(1/years) - 1
+    /// 负收益：使用简单年化 (current/cost - 1) / years，避免复利公式对亏损的过度放大
     pub fn annualized_return_with_min_days(&self, today: &NaiveDate, min_days: i64) -> Option<f64> {
         let cost = self.cost_price;
         let current = self.current_price?;
@@ -51,7 +53,14 @@ impl Position {
             return None;
         }
         let years = days as f64 / 365.0;
-        Some((current / cost).powf(1.0 / years) - 1.0)
+        let ratio = current / cost;
+        if ratio >= 1.0 {
+            // 正收益：复利公式
+            Some(ratio.powf(1.0 / years) - 1.0)
+        } else {
+            // 负收益：简单年化，避免 (0.95)^12 - 1 ≈ -46% 的失真
+            Some((ratio - 1.0) / years)
+        }
     }
 
     /// 绝对收益率 (不考虑时间)

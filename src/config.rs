@@ -18,6 +18,8 @@ pub struct Settings {
     pub annualized_target_low: f64,
     pub annualized_target_high: f64,
     pub min_holding_days: i64,
+    pub min_absolute_profit_days: i64,
+    pub max_contrarian_weight: f64,
     pub report_output_dir: String,
 }
 
@@ -66,6 +68,8 @@ impl AppConfig {
                 annualized_target_low: 10.0,
                 annualized_target_high: 15.0,
                 min_holding_days: 30,
+                min_absolute_profit_days: 90,
+                max_contrarian_weight: 2.0,
                 report_output_dir: "./reports".to_string(),
             },
             allocation: Allocation {
@@ -136,6 +140,9 @@ impl AppConfig {
         }
         if self.settings.min_holding_days < 0 {
             anyhow::bail!("最小持仓天数不能为负数: {}", self.settings.min_holding_days);
+        }
+        if self.settings.max_contrarian_weight < 1.0 {
+            anyhow::bail!("最大逆向权重不能小于 1.0: {}", self.settings.max_contrarian_weight);
         }
         Ok(())
     }
@@ -217,6 +224,8 @@ impl AppConfig {
             "settings.annualized_target_low" => Some(self.settings.annualized_target_low.to_string()),
             "settings.annualized_target_high" => Some(self.settings.annualized_target_high.to_string()),
             "settings.min_holding_days" => Some(self.settings.min_holding_days.to_string()),
+            "settings.min_absolute_profit_days" => Some(self.settings.min_absolute_profit_days.to_string()),
+            "settings.max_contrarian_weight" => Some(self.settings.max_contrarian_weight.to_string()),
             "settings.report_output_dir" => Some(self.settings.report_output_dir.clone()),
             "allocation.us_stocks" => Some(self.allocation.us_stocks.to_string()),
             "allocation.cn_stocks" => Some(self.allocation.cn_stocks.to_string()),
@@ -245,6 +254,8 @@ impl AppConfig {
             "settings.annualized_target_low" => self.settings.annualized_target_low = value.parse()?,
             "settings.annualized_target_high" => self.settings.annualized_target_high = value.parse()?,
             "settings.min_holding_days" => self.settings.min_holding_days = value.parse()?,
+            "settings.min_absolute_profit_days" => self.settings.min_absolute_profit_days = value.parse()?,
+            "settings.max_contrarian_weight" => self.settings.max_contrarian_weight = value.parse()?,
             "settings.report_output_dir" => self.settings.report_output_dir = value.to_string(),
             "allocation.us_stocks" => self.allocation.us_stocks = value.parse()?,
             "allocation.cn_stocks" => self.allocation.cn_stocks = value.parse()?,

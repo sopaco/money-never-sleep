@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::models::Position;
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 
 #[derive(Debug)]
 pub struct BuySuggestion {
@@ -9,6 +9,7 @@ pub struct BuySuggestion {
     pub cn_amount: f64,
     pub counter_amount: f64,
     pub details: Vec<BuyDetail>,
+    pub excluded: Vec<ExcludedFromBuy>,
 }
 
 #[derive(Debug)]
@@ -56,14 +57,25 @@ fn total_sell_proceeds(suggestions: &[SellSuggestion]) -> f64 {
     suggestions.iter().map(|s| s.sell_amount).sum()
 }
 
+/// 买入建议中标记因高浮亏被排除加仓的标的
+#[derive(Debug)]
+pub struct ExcludedFromBuy {
+    pub asset_code: String,
+    pub asset_name: String,
+    pub loss_ratio: f64,
+    pub reason: String,
+}
+
 /// 计算买入建议
 /// sell_proceeds: 卖出建议预计回收的现金，用于实现买卖互感知
+/// risk_warnings: 风险警告列表，高浮亏标的将被排除加仓
 pub fn calculate_buy_suggestions(
     config: &AppConfig,
     score: f64,
     cash_balance: f64,
     positions: &[Position],
     sell_suggestions: &[SellSuggestion],
+    risk_warnings: &[RiskWarning],
 ) -> BuySuggestion {
     // 买入可用现金 = 当前现金 + 卖出回收
     let sell_proceeds = total_sell_proceeds(sell_suggestions);
@@ -81,15 +93,30 @@ pub fn calculate_buy_suggestions(
     let counter_amount = total_amount * cc_ratio;
 
     // 按逆向加权分配：浮亏越多获得越多资金
+    // 高浮亏标的（≥30%）排除加仓，避免"越亏越买"的风险
+    let excluded: Vec<ExcludedFromBuy> = risk_warnings
+        .iter()
+        .filter(|w| w.loss_ratio >= 30.0)
+        .map(|w| ExcludedFromBuy {
+            asset_code: w.asset_code.clone(),
+            asset_name: w.asset_name.clone(),
+            loss_ratio: w.loss_ratio,
+            reason: "浮亏≥30%，暂停逆向加仓以防基本面恶化".to_string(),
+        })
+        .collect();
+    let excluded_codes: Vec<String> = excluded.iter().map(|e| e.asset_code.clone()).collect();
+
     let mut details = Vec::new();
 
     let us_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "us_stocks").collect();
     let cn_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "cn_stocks").collect();
     let cc_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "counter_cyclical").collect();
 
-    details.extend(distribute_amount_contrarian(&us_positions, us_amount));
-    details.extend(distribute_amount_contrarian(&cn_positions, cn_amount));
-    details.extend(distribute_amount_contrarian(&cc_positions, counter_amount));
+    let max_weight = config.settings.max_contrarian_weight;
+
+    details.extend(distribute_amount_contrarian(&us_positions, us_amount, max_weight, &excluded_codes));
+    details.extend(distribute_amount_contrarian(&cn_positions, cn_amount, max_weight, &excluded_codes));
+    details.extend(distribute_amount_contrarian(&cc_positions, counter_amount, max_weight, &excluded_codes));
 
     BuySuggestion {
         total_amount,
@@ -97,32 +124,45 @@ pub fn calculate_buy_suggestions(
         cn_amount,
         counter_amount,
         details,
+        excluded,
     }
 }
 
 /// 逆向加权分配：浮亏/低估的标的获得更多资金
-/// 权重 = max(1.0, cost_price / current_price)，即浮亏越多权重越高
+/// 权重 = min(max_weight, max(1.0, cost_price / current_price))，即浮亏越多权重越高但有上限
 /// 若所有持仓都浮盈，则等额分配
-fn distribute_amount_contrarian(positions: &[&Position], total: f64) -> Vec<BuyDetail> {
+/// excluded_codes: 因高浮亏被排除加仓的标的代码列表
+fn distribute_amount_contrarian(positions: &[&Position], total: f64, max_weight: f64, excluded_codes: &[String]) -> Vec<BuyDetail> {
     if positions.is_empty() || total <= 0.0 {
         return Vec::new();
     }
-    if positions.len() == 1 {
+
+    // 过滤掉被排除的标的
+    let eligible: Vec<&&Position> = positions
+        .iter()
+        .filter(|p| !excluded_codes.contains(&p.asset_code))
+        .collect();
+
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    if eligible.len() == 1 {
         return vec![BuyDetail {
-            asset_code: positions[0].asset_code.clone(),
-            asset_name: positions[0].asset_name.clone(),
+            asset_code: eligible[0].asset_code.clone(),
+            asset_name: eligible[0].asset_name.clone(),
             amount: total,
         }];
     }
 
-    // 计算逆向权重：浮亏的标获得更高权重
-    let weights: Vec<f64> = positions
+    // 计算逆向权重：浮亏的标获得更高权重，但有上限防止过度集中
+    let weights: Vec<f64> = eligible
         .iter()
         .map(|p| {
             match p.current_price {
                 Some(cur) if cur > 0.0 && p.cost_price > 0.0 => {
                     // 浮亏时 cost/cur > 1，浮盈时 < 1，取 max(1.0, ...) 保证浮盈标的也有基础权重
-                    (p.cost_price / cur).max(1.0)
+                    // 限制最大权重防止单标的过度集中
+                    (p.cost_price / cur).max(1.0).min(max_weight)
                 }
                 _ => 1.0, // 无现价时给予等额权重
             }
@@ -132,8 +172,8 @@ fn distribute_amount_contrarian(positions: &[&Position], total: f64) -> Vec<BuyD
     let total_weight: f64 = weights.iter().sum();
     if total_weight <= 0.0 {
         // 等额分配兜底
-        let per = total / positions.len() as f64;
-        return positions
+        let per = total / eligible.len() as f64;
+        return eligible
             .iter()
             .map(|p| BuyDetail {
                 asset_code: p.asset_code.clone(),
@@ -143,7 +183,7 @@ fn distribute_amount_contrarian(positions: &[&Position], total: f64) -> Vec<BuyD
             .collect();
     }
 
-    positions
+    eligible
         .iter()
         .zip(weights.iter())
         .map(|(p, w)| BuyDetail {
@@ -166,6 +206,7 @@ pub fn calculate_sell_suggestions(
 ) -> Vec<SellSuggestion> {
     let today = Local::now().date_naive();
     let min_days = config.settings.min_holding_days;
+    let min_abs_days = config.settings.min_absolute_profit_days;
     let mut suggestions = Vec::new();
 
     for pos in positions {
@@ -176,6 +217,12 @@ pub fn calculate_sell_suggestions(
             Some(p) if p > 0.0 => p,
             _ => continue,
         };
+
+        // 计算持仓天数
+        let holding_days = NaiveDate::parse_from_str(&pos.first_buy_date, "%Y-%m-%d")
+            .ok()
+            .map(|d| (today - d).num_days())
+            .unwrap_or(0);
 
         // 年化收益（含最小天数门槛）
         let ann_ret = pos.annualized_return_with_min_days(&today, min_days);
@@ -189,8 +236,8 @@ pub fn calculate_sell_suggestions(
             let r = config.sell_ratio_for(score, ann * 100.0) / 100.0;
             if r > 0.0 {
                 (r, SellReason::AnnualizedHigh)
-            } else if abs_ret >= 0.30 {
-                // 年化不达标但绝对收益≥30%（长期持有获利），在贪婪及以上环境减仓20%
+            } else if abs_ret >= 0.30 && holding_days >= min_abs_days {
+                // 年化不达标但绝对收益≥30%且持仓足够长（长期持有获利），在贪婪及以上环境减仓
                 if score >= config.thresholds.neutral {
                     (0.20, SellReason::AbsoluteProfit)
                 } else {
@@ -199,8 +246,8 @@ pub fn calculate_sell_suggestions(
             } else {
                 (0.0, SellReason::AnnualizedHigh) // 不触发
             }
-        } else if abs_ret >= 0.30 {
-            // 年化无效（持仓不足门槛天数），但绝对收益≥30%
+        } else if abs_ret >= 0.30 && holding_days >= min_abs_days {
+            // 年化无效（持仓不足门槛天数），但绝对收益≥30%且持仓足够长
             // 根据情绪区间差异化减仓：极度贪婪更多，中性较少
             if score >= config.thresholds.greed {
                 (0.15, SellReason::AbsoluteProfit)
@@ -228,6 +275,8 @@ pub fn calculate_sell_suggestions(
             });
         }
     }
+    // 按绝对收益从高到低排序：优先卖出收益最高的标的以锁定利润
+    suggestions.sort_by(|a, b| b.absolute_return.partial_cmp(&a.absolute_return).unwrap_or(std::cmp::Ordering::Equal));
     suggestions
 }
 

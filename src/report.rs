@@ -160,6 +160,12 @@ pub fn generate_report(
                 report.push_str(&format!("    · {} ({}): ¥{:.2}\n", d.asset_code, d.asset_name, d.amount));
             }
         }
+        if !buy_suggestion.excluded.is_empty() {
+            report.push_str("  以下标的因高浮亏暂停加仓:\n");
+            for e in &buy_suggestion.excluded {
+                report.push_str(&format!("    ✗ {} ({}) — 浮亏 {:.0}%: {}\n", e.asset_code, e.asset_name, e.loss_ratio, e.reason));
+            }
+        }
     } else {
         report.push_str("  当前市场情绪偏高，建议暂停买入。\n");
         report.push_str("  可用资金继续持有，等待市场回调。\n");
@@ -221,22 +227,35 @@ pub fn generate_report(
     }
 
     let zones = [
-        ("恐慌", config.thresholds.fear, config.buy_ratio.fear),
         ("极度恐慌", config.thresholds.extreme_fear, config.buy_ratio.extreme_fear),
+        ("恐慌", config.thresholds.fear, config.buy_ratio.fear),
+        ("中性", config.thresholds.neutral, config.buy_ratio.neutral),
+        ("贪婪", config.thresholds.greed, config.buy_ratio.greed),
     ];
 
-    for (name, threshold, ratio) in &zones {
+    for (i, (name, threshold, ratio)) in zones.iter().enumerate() {
         let amount = effective_cash_for_plan * (ratio / 100.0);
-        if amount > 0.0 {
+        // 极度恐慌: 指数 < threshold; 其他: 指数 < threshold 的该区间
+        let threshold_desc = if i == 0 {
+            format!("指数 < {:.0}", threshold)
+        } else {
+            format!("{:.0} ≤ 指数 < {:.0}", zones[i - 1].1, threshold)
+        };
+        if *ratio > 0.0 {
             report.push_str(&format!(
-                "  · {}   (指数 < {:.0}): 投入 ¥{:.2} ({:.0}%)\n",
-                name, threshold, amount, ratio
+                "  · {}   ({}): 投入 ¥{:.2} ({:.0}%)\n",
+                name, threshold_desc, amount, ratio
             ));
             report.push_str(&format!(
                 "    - 美股 ¥{:.2} | A股 ¥{:.2} | 逆周期 ¥{:.2}\n",
                 amount * config.allocation.us_stocks / 100.0,
                 amount * config.allocation.cn_stocks / 100.0,
                 amount * config.allocation.counter_cyclical / 100.0,
+            ));
+        } else {
+            report.push_str(&format!(
+                "  · {}   ({}): 暂停买入，持有观望\n",
+                name, threshold_desc
             ));
         }
     }
