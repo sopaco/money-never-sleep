@@ -6,7 +6,7 @@
 
 ## What
 
-MNS (Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fear & Greed Index, analyzes portfolio positions against annual return targets, and generates daily buy/sell recommendations as text reports.
+MNS (Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fear & Greed Index, analyzes portfolio positions against return targets, and generates daily buy/sell recommendations as text reports.
 
 ## Why
 
@@ -22,7 +22,8 @@ MNS (Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fea
 2. **Reads** current cash balance, positions, and cost basis from SQLite
 3. **Calculates** buy/sell suggestions based on:
    - Fear & Greed zone → how much cash to deploy
-   - Annualized return vs 10%/15% targets → whether to take profit
+   - Annualized return (with min holding days threshold) vs 10%/15% targets → whether to take profit
+   - Absolute return ≥ 30% → long-term profit-taking even if annualized is below target
 4. **Outputs** a text report to `reports/YYYY-MM-DD.txt`
 
 ## What It Does NOT Do
@@ -34,6 +35,8 @@ MNS (Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fea
 ## Core Design Principles
 
 - **Single binary** — no runtime dependencies, portable
-- **SQLite for state** — portable, zero-config
+- **SQLite for state** — portable, zero-config, transactional
 - **TOML for config** — human-editable, no special tooling
 - **Text reports** — machine-readable, future-proof, zero coupling with push systems
+- **Contrarian weighting** — buy distribution favors underwater positions over winners
+- **Buy/sell aware** — sell proceeds flow into buy suggestions for net operation guidance

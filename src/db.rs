@@ -75,6 +75,9 @@ impl Database {
     }
 
     pub fn set_cash_balance(&self, amount: f64) -> Result<()> {
+        if amount < 0.0 {
+            anyhow::bail!("现金余额不能为负数: {}", amount);
+        }
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.conn.execute(
             "UPDATE cash SET balance = ?, updated_at = ? WHERE id = 1",
@@ -84,6 +87,9 @@ impl Database {
     }
 
     pub fn add_cash(&self, amount: f64) -> Result<f64> {
+        if amount <= 0.0 {
+            anyhow::bail!("增加现金金额必须为正数: {}", amount);
+        }
         let balance = self.get_cash_balance()?;
         let new_balance = balance + amount;
         self.set_cash_balance(new_balance)?;
@@ -153,6 +159,13 @@ impl Database {
     }
 
     pub fn buy_position(&self, code: &str, shares: f64, price: f64) -> Result<()> {
+        if shares <= 0.0 {
+            anyhow::bail!("买入份额必须为正数");
+        }
+        if price <= 0.0 {
+            anyhow::bail!("买入价格必须为正数");
+        }
+
         let pos = self
             .get_position(code)?
             .with_context(|| format!("未找到资产: {}", code))?;
@@ -160,6 +173,12 @@ impl Database {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let today = Local::now().format("%Y-%m-%d").to_string();
         let amount = shares * price;
+
+        // 先检查现金余额
+        let balance = self.get_cash_balance()?;
+        if balance < amount {
+            anyhow::bail!("现金余额不足: 当前 ¥{:.2}, 需要 ¥{:.2}", balance, amount);
+        }
 
         // 更新持仓：加权平均成本
         let old_total = pos.shares * pos.cost_price;
@@ -176,55 +195,74 @@ impl Database {
             pos.first_buy_date.clone()
         };
 
-        self.conn.execute(
+        // 使用事务保证原子性
+        let tx = self.conn.unchecked_transaction()
+            .with_context(|| "开启事务失败")?;
+
+        tx.execute(
             "UPDATE positions SET shares = ?, cost_price = ?, current_price = ?, first_buy_date = ?, updated_at = ? WHERE asset_code = ?",
             params![new_shares, new_cost_price, price, first_buy_date, now, code],
         )?;
 
-        // 扣减现金
-        let balance = self.get_cash_balance()?;
-        if balance < amount {
-            anyhow::bail!("现金余额不足: 当前 ¥{:.2}, 需要 ¥{:.2}", balance, amount);
-        }
-        self.set_cash_balance(balance - amount)?;
+        tx.execute(
+            "UPDATE cash SET balance = ?, updated_at = ? WHERE id = 1",
+            params![balance - amount, now],
+        )?;
 
-        // 记录交易
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date) VALUES ('buy', ?, ?, ?, ?, ?)",
             params![code, shares, price, amount, today],
         )?;
+
+        tx.commit().with_context(|| "提交事务失败")?;
 
         Ok(())
     }
 
     pub fn sell_position(&self, code: &str, shares: f64, price: f64) -> Result<()> {
+        if shares <= 0.0 {
+            anyhow::bail!("卖出份额必须为正数");
+        }
+        if price <= 0.0 {
+            anyhow::bail!("卖出价格必须为正数");
+        }
+
         let pos = self
             .get_position(code)?
             .with_context(|| format!("未找到资产: {}", code))?;
 
-        if shares > pos.shares {
+        if shares > pos.shares + 1e-6 {
             anyhow::bail!("卖出份额超出持有量: 持有 {:.2}, 欲卖 {:.2}", pos.shares, shares);
         }
 
+        let actual_shares = shares.min(pos.shares); // 防止浮点误差
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let today = Local::now().format("%Y-%m-%d").to_string();
-        let amount = shares * price;
-        let new_shares = pos.shares - shares;
+        let amount = actual_shares * price;
+        let new_shares = pos.shares - actual_shares;
 
-        self.conn.execute(
+        let balance = self.get_cash_balance()?;
+
+        // 使用事务保证原子性
+        let tx = self.conn.unchecked_transaction()
+            .with_context(|| "开启事务失败")?;
+
+        tx.execute(
             "UPDATE positions SET shares = ?, current_price = ?, updated_at = ? WHERE asset_code = ?",
             params![new_shares, price, now, code],
         )?;
 
-        // 回收现金
-        let balance = self.get_cash_balance()?;
-        self.set_cash_balance(balance + amount)?;
-
-        // 记录交易
-        self.conn.execute(
-            "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date) VALUES ('sell', ?, ?, ?, ?, ?)",
-            params![code, shares, price, amount, today],
+        tx.execute(
+            "UPDATE cash SET balance = ?, updated_at = ? WHERE id = 1",
+            params![balance + amount, now],
         )?;
+
+        tx.execute(
+            "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date) VALUES ('sell', ?, ?, ?, ?, ?)",
+            params![code, actual_shares, price, amount, today],
+        )?;
+
+        tx.commit().with_context(|| "提交事务失败")?;
 
         Ok(())
     }
@@ -280,6 +318,11 @@ impl Database {
     ) -> Result<()> {
         let today = Local::now().format("%Y-%m-%d").to_string();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // 同一天只保留最新快照：先删除当天已有记录，再插入
+        self.conn.execute(
+            "DELETE FROM fear_greed_snapshots WHERE snapshot_date = ?",
+            params![today],
+        )?;
         self.conn.execute(
             "INSERT INTO fear_greed_snapshots (score, rating, snapshot_date, previous_close, previous_1_week, previous_1_month, previous_1_year, fetched_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -288,6 +331,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_latest_snapshot(&self) -> Result<Option<FearGreedSnapshot>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, score, rating, snapshot_date, previous_close, previous_1_week, previous_1_month, previous_1_year, fetched_at

@@ -57,19 +57,19 @@
 
 ---
 
-## Decision 6: Annualized return as the sell trigger metric
+## Decision 6: Annualized return as the primary sell trigger, with min holding days guard
 
 **Context**: Needed a way to determine if a position has "earned enough" to take profit.
-**Choice**: `annualized = (current_price / cost_price) ^ (365 / holding_days) - 1`
+**Choice**: `annualized = (current_price / cost_price) ^ (365 / holding_days) - 1`, with `min_holding_days` threshold (default 30).
 **Rationale**:
 - Normalizes across positions held for different lengths
 - Directly maps to the user's 10%-15% annual target
-- Hard to game (market-beating short-term gains still show low annualization if held briefly)
-**Trade-off**: Breaks down for very short holding periods (< 30 days) — results flagged as N/A.
+- Min days threshold prevents short-term noise from triggering extreme sell suggestions
+**Trade-off**: Positions held < 30 days show N/A for annualized — but absolute return still available as fallback.
 
 ---
 
-## Decision 7: Two-dimensional sell matrix (zone × return)
+## Decision 7: Two-dimensional sell matrix (zone × return), 3×3
 
 **Context**: Simple "sell when greedy" is too blunt. Need to consider both market sentiment AND whether the position has actually earned its target return.
 
@@ -80,16 +80,62 @@
 Extreme Greed    50%          30%        20%
 Greed            40%          20%         0% (hold)
 Neutral          30%          0%         0% (hold)
+Fear/EFear       0%           0%         0% (hold)
 ```
 
-**Rationale**: Backtested against 2016-2025 data — this combination outperformed simple fear/greed binary.
+**Rationale**: Full 3-zone matrix (neutral/greed/extreme_greed) matches PRD spec. Fear zones never trigger sell — contrarian strategy holds through fear.
 **Trade-off**: More parameters to tune. User can adjust via config.
 
 ---
 
-## Decision 8:浮亏 > 20% triggers warning, NOT automatic sell
+## Decision 8: Absolute return ≥ 30% as secondary sell trigger
+
+**Context**: A position held 5 years may have 50% absolute gain but only 8.4% annualized — below the 10% target. It should still be a candidate for profit-taking.
+**Choice**: If absolute return ≥ 30%, trigger sell in greedy environments even if annualized is below target.
+**Rationale**: Long-term positions with substantial unrealized gains deserve protection regardless of annualized rate.
+**Trade-off**: Hardcoded 30% threshold (could be made configurable).
+
+---
+
+## Decision 9: Contrarian buy distribution over market-value-weighted
+
+**Context**: Original code distributed buy funds proportional to market value — winners got more, losers got less.
+**Choice**: Use contrarian weighting: `weight = max(1.0, cost_price / current_price)`.
+**Rationale**:
+- Underwater positions get more funds (higher weight), aligning with contrarian philosophy
+- Market-value weighting created a "winner-take-more" effect contradicting the strategy
+- Equal minimum weight (1.0) ensures winning positions still get some allocation
+**Trade-off**: May over-allocate to fundamentally broken positions — user must review risk warnings.
+
+---
+
+## Decision 10: Sell-first, buy-second pipeline with proceeds awareness
+
+**Context**: Original code computed buy and sell independently — same day could show "buy ¥50k" and "sell 40%" with no connection.
+**Choice**: Compute sell suggestions first, then pass sell proceeds into buy calculation.
+**Rationale**:
+- Available cash for buying = current balance + sell proceeds
+- Report shows net operation direction (net buy / net sell / hold)
+- More realistic view of what the user would actually do today
+**Trade-off**: Slightly more complex pipeline order (must compute sell before buy).
+
+---
+
+## Decision 11: 浮亏 > 20% triggers sentiment-aware warning, NOT automatic sell
 
 **Context**: Contrarian strategy means buying during fear — positions may go negative before recovering.
-**Choice**: Only warn, never auto-sell.
-**Rationale**: Selling at -20% locks in losses. The tool's whole purpose is to help user resist panic selling.
+**Choice**: Only warn, never auto-sell. Warning advice varies by market zone:
+- Fear: "可能是加仓机会" (consider buying more)
+- Neutral: "审视基本面" (review fundamentals)
+- Greed: "紧急审视" (urgent review — market up but this position is down)
+**Rationale**: Selling at -20% locks in losses. Different sentiment contexts require different responses.
 **Trade-off**: If a position's fundamentals deteriorate, the user still needs to manually decide to exit.
+
+---
+
+## Decision 12: SQLite transactions for buy/sell operations
+
+**Context**: Original `buy_position()` and `sell_position()` executed 3 separate SQL statements without transaction — crash between steps could corrupt data.
+**Choice**: Wrap all DB operations in `unchecked_transaction()`.
+**Rationale**: Atomicity guarantee — either all changes commit or none do.
+**Trade-off**: Minimal performance impact for a single-user CLI tool.

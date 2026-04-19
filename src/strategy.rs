@@ -22,10 +22,18 @@ pub struct BuyDetail {
 pub struct SellSuggestion {
     pub asset_code: String,
     pub asset_name: String,
-    pub annualized_return: f64,
+    pub annualized_return: Option<f64>,
+    pub absolute_return: f64,
     pub sell_ratio: f64,
     pub sell_shares: f64,
     pub sell_amount: f64,
+    pub reason: SellReason,
+}
+
+#[derive(Debug)]
+pub enum SellReason {
+    AnnualizedHigh,      // 年化收益达标
+    AbsoluteProfit,      // 绝对收益足够，长期持有获利了结
 }
 
 #[derive(Debug)]
@@ -33,17 +41,36 @@ pub struct RiskWarning {
     pub asset_code: String,
     pub asset_name: String,
     pub loss_ratio: f64,
+    pub advice: RiskAdvice,
+}
+
+#[derive(Debug)]
+pub enum RiskAdvice {
+    ConsiderBuyMore,  // 恐慌环境下浮亏，可能是加仓机会
+    ReviewFundamentals, // 中性环境下浮亏，审视基本面
+    UrgentReview,      // 贪婪环境下浮亏，需要紧急审视
+}
+
+/// 计算卖出建议后回收的现金总额
+fn total_sell_proceeds(suggestions: &[SellSuggestion]) -> f64 {
+    suggestions.iter().map(|s| s.sell_amount).sum()
 }
 
 /// 计算买入建议
+/// sell_proceeds: 卖出建议预计回收的现金，用于实现买卖互感知
 pub fn calculate_buy_suggestions(
     config: &AppConfig,
     score: f64,
     cash_balance: f64,
     positions: &[Position],
+    sell_suggestions: &[SellSuggestion],
 ) -> BuySuggestion {
+    // 买入可用现金 = 当前现金 + 卖出回收
+    let sell_proceeds = total_sell_proceeds(sell_suggestions);
+    let available_cash = cash_balance + sell_proceeds;
+
     let ratio = config.buy_ratio_for(score) / 100.0;
-    let total_amount = cash_balance * ratio;
+    let total_amount = available_cash * ratio;
 
     let us_ratio = config.allocation.us_stocks / 100.0;
     let cn_ratio = config.allocation.cn_stocks / 100.0;
@@ -53,16 +80,16 @@ pub fn calculate_buy_suggestions(
     let cn_amount = total_amount * cn_ratio;
     let counter_amount = total_amount * cc_ratio;
 
-    // 按类别内持仓的市值比例分配
+    // 按逆向加权分配：浮亏越多获得越多资金
     let mut details = Vec::new();
 
     let us_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "us_stocks").collect();
     let cn_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "cn_stocks").collect();
     let cc_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "counter_cyclical").collect();
 
-    details.extend(distribute_amount(&us_positions, us_amount));
-    details.extend(distribute_amount(&cn_positions, cn_amount));
-    details.extend(distribute_amount(&cc_positions, counter_amount));
+    details.extend(distribute_amount_contrarian(&us_positions, us_amount));
+    details.extend(distribute_amount_contrarian(&cn_positions, cn_amount));
+    details.extend(distribute_amount_contrarian(&cc_positions, counter_amount));
 
     BuySuggestion {
         total_amount,
@@ -73,7 +100,10 @@ pub fn calculate_buy_suggestions(
     }
 }
 
-fn distribute_amount(positions: &[&Position], total: f64) -> Vec<BuyDetail> {
+/// 逆向加权分配：浮亏/低估的标的获得更多资金
+/// 权重 = max(1.0, cost_price / current_price)，即浮亏越多权重越高
+/// 若所有持仓都浮盈，则等额分配
+fn distribute_amount_contrarian(positions: &[&Position], total: f64) -> Vec<BuyDetail> {
     if positions.is_empty() || total <= 0.0 {
         return Vec::new();
     }
@@ -84,10 +114,24 @@ fn distribute_amount(positions: &[&Position], total: f64) -> Vec<BuyDetail> {
             amount: total,
         }];
     }
-    // 按市值比例分配
-    let total_mv: f64 = positions.iter().map(|p| p.market_value()).sum();
-    if total_mv <= 0.0 {
-        // 等额分配
+
+    // 计算逆向权重：浮亏的标获得更高权重
+    let weights: Vec<f64> = positions
+        .iter()
+        .map(|p| {
+            match p.current_price {
+                Some(cur) if cur > 0.0 && p.cost_price > 0.0 => {
+                    // 浮亏时 cost/cur > 1，浮盈时 < 1，取 max(1.0, ...) 保证浮盈标的也有基础权重
+                    (p.cost_price / cur).max(1.0)
+                }
+                _ => 1.0, // 无现价时给予等额权重
+            }
+        })
+        .collect();
+
+    let total_weight: f64 = weights.iter().sum();
+    if total_weight <= 0.0 {
+        // 等额分配兜底
         let per = total / positions.len() as f64;
         return positions
             .iter()
@@ -98,23 +142,30 @@ fn distribute_amount(positions: &[&Position], total: f64) -> Vec<BuyDetail> {
             })
             .collect();
     }
+
     positions
         .iter()
-        .map(|p| BuyDetail {
+        .zip(weights.iter())
+        .map(|(p, w)| BuyDetail {
             asset_code: p.asset_code.clone(),
             asset_name: p.asset_name.clone(),
-            amount: total * (p.market_value() / total_mv),
+            amount: total * (w / total_weight),
         })
         .collect()
 }
 
 /// 计算卖出建议
+/// 改进：
+/// 1. 使用最小持仓天数门槛，避免短期年化失真触发卖出
+/// 2. 增加绝对收益考量：长期持有绝对收益超30%也可止盈
+/// 3. 中性区间按PRD矩阵补齐
 pub fn calculate_sell_suggestions(
     config: &AppConfig,
     score: f64,
     positions: &[Position],
 ) -> Vec<SellSuggestion> {
     let today = Local::now().date_naive();
+    let min_days = config.settings.min_holding_days;
     let mut suggestions = Vec::new();
 
     for pos in positions {
@@ -126,12 +177,42 @@ pub fn calculate_sell_suggestions(
             _ => continue,
         };
 
-        let ann_ret = match pos.annualized_return(&today) {
-            Some(r) => r,
-            None => continue,
+        // 年化收益（含最小天数门槛）
+        let ann_ret = pos.annualized_return_with_min_days(&today, min_days);
+
+        // 绝对收益（不受天数限制）
+        let abs_ret = pos.absolute_return().unwrap_or(0.0);
+
+        // 判断是否触发卖出
+        let (ratio, reason) = if let Some(ann) = ann_ret {
+            // 年化收益有效，按矩阵判断
+            let r = config.sell_ratio_for(score, ann * 100.0) / 100.0;
+            if r > 0.0 {
+                (r, SellReason::AnnualizedHigh)
+            } else if abs_ret >= 0.30 {
+                // 年化不达标但绝对收益≥30%（长期持有获利），在贪婪及以上环境减仓20%
+                if score >= config.thresholds.neutral {
+                    (0.20, SellReason::AbsoluteProfit)
+                } else {
+                    (0.0, SellReason::AnnualizedHigh) // 不触发
+                }
+            } else {
+                (0.0, SellReason::AnnualizedHigh) // 不触发
+            }
+        } else if abs_ret >= 0.30 {
+            // 年化无效（持仓不足门槛天数），但绝对收益≥30%
+            // 根据情绪区间差异化减仓：极度贪婪更多，中性较少
+            if score >= config.thresholds.greed {
+                (0.15, SellReason::AbsoluteProfit)
+            } else if score >= config.thresholds.neutral {
+                (0.10, SellReason::AbsoluteProfit)
+            } else {
+                continue;
+            }
+        } else {
+            continue;
         };
 
-        let ratio = config.sell_ratio_for(score, ann_ret * 100.0) / 100.0;
         if ratio > 0.0 {
             let sell_shares = pos.shares * ratio;
             let sell_amount = sell_shares * current;
@@ -139,9 +220,11 @@ pub fn calculate_sell_suggestions(
                 asset_code: pos.asset_code.clone(),
                 asset_name: pos.asset_name.clone(),
                 annualized_return: ann_ret,
+                absolute_return: abs_ret,
                 sell_ratio: ratio * 100.0,
                 sell_shares,
                 sell_amount,
+                reason,
             });
         }
     }
@@ -149,7 +232,8 @@ pub fn calculate_sell_suggestions(
 }
 
 /// 检查风险警告（浮亏超 20%）
-pub fn check_risk_warnings(positions: &[Position]) -> Vec<RiskWarning> {
+/// 改进：结合市场情绪给出差异化建议
+pub fn check_risk_warnings(config: &AppConfig, score: f64, positions: &[Position]) -> Vec<RiskWarning> {
     let mut warnings = Vec::new();
     for pos in positions {
         if pos.shares <= 0.0 || pos.cost_price <= 0.0 {
@@ -158,10 +242,21 @@ pub fn check_risk_warnings(positions: &[Position]) -> Vec<RiskWarning> {
         if let Some(current) = pos.current_price {
             let ratio = current / pos.cost_price;
             if ratio < 0.8 {
+                let advice = if score < config.thresholds.fear {
+                    // 恐慌环境下浮亏，可能是加仓机会
+                    RiskAdvice::ConsiderBuyMore
+                } else if score < config.thresholds.neutral {
+                    // 中性环境下浮亏，审视基本面
+                    RiskAdvice::ReviewFundamentals
+                } else {
+                    // 贪婪环境下浮亏，需要紧急审视（别人赚钱你还在亏）
+                    RiskAdvice::UrgentReview
+                };
                 warnings.push(RiskWarning {
                     asset_code: pos.asset_code.clone(),
                     asset_name: pos.asset_name.clone(),
                     loss_ratio: (1.0 - ratio) * 100.0,
+                    advice,
                 });
             }
         }

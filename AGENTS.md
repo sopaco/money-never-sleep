@@ -76,8 +76,27 @@ Use dot-path strings like `thresholds.fear`, `buy_ratio.extreme_fear` — these 
 
 ### Annualized return formula
 `annualized = (current / cost) ^ (365 / holding_days) - 1`
-- `Position::annualized_return()` returns a decimal (e.g. `0.185` for 18.5%)
+- `Position::annualized_return_with_min_days(today, min_days)` — uses `settings.min_holding_days` threshold to avoid short-term distortion
+- `Position::annualized_return(today)` — no minimum days, kept as general API
+- `Position::absolute_return()` — simple `(current - cost) / cost`, used for long-term profit-taking
 - `config::sell_ratio_for()` expects percentage (e.g. `18.5`)
+
+### Strategy engine pipeline
+`strategy` module computes in this order:
+1. `calculate_sell_suggestions()` — sell first
+2. `calculate_buy_suggestions()` — buy uses `available_cash = cash + sell_proceeds` (buy/sell aware)
+3. `check_risk_warnings()` — risk warnings with sentiment-aware advice
+
+### Buy distribution: contrarian weighting
+`distribute_amount_contrarian()` assigns more funds to underwater positions:
+- Weight = `max(1.0, cost_price / current_price)` — losing positions get higher weight
+- Winning positions get weight 1.0 (baseline)
+- This aligns with contrarian strategy (buy more when price is below cost)
+
+### Sell decision: dual-criteria
+Sell suggestions consider both:
+1. **Annualized return** (with min holding days threshold) → PRD matrix
+2. **Absolute return** ≥ 30% → long-term profit-taking even if annualized is low
 
 ### Error handling
 Use `anyhow::Result<()>` for command handlers. Use `anyhow::bail!("message")` for user-facing errors.

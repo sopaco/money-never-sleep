@@ -17,6 +17,7 @@ pub struct AppConfig {
 pub struct Settings {
     pub annualized_target_low: f64,
     pub annualized_target_high: f64,
+    pub min_holding_days: i64,
     pub report_output_dir: String,
 }
 
@@ -50,6 +51,7 @@ pub struct SellRatio {
     pub extreme_greed_below_target: f64,
     pub greed_target_high: f64,
     pub greed_target_low: f64,
+    pub neutral_target_high: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +65,7 @@ impl AppConfig {
             settings: Settings {
                 annualized_target_low: 10.0,
                 annualized_target_high: 15.0,
+                min_holding_days: 30,
                 report_output_dir: "./reports".to_string(),
             },
             allocation: Allocation {
@@ -88,6 +91,7 @@ impl AppConfig {
                 extreme_greed_below_target: 20.0,
                 greed_target_high: 40.0,
                 greed_target_low: 20.0,
+                neutral_target_high: 30.0,
             },
             api: ApiConfig {
                 fear_greed_url: "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -113,7 +117,27 @@ impl AppConfig {
         let path = Self::config_path()?;
         let content = fs::read_to_string(&path)
             .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
-        toml::from_str(&content).with_context(|| "解析配置文件失败")
+        let config: AppConfig = toml::from_str(&content).with_context(|| "解析配置文件失败")?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 校验配置合法性
+    pub fn validate(&self) -> Result<()> {
+        let alloc_sum = self.allocation.us_stocks + self.allocation.cn_stocks + self.allocation.counter_cyclical;
+        if (alloc_sum - 100.0).abs() > 0.01 {
+            anyhow::bail!(
+                "资产配置比例之和必须为 100%，当前: 美股{}% + A股{}% + 逆周期{}% = {}%",
+                self.allocation.us_stocks,
+                self.allocation.cn_stocks,
+                self.allocation.counter_cyclical,
+                alloc_sum
+            );
+        }
+        if self.settings.min_holding_days < 0 {
+            anyhow::bail!("最小持仓天数不能为负数: {}", self.settings.min_holding_days);
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -148,8 +172,10 @@ impl AppConfig {
             self.buy_ratio.fear
         } else if score < self.thresholds.neutral {
             self.buy_ratio.neutral
-        } else {
+        } else if score < self.thresholds.greed {
             self.buy_ratio.greed
+        } else {
+            0.0 // 极度贪婪时暂停买入
         }
     }
 
@@ -173,6 +199,13 @@ impl AppConfig {
             } else {
                 0.0
             }
+        } else if score >= self.thresholds.fear {
+            // 中性
+            if annualized >= self.settings.annualized_target_high {
+                self.sell_ratio.neutral_target_high
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -183,6 +216,7 @@ impl AppConfig {
         match key {
             "settings.annualized_target_low" => Some(self.settings.annualized_target_low.to_string()),
             "settings.annualized_target_high" => Some(self.settings.annualized_target_high.to_string()),
+            "settings.min_holding_days" => Some(self.settings.min_holding_days.to_string()),
             "settings.report_output_dir" => Some(self.settings.report_output_dir.clone()),
             "allocation.us_stocks" => Some(self.allocation.us_stocks.to_string()),
             "allocation.cn_stocks" => Some(self.allocation.cn_stocks.to_string()),
@@ -200,6 +234,7 @@ impl AppConfig {
             "sell_ratio.extreme_greed_below_target" => Some(self.sell_ratio.extreme_greed_below_target.to_string()),
             "sell_ratio.greed_target_high" => Some(self.sell_ratio.greed_target_high.to_string()),
             "sell_ratio.greed_target_low" => Some(self.sell_ratio.greed_target_low.to_string()),
+            "sell_ratio.neutral_target_high" => Some(self.sell_ratio.neutral_target_high.to_string()),
             "api.fear_greed_url" => Some(self.api.fear_greed_url.clone()),
             _ => None,
         }
@@ -209,6 +244,7 @@ impl AppConfig {
         match key {
             "settings.annualized_target_low" => self.settings.annualized_target_low = value.parse()?,
             "settings.annualized_target_high" => self.settings.annualized_target_high = value.parse()?,
+            "settings.min_holding_days" => self.settings.min_holding_days = value.parse()?,
             "settings.report_output_dir" => self.settings.report_output_dir = value.to_string(),
             "allocation.us_stocks" => self.allocation.us_stocks = value.parse()?,
             "allocation.cn_stocks" => self.allocation.cn_stocks = value.parse()?,
@@ -226,6 +262,7 @@ impl AppConfig {
             "sell_ratio.extreme_greed_below_target" => self.sell_ratio.extreme_greed_below_target = value.parse()?,
             "sell_ratio.greed_target_high" => self.sell_ratio.greed_target_high = value.parse()?,
             "sell_ratio.greed_target_low" => self.sell_ratio.greed_target_low = value.parse()?,
+            "sell_ratio.neutral_target_high" => self.sell_ratio.neutral_target_high = value.parse()?,
             "api.fear_greed_url" => self.api.fear_greed_url = value.to_string(),
             _ => anyhow::bail!("未知的配置项: {}", key),
         }

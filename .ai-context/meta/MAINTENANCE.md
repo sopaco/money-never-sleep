@@ -23,7 +23,7 @@
 
 ## Token Budget
 
-Total should stay under ~3500 tokens across all files. If approaching limit:
+Total should stay under ~4000 tokens across all files. If approaching limit:
 - Trim `ARCHITECTURE.md` detail
 - Move rarely-used details to code comments (link to file instead)
 - Keep `DYNAMICS.md` lean — only current state

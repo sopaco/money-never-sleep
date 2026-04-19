@@ -1,6 +1,7 @@
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Position {
     pub id: i64,
     pub asset_code: String,
@@ -14,11 +15,28 @@ pub struct Position {
 }
 
 impl Position {
-    pub fn market_value(&self) -> f64 {
-        self.current_price.unwrap_or(0.0) * self.shares
+    /// 持仓市值，无现价时返回 None
+    #[allow(dead_code)]
+    pub fn market_value(&self) -> Option<f64> {
+        self.current_price.map(|p| p * self.shares)
     }
 
+    /// 持仓市值，无现价时使用成本价估算（用于总资产等不可缺失场景）
+    pub fn market_value_or_cost(&self) -> f64 {
+        self.current_price
+            .map(|p| p * self.shares)
+            .unwrap_or(self.cost_price * self.shares)
+    }
+
+    /// 年化收益（无最小天数限制），保留作为通用 API
+    #[allow(dead_code)]
     pub fn annualized_return(&self, today: &NaiveDate) -> Option<f64> {
+        self.annualized_return_with_min_days(today, 0)
+    }
+
+    /// 年化收益计算，可指定最小持仓天数门槛
+    /// 持仓天数不足门槛时不返回年化值，避免短期收益被放大失真
+    pub fn annualized_return_with_min_days(&self, today: &NaiveDate, min_days: i64) -> Option<f64> {
         let cost = self.cost_price;
         let current = self.current_price?;
         if cost <= 0.0 || current <= 0.0 {
@@ -29,12 +47,26 @@ impl Position {
         if days <= 0 {
             return None;
         }
+        if days < min_days {
+            return None;
+        }
         let years = days as f64 / 365.0;
         Some((current / cost).powf(1.0 / years) - 1.0)
+    }
+
+    /// 绝对收益率 (不考虑时间)
+    pub fn absolute_return(&self) -> Option<f64> {
+        let cost = self.cost_price;
+        let current = self.current_price?;
+        if cost <= 0.0 {
+            return None;
+        }
+        Some((current - cost) / cost)
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Transaction {
     pub id: i64,
     pub tx_type: String,
@@ -47,6 +79,7 @@ pub struct Transaction {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FearGreedSnapshot {
     pub id: i64,
     pub score: f64,
@@ -65,6 +98,7 @@ pub struct FearGreedResponse {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct FearGreedData {
     pub score: f64,
     pub rating: String,

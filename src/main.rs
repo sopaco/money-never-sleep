@@ -90,6 +90,9 @@ fn cmd_cash() -> Result<()> {
 }
 
 fn cmd_cash_set(amount: f64) -> Result<()> {
+    if amount < 0.0 {
+        anyhow::bail!("现金余额不能为负数: {}", amount);
+    }
     let db = db::Database::open()?;
     db.set_cash_balance(amount)?;
     println!("✓ 现金余额已设置为: ¥{:.2}", amount);
@@ -115,6 +118,7 @@ fn cmd_portfolio() -> Result<()> {
     }
 
     let today = chrono::Local::now().date_naive();
+    let min_days = config.settings.min_holding_days;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
@@ -126,14 +130,19 @@ fn cmd_portfolio() -> Result<()> {
         Cell::new("现价"),
         Cell::new("市值"),
         Cell::new("年化收益"),
+        Cell::new("绝对收益"),
     ]);
 
     let mut total_mv = 0.0;
     for pos in &positions {
-        let mv = pos.market_value();
+        let mv = pos.market_value_or_cost();
         total_mv += mv;
-        let ann = pos.annualized_return(&today);
+        let ann = pos.annualized_return_with_min_days(&today, min_days);
         let ann_str = match ann {
+            Some(r) => format!("{:+.1}%", r * 100.0),
+            None => "N/A".to_string(),
+        };
+        let abs_str = match pos.absolute_return() {
             Some(r) => format!("{:+.1}%", r * 100.0),
             None => "N/A".to_string(),
         };
@@ -164,6 +173,7 @@ fn cmd_portfolio() -> Result<()> {
             Cell::new(price_str),
             Cell::new(format!("¥{:.2}", mv)),
             ann_cell,
+            Cell::new(&abs_str),
         ]);
     }
 
@@ -286,9 +296,9 @@ async fn cmd_report() -> Result<()> {
     let positions = db.list_positions()?;
 
     // 策略计算
-    let buy_suggestion = strategy::calculate_buy_suggestions(&config, score, cash, &positions);
     let sell_suggestions = strategy::calculate_sell_suggestions(&config, score, &positions);
-    let risk_warnings = strategy::check_risk_warnings(&positions);
+    let buy_suggestion = strategy::calculate_buy_suggestions(&config, score, cash, &positions, &sell_suggestions);
+    let risk_warnings = strategy::check_risk_warnings(&config, score, &positions);
 
     // 生成报告
     let report = report::generate_report(
