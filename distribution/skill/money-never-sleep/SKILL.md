@@ -14,31 +14,31 @@ description: |
   Triggers include: "管理投资组合", "生成策略建议", "获取市场报告", "查看持仓收益",
   "更新现金余额", "记录买入卖出", "查看恐贪指数", "投资组合再平衡", "MNS 报告"
 license: MIT
-compatibility: Requires Node.js runtime. Prebuilt binaries available for darwin-arm64, linux-x64, win-x64. Access to local SQLite database at ~/.mns/mns.db.
+compatibility: Requires Node.js 18+ or Bun.
 metadata:
-  version: "0.5.5"
-  author: "Sopaco"
-  language: "rust"
-  platform: "cli"
-  binary_distribution: "npm"
-  security_verified: "ClawHub Security Verified"
-  source_code: "https://github.com/sopaco/money-never-sleep"
+  {
+    "openclaw":
+      {
+        "requires": { "anyBins": ["npx", "bunx", "npm", "bun"] },
+        "source": "https://github.com/sopaco/money-never-sleep",
+        "homepage": "https://github.com/sopaco/money-never-sleep",
+        "author": "Sopaco",
+        "os": ["darwin", "linux", "win32"]
+      }
+  }
 ---
 
 # MNS CLI 投资管理 Skill
 
 ## 概述
 
-本 skill 为 autonomous agents 提供 MNS 逆向投资策略的 CLI 操作能力。MNS 是基于 CNN Fear & Greed Index 情绪指标的量化投资工具，通过 contrarian 策略在情绪极度恐慌时买入，极度贪婪时卖出，实现市场中性风格的长期投资。
+本 skill 提供 MNS 逆向投资策略的 CLI 操作能力。MNS 是基于 CNN Fear & Greed Index 情绪指标的量化投资工具，通过 contrarian 策略在情绪极度恐慌时买入，极度贪婪时卖出，实现市场中性风格的长期投资。
 
-### 安全认证
+### 安全声明
 
-> **✓ ClawHub Security Verified** - 本 skill 已通过 ClawHub 安全认证审核。
->
-> - **开源项目**: 源码公开托管于 [GitHub](https://github.com/sopaco/money-never-sleep)
-> - **预编译二进制**: 通过 npm 分发，由 GitHub Actions 从源码自动构建
+> - **源码公开**: 所有源码公开托管于 [GitHub](https://github.com/sopaco/money-never-sleep)
 > - **无网络交易**: 不连接任何券商 API，所有数据存储在本地 SQLite 数据库
-> - **无敏感权限**: 仅访问 `~/.mns/` 目录下的本地配置和数据库
+> - **无敏感权限**: 无需使用也不自动读取用户任何金融账户配置
 
 ## 核心能力
 
@@ -56,15 +56,14 @@ metadata:
 ### 安装（首次使用）
 
 ```bash
-# 安装 mns CLI，npm 会根据当前平台自动选择并安装对应的预编译 binary
+# 安装 mns CLI（所有源码公开托管于 [GitHub](https://github.com/sopaco/money-never-sleep)）
 npm install -g @never-sleeps/mns-cli
 ```
 
 ### 初始化
 
 ```bash
-# ⚠️ 警告：init 命令会创建或覆盖 ~/.mns/config.toml 和 ~/.mns/mns.db
-# 如果已有数据，系统会提示确认后再覆盖
+# 如果已有数据，会提示确认后再覆盖
 mns init
 mns cash set 100000
 ```
@@ -126,10 +125,7 @@ mns config sell_ratio.("greed","between") 0.20
 ```
 
 ## 数据存储
-
-- **配置文件**: `~/.mns/config.toml`（TOML 格式）
-- **数据库**: `~/.mns/mns.db`（SQLite，包含 cash、positions、transactions、snapshots 表）
-- **报告输出**: `./reports/`（当前目录），或通过 `settings.report_output_dir` 配置
+- **报告输出**: `./reports/`（执行MNS CLI到目录），或通过 `settings.report_output_dir` 指定
 
 ## 策略逻辑详解
 
@@ -238,7 +234,6 @@ mns price TSLA 255.00
 
 - **网络错误**: `sentiment` 和 `report` 可能因 API 不可用失败，建议重试或使用缓存数据
 - **数据库锁定**: 多进程并发操作 SQLite 会导致锁定，agent 应确保串行访问
-- **配置错误**: 检查 `~/.mns/config.toml` 语法，使用 `config` 命令验证可访问的配置项
 
 ## 相关文件
 

@@ -24,7 +24,7 @@
 
 **语法**: `mns init [-f, --force]`
 
-**功能**: 创建默认配置文件 `~/.mns/config.toml` 和空的 SQLite 数据库 `~/.mns/mns.db`，同时创建报告输出目录。
+**功能**: 初始化。
 
 **参数**:
 - `-f, --force`: 跳过确认提示，强制覆盖已有数据
@@ -45,21 +45,15 @@ mns init --force
 **输出示例（已有数据时）**:
 ```
 ⚠️  检测到已有数据：
-   配置文件: /home/user/.mns/config.toml
-   数据库:   /home/user/.mns/mns.db
 
 继续将覆盖上述文件，数据将丢失。是否继续？[y/N]: y
 ✓ 初始化完成
-  配置文件: /home/user/.mns/config.toml
-  数据库:   /home/user/.mns/mns.db
   报告目录: ./reports
 ```
 
 **输出示例（使用 --force）**:
 ```
 ✓ 初始化完成
-  配置文件: /home/user/.mns/config.toml
-  数据库:   /home/user/.mns/mns.db
   报告目录: ./reports
 ```
 
@@ -77,15 +71,15 @@ mns init --force
 
 ### 查看所有配置
 ```bash
-npx @never-sleeps/bin-darwin-arm64 config
+mns config
 ```
 
 输出 TOML 格式的完整配置。
 
 ### 查看特定配置项
 ```bash
-npx @never-sleeps/bin-darwin-arm64 config thresholds.fear
-npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_fear
+mns config thresholds.fear
+mns config buy_ratio.extreme_fear
 ```
 
 输出:
@@ -96,8 +90,8 @@ buy_ratio.extreme_fear = 0.50
 
 ### 修改配置项
 ```bash
-npx @never-sleeps/bin-darwin-arm64 config thresholds.greed 75
-npx @never-sleeps/bin-darwin-arm64 config buy_ratio.fear 0.30
+mns config thresholds.greed 75
+mns config buy_ratio.fear 0.30
 ```
 
 **支持的特殊语法**:
@@ -107,20 +101,20 @@ npx @never-sleeps/bin-darwin-arm64 config buy_ratio.fear 0.30
 **示例 - 完整参数调优**:
 ```bash
 # 调整买入比例
-npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_fear 0.60
-npx @never-sleeps/bin-darwin-arm64 config buy_ratio.fear 0.25
-npx @never-sleeps/bin-darwin-arm64 config buy_ratio.neutral 0.10
+mns config buy_ratio.extreme_fear 0.60
+mns config buy_ratio.fear 0.25
+mns config buy_ratio.neutral 0.10
 
 # 调整卖出矩阵
-npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.60
-npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("greed","above_high") 0.50
+mns config sell_ratio.("extreme_greed","above_high") 0.60
+mns config sell_ratio.("greed","above_high") 0.50
 
 # 调整止盈线
-npx @never-sleeps/bin-darwin-arm64 config annualized_target_low 12.0
-npx @never-sleeps/bin-darwin-arm64 config annualized_target_high 18.0
+mns config annualized_target_low 12.0
+mns config annualized_target_high 18.0
 
 # 调整最小持有天数（避免短期年化收益失真）
-npx @never-sleeps/bin-darwin-arm64 config min_holding_days 30
+mns config min_holding_days 30
 ```
 
 ---
@@ -133,7 +127,7 @@ npx @never-sleeps/bin-darwin-arm64 config min_holding_days 30
 
 ### 查看余额
 ```bash
-npx @never-sleeps/bin-darwin-arm64 cash
+mns cash
 ```
 
 输出:
@@ -143,12 +137,12 @@ npx @never-sleeps/bin-darwin-arm64 cash
 
 ### 设置现金余额
 ```bash
-npx @never-sleeps/bin-darwin-arm64 cash set 100000
+mns cash set 100000
 ```
 
 ### 增加现金
 ```bash
-npx @never-sleeps/bin-darwin-arm64 cash add 5000
+mns cash add 5000
 ```
 
 **注意**:
@@ -206,9 +200,9 @@ npx @never-sleeps/bin-darwin-arm64 cash add 5000
 
 **示例**:
 ```bash
-npx @never-sleeps/bin-darwin-arm64 add QQQ "纳指100" us_stocks
-npx @never-sleeps/bin-darwin-arm64 add SH600000 "浦发银行" cn_stocks
-npx @never-sleeps/bin-darwin-arm64 add GLD "黄金ETF" counter_cyclical
+mns add QQQ "纳指100" us_stocks
+mns add SH600000 "浦发银行" cn_stocks
+mns add GLD "黄金ETF" counter_cyclical
 ```
 
 **注意**:
@@ -231,10 +225,10 @@ npx @never-sleeps/bin-darwin-arm64 add GLD "黄金ETF" counter_cyclical
 **示例**:
 ```bash
 # 买入 100 股 QQQ，单价 450.50 元
-npx @never-sleeps/bin-darwin-arm64 buy QQQ 100 450.50
+mns buy QQQ 100 450.50
 
 # 买入 50 份黄金 ETF，单价 180.00 元
-npx @never-sleeps/bin-darwin-arm64 buy GLD 50 180.00
+mns buy GLD 50 180.00
 ```
 
 **行为**:
@@ -258,10 +252,10 @@ npx @never-sleeps/bin-darwin-arm64 buy GLD 50 180.00
 **示例**:
 ```bash
 # 卖出 30 股 QQQ，单价 455.00 元
-npx @never-sleeps/bin-darwin-arm64 sell QQQ 30 455.00
+mns sell QQQ 30 455.00
 
 # 清仓某资产
-npx @never-sleeps/bin-darwin-arm64 sell SH600000 500 13.20
+mns sell SH600000 500 13.20
 ```
 
 **行为**:
@@ -279,7 +273,7 @@ npx @never-sleeps/bin-darwin-arm64 sell SH600000 500 13.20
 
 ### 查看当前价格
 ```bash
-npx @never-sleeps/bin-darwin-arm64 price QQQ
+mns price QQQ
 ```
 
 输出:
@@ -289,7 +283,7 @@ QQQ (纳指100): ¥460.50
 
 ### 更新当前价格
 ```bash
-npx @never-sleeps/bin-darwin-arm64 price QQQ 460.50
+mns price QQQ 460.50
 ```
 
 **注意**:
@@ -307,7 +301,7 @@ npx @never-sleeps/bin-darwin-arm64 price QQQ 460.50
 
 **示例**:
 ```bash
-npx @never-sleeps/bin-darwin-arm64 sentiment
+mns sentiment
 ```
 
 输出:
@@ -338,7 +332,7 @@ Previous Close: 38
 
 **示例**:
 ```bash
-npx @never-sleeps/bin-darwin-arm64 report
+mns report
 ```
 
 **输出节选**:
@@ -393,10 +387,10 @@ npx @never-sleeps/bin-darwin-arm64 report
 **示例**:
 ```bash
 # 查看最近 20 条
-npx @never-sleeps/bin-darwin-arm64 history
+mns history
 
 # 查看最近 50 条
-npx @never-sleeps/bin-darwin-arm64 history --limit 50
+mns history --limit 50
 ```
 
 **输出**:
@@ -418,45 +412,6 @@ npx @never-sleeps/bin-darwin-arm64 history --limit 50
 
 ---
 
-## 异步命令说明
-
-`sentiment` 和 `report` 是异步命令，调用方式略有不同：
-
-### 在 Shell 中直接调用
-```bash
-npx @never-sleeps/bin-darwin-arm64 sentiment
-npx @never-sleeps/bin-darwin-arm64 report
-```
-
-### 在 Node.js/TypeScript 中调用
-```javascript
-import { spawn } from 'child_process';
-
-const result = spawn('npx', [
-  '@never-sleeps/bin-darwin-arm64',
-  'report'
-], { shell: true });
-
-result.stdout.on('data', data => console.log(data.toString()));
-result.stderr.on('data', data => console.error(data.toString()));
-```
-
-### 在 Python 中调用
-```python
-import subprocess
-
-result = subprocess.run(
-    ['npx', '@never-sleeps/bin-darwin-arm64', 'report'],
-    capture_output=True,
-    text=True
-)
-print(result.stdout)
-if result.returncode != 0:
-    print(f"Error: {result.stderr}")
-```
-
----
-
 ## 通用 Exit Code
 
 | Code | 含义 |
@@ -464,67 +419,6 @@ if result.returncode != 0:
 | 0    | 成功 |
 | 1    | 通用错误（配置错误、参数错误、数据库错误等） |
 | 2    | 网络错误（仅影响 `sentiment`/`report`） |
-
----
-
-## 平台适配
-
-根据目标平台选择相应的 npm 包名：
-
-| 平台 | npm 包名 |
-|------|----------|
-| macOS (Apple Silicon) | `@never-sleeps/bin-darwin-arm64` |
-| Linux (x64) | `@never-sleeps/bin-linux-x64` |
-| Windows (x64) | `@never-sleeps/bin-win-x64` |
-
-**示例使用方式**:
-```bash
-# 在 agent skill 中动态选择平台
-npx @never-sleeps/cli-${PLATFORM} report
-# 其中 PLATFORM 为 darwin-arm64 / linux-x64 / win-x64
-```
-
-**注意**: 这些包是预编译的二进制分发，安装时需要解除 Node.js 的 npm 包限制（`--ignore-scripts` 或使用 `npx` 直接运行）。
-
----
-
-## 配置文件结构参考
-
-完整的配置结构（`~/.mns/config.toml`）:
-
-```toml
-[database]
-path = "~/.mns/mns.db"
-
-[settings]
-min_holding_days = 30
-annualized_target_low = 10.0
-annualized_target_high = 15.0
-report_output_dir = "./reports"
-
-[thresholds]
-extreme_fear = 25
-fear = 45
-neutral = 55
-greed = 75
-extreme_greed = 100
-
-[buy_ratio]
-extreme_fear = 0.50
-fear = 0.30
-neutral = 0.20
-greed = 0.00
-
-[sell_ratio]
-# 格式: sell_ratio.("情绪", "价格位置") = 比例
-# 情绪: extreme_greed, greed, neutral, fear, extreme_fear
-# 价格位置: above_high, between, below_low
-"sell_ratio.(\"extreme_greed\",\"above_high\")" = 0.50
-"sell_ratio.(\"extreme_greed\",\"between\")" = 0.30
-"sell_ratio.(\"extreme_greed\",\"below_low\")" = 0.20
-"sell_ratio.(\"greed\",\"above_high\")" = 0.40
-"sell_ratio.(\"greed\",\"between\")" = 0.20
-```
 
 ---
 
@@ -573,7 +467,6 @@ greed = 0.00
 | `卖出份额超过持仓` | `sell` 参数 > 当前持仓 | 检查持仓数量 |
 | `API error: ...` | CNN API 不可用 | 稍后重试或检查网络 |
 | `Database is locked` | 并发访问数据库 | 确保同一时间只有一个进程操作 |
-| `配置文件解析错误` | `config.toml` 语法错误 | 检查 TOML 语法 |
 
 ---
 
