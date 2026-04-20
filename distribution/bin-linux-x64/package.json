@@ -1,24 +1,24 @@
 {
-  "name": "@mns/bin-linux-x64",
-  "version": "0.5.0",
-  "description": "",
-  "publishConfig": {
-    "access": "public"
-  },
-  "os": [
-    "linux"
-  ],
-  "cpu": [
-    "x64"
-  ],
-  "files": [
-    "bin/"
-  ],
-  "author": "Sopaco",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sopaco/mns.git",
-    "directory": "distribution/bin-linux-x64"
-  }
+	"name": "@never-sleeps/bin-linux-x64",
+	"version": "0.5.0",
+	"description": "",
+	"publishConfig": {
+		"access": "public"
+	},
+	"os": [
+		"linux"
+	],
+	"cpu": [
+		"x64"
+	],
+	"files": [
+		"bin/"
+	],
+	"author": "Sopaco",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/sopaco/money-never-sleep.git",
+		"directory": "distribution/bin-linux-x64"
+	}
 }
