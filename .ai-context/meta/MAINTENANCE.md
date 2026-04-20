@@ -1,6 +1,6 @@
 # Maintenance Guide — MNS AI Context
 
-**Last updated**: 2026-04-20
+**Last updated**: 2026-04-21
 
 ---
 
@@ -10,7 +10,7 @@
 |------|---------------|
 | `DYNAMICS.md` | Any new issue, blocker, or workaround discovered |
 | `DECISIONS.md` | Any new design decision or parameter change |
-| `ARCHITECTURE.md` | New module, changed data flow, new dependencies |
+| `ARCHITECTURE.md` | New module (e.g., `quote.rs`), changed data flow, new dependencies |
 | `PROJECT-ESSENCE.md` | Mission change, new target user, dropped feature |
 | `SKILL.md` | Only if activation rules change |
 
@@ -40,6 +40,8 @@ All in `d:\Workspace\toys\MNS\.ai-context\`
     ├── PROJECT-ESSENCE.md     ← Core identity (rarely changes)
     ├── ARCHITECTURE.md         ← Component map (monthly review)
     └── DECISIONS.md            ← Design rationale (per-change)
+
+# New modules in src/: quote.rs (auto price fetch)
 ```
 
 ## Related Documentation

@@ -1,6 +1,6 @@
 # Design Decisions — MNS
 
-**Last updated**: 2026-04-20
+**Last updated**: 2026-04-21
 
 ---
 
@@ -139,3 +139,17 @@ Fear/EFear       0%           0%         0% (hold)
 **Choice**: Wrap all DB operations in `unchecked_transaction()`.
 **Rationale**: Atomicity guarantee — either all changes commit or none do.
 **Trade-off**: Minimal performance impact for a single-user CLI tool.
+
+---
+
+## Decision 13: Multiple price data sources (Tian Tian Fund + Yahoo Finance)
+
+**Context**: Needed a way to automatically update asset prices. Users hold both Chinese funds and US ETFs.
+**Choice**: Use two data sources based on code pattern:
+- 6-digit numeric codes → Tian Tian Fund (`fundgz.1234567.com.cn`)
+- Letter codes → Yahoo Finance (`query1.finance.yahoo.com`)
+**Rationale**:
+- Tian Tian Fund is the de facto standard for Chinese fund data, free and reliable
+- Yahoo Finance covers global markets including US ETFs
+- Code pattern detection is simple and reliable
+**Trade-off**: Some QDII funds may not have real-time estimates on Tian Tian Fund; users must manually update those.

@@ -2,7 +2,7 @@
 
 ## 工具概述
 
-MNS (Market Neutral Strategist) 是一款个人逆向投资 CLI 工具，通过监控 CNN 恐贪指数，结合持仓成本与年化收益目标，每日生成买入/卖出建议，输出文本报告。
+MNS (Money Never Sleeps，Market Neutral Strategist) 是一款个人逆向投资 CLI 工具，通过监控 CNN 恐贪指数，结合持仓成本与年化收益目标，每日生成买入/卖出建议，输出文本报告。
 
 ## 数据存储
 

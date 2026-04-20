@@ -118,8 +118,13 @@ impl AppConfig {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        let content = fs::read_to_string(&path)
+        Self::load_from_path(&Self::config_path()?)
+    }
+
+    /// 从指定路径加载配置
+    pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path)
             .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
         let config: AppConfig = toml::from_str(&content).with_context(|| "解析配置文件失败")?;
         config.validate()?;
@@ -128,7 +133,9 @@ impl AppConfig {
 
     /// 校验配置合法性
     pub fn validate(&self) -> Result<()> {
-        let alloc_sum = self.allocation.us_stocks + self.allocation.cn_stocks + self.allocation.counter_cyclical;
+        let alloc_sum = self.allocation.us_stocks
+            + self.allocation.cn_stocks
+            + self.allocation.counter_cyclical;
         if (alloc_sum - 100.0).abs() > 0.01 {
             anyhow::bail!(
                 "资产配置比例之和必须为 100%，当前: 美股{}% + A股{}% + 逆周期{}% = {}%",
@@ -142,7 +149,10 @@ impl AppConfig {
             anyhow::bail!("最小持仓天数不能为负数: {}", self.settings.min_holding_days);
         }
         if self.settings.max_contrarian_weight < 1.0 {
-            anyhow::bail!("最大逆向权重不能小于 1.0: {}", self.settings.max_contrarian_weight);
+            anyhow::bail!(
+                "最大逆向权重不能小于 1.0: {}",
+                self.settings.max_contrarian_weight
+            );
         }
         Ok(())
     }
@@ -221,11 +231,19 @@ impl AppConfig {
     /// 用 dot path 获取/设置配置值
     pub fn get_value(&self, key: &str) -> Option<String> {
         match key {
-            "settings.annualized_target_low" => Some(self.settings.annualized_target_low.to_string()),
-            "settings.annualized_target_high" => Some(self.settings.annualized_target_high.to_string()),
+            "settings.annualized_target_low" => {
+                Some(self.settings.annualized_target_low.to_string())
+            }
+            "settings.annualized_target_high" => {
+                Some(self.settings.annualized_target_high.to_string())
+            }
             "settings.min_holding_days" => Some(self.settings.min_holding_days.to_string()),
-            "settings.min_absolute_profit_days" => Some(self.settings.min_absolute_profit_days.to_string()),
-            "settings.max_contrarian_weight" => Some(self.settings.max_contrarian_weight.to_string()),
+            "settings.min_absolute_profit_days" => {
+                Some(self.settings.min_absolute_profit_days.to_string())
+            }
+            "settings.max_contrarian_weight" => {
+                Some(self.settings.max_contrarian_weight.to_string())
+            }
             "settings.report_output_dir" => Some(self.settings.report_output_dir.clone()),
             "allocation.us_stocks" => Some(self.allocation.us_stocks.to_string()),
             "allocation.cn_stocks" => Some(self.allocation.cn_stocks.to_string()),
@@ -238,12 +256,20 @@ impl AppConfig {
             "buy_ratio.fear" => Some(self.buy_ratio.fear.to_string()),
             "buy_ratio.neutral" => Some(self.buy_ratio.neutral.to_string()),
             "buy_ratio.greed" => Some(self.buy_ratio.greed.to_string()),
-            "sell_ratio.extreme_greed_target_high" => Some(self.sell_ratio.extreme_greed_target_high.to_string()),
-            "sell_ratio.extreme_greed_target_low" => Some(self.sell_ratio.extreme_greed_target_low.to_string()),
-            "sell_ratio.extreme_greed_below_target" => Some(self.sell_ratio.extreme_greed_below_target.to_string()),
+            "sell_ratio.extreme_greed_target_high" => {
+                Some(self.sell_ratio.extreme_greed_target_high.to_string())
+            }
+            "sell_ratio.extreme_greed_target_low" => {
+                Some(self.sell_ratio.extreme_greed_target_low.to_string())
+            }
+            "sell_ratio.extreme_greed_below_target" => {
+                Some(self.sell_ratio.extreme_greed_below_target.to_string())
+            }
             "sell_ratio.greed_target_high" => Some(self.sell_ratio.greed_target_high.to_string()),
             "sell_ratio.greed_target_low" => Some(self.sell_ratio.greed_target_low.to_string()),
-            "sell_ratio.neutral_target_high" => Some(self.sell_ratio.neutral_target_high.to_string()),
+            "sell_ratio.neutral_target_high" => {
+                Some(self.sell_ratio.neutral_target_high.to_string())
+            }
             "api.fear_greed_url" => Some(self.api.fear_greed_url.clone()),
             _ => None,
         }
@@ -251,11 +277,19 @@ impl AppConfig {
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
-            "settings.annualized_target_low" => self.settings.annualized_target_low = value.parse()?,
-            "settings.annualized_target_high" => self.settings.annualized_target_high = value.parse()?,
+            "settings.annualized_target_low" => {
+                self.settings.annualized_target_low = value.parse()?
+            }
+            "settings.annualized_target_high" => {
+                self.settings.annualized_target_high = value.parse()?
+            }
             "settings.min_holding_days" => self.settings.min_holding_days = value.parse()?,
-            "settings.min_absolute_profit_days" => self.settings.min_absolute_profit_days = value.parse()?,
-            "settings.max_contrarian_weight" => self.settings.max_contrarian_weight = value.parse()?,
+            "settings.min_absolute_profit_days" => {
+                self.settings.min_absolute_profit_days = value.parse()?
+            }
+            "settings.max_contrarian_weight" => {
+                self.settings.max_contrarian_weight = value.parse()?
+            }
             "settings.report_output_dir" => self.settings.report_output_dir = value.to_string(),
             "allocation.us_stocks" => self.allocation.us_stocks = value.parse()?,
             "allocation.cn_stocks" => self.allocation.cn_stocks = value.parse()?,
@@ -268,12 +302,20 @@ impl AppConfig {
             "buy_ratio.fear" => self.buy_ratio.fear = value.parse()?,
             "buy_ratio.neutral" => self.buy_ratio.neutral = value.parse()?,
             "buy_ratio.greed" => self.buy_ratio.greed = value.parse()?,
-            "sell_ratio.extreme_greed_target_high" => self.sell_ratio.extreme_greed_target_high = value.parse()?,
-            "sell_ratio.extreme_greed_target_low" => self.sell_ratio.extreme_greed_target_low = value.parse()?,
-            "sell_ratio.extreme_greed_below_target" => self.sell_ratio.extreme_greed_below_target = value.parse()?,
+            "sell_ratio.extreme_greed_target_high" => {
+                self.sell_ratio.extreme_greed_target_high = value.parse()?
+            }
+            "sell_ratio.extreme_greed_target_low" => {
+                self.sell_ratio.extreme_greed_target_low = value.parse()?
+            }
+            "sell_ratio.extreme_greed_below_target" => {
+                self.sell_ratio.extreme_greed_below_target = value.parse()?
+            }
             "sell_ratio.greed_target_high" => self.sell_ratio.greed_target_high = value.parse()?,
             "sell_ratio.greed_target_low" => self.sell_ratio.greed_target_low = value.parse()?,
-            "sell_ratio.neutral_target_high" => self.sell_ratio.neutral_target_high = value.parse()?,
+            "sell_ratio.neutral_target_high" => {
+                self.sell_ratio.neutral_target_high = value.parse()?
+            }
             "api.fear_greed_url" => self.api.fear_greed_url = value.to_string(),
             _ => anyhow::bail!("未知的配置项: {}", key),
         }

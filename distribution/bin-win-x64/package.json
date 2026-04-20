@@ -1,6 +1,6 @@
 {
 	"name": "@never-sleeps/bin-win-x64",
-	"version": "0.5.5",
+	"version": "0.5.6",
 	"description": "MNS binaries for Windows x64",
 	"publishConfig": {
 		"access": "public"

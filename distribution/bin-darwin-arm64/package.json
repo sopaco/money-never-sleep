@@ -1,6 +1,6 @@
 {
 	"name": "@never-sleeps/bin-darwin-arm64",
-	"version": "0.5.5",
+	"version": "0.5.6",
 	"description": "MNS binaries for macOS Apple Silicon",
 	"publishConfig": {
 		"access": "public"

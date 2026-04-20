@@ -23,7 +23,7 @@ mns init
 mns cash set 100000
 mns add QQQ "纳指100" us_stocks
 mns buy QQQ 100 350.00
-mns price QQQ 420.00
+mns update-prices       # 自动更新所有资产价格
 mns portfolio
 mns report
 ```
@@ -33,6 +33,7 @@ mns report
 | File | Purpose |
 |------|---------|
 | `SKILL.md` | This file — entry point |
+| `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） |
 | `references/PROJECT-ESSENCE.md` | What & why |
 | `references/ARCHITECTURE.md` | Component relationships |
 | `references/DECISIONS.md` | Design decisions |
@@ -43,7 +44,7 @@ mns report
 
 - **Language**: Rust (edition 2024)
 - **Database**: SQLite via `rusqlite` (bundled)
-- **HTTP**: `reqwest` for CNN Fear & Greed API
+- **HTTP**: `reqwest` for CNN Fear & Greed API, Tian Tian Fund, Yahoo Finance
 - **CLI**: `clap` v4 (derive mode)
 - **Config**: TOML at `~/.mns/config.toml`
 - **Data**: SQLite at `~/.mns/mns.db`

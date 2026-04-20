@@ -1,0 +1,36 @@
+# 价值投资配置 - 等待极端机会
+[settings]
+annualized_target_low = 12.0   # 更高的止盈线
+annualized_target_high = 18.0
+min_holding_days = 60         # 更长的最小持仓
+min_absolute_profit_days = 90
+max_contrarian_weight = 2.0
+report_output_dir = "./reports"
+
+[allocation]
+us_stocks = 45.0
+cn_stocks = 35.0
+counter_cyclical = 20.0
+
+[thresholds]
+extreme_fear = 20.0           # 只在真正的极端恐慌时买入
+fear = 40.0
+neutral = 55.0
+greed = 75.0
+
+[buy_ratio]
+extreme_fear = 70.0           # 极度恐慌大仓买入
+fear = 40.0
+neutral = 0.0
+greed = 0.0
+
+[sell_ratio]
+extreme_greed_target_high = 50.0
+extreme_greed_target_low = 35.0
+extreme_greed_below_target = 20.0
+greed_target_high = 35.0
+greed_target_low = 20.0
+neutral_target_high = 0.0
+
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"

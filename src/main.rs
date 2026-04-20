@@ -1,14 +1,16 @@
+mod backtest;
 mod cli;
 mod config;
 mod db;
 mod models;
+mod quote;
 mod report;
 mod sentiment;
 mod strategy;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{CashAction, Commands};
+use cli::{BacktestAction, CashAction, Commands};
 use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use config::AppConfig;
 
@@ -44,6 +46,12 @@ async fn main() -> Result<()> {
         Commands::Sentiment => cmd_sentiment().await?,
         Commands::Report => cmd_report().await?,
         Commands::History { limit } => cmd_history(limit)?,
+        Commands::Backtest { action } => match action {
+            None => cmd_backtest(None, None)?,
+            Some(BacktestAction::Run { config, compare }) => cmd_backtest(config, compare)?,
+            Some(BacktestAction::Params) => cmd_backtest_params()?,
+        },
+        Commands::UpdatePrices => cmd_update_prices().await?,
     }
 
     Ok(())
@@ -411,5 +419,156 @@ fn cmd_history(limit: i64) -> Result<()> {
     }
 
     println!("{}", table);
+    Ok(())
+}
+
+fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<()> {
+    use backtest::{
+        BacktestConfig, print_comparison, run_backtest, run_buy_and_hold, run_custom_comparison,
+        run_param_comparison,
+    };
+
+    println!("=================================================================");
+    println!("   MNS 逆向投资策略回测");
+    println!("=================================================================");
+    println!();
+
+    let bt_config = BacktestConfig::default();
+    println!(
+        "[INFO] 回测期间: {} ~ {}",
+        bt_config.start_date.format("%Y-%m-%d"),
+        bt_config.end_date.format("%Y-%m-%d")
+    );
+    println!(
+        "[INFO] 初始资金: {:.0}, 年度注资: {:.0}",
+        bt_config.initial_cash, bt_config.annual_inflow
+    );
+    println!();
+
+    if let Some(paths) = compare {
+        // 多配置对比模式
+        let path_list: Vec<&str> = paths.split(',').map(|s| s.trim()).collect();
+        let base_config = AppConfig::default_config();
+
+        let results = run_custom_comparison(&base_config, &bt_config, &path_list);
+
+        for result in &results {
+            result.print_report();
+        }
+        print_comparison(&results);
+    } else if let Some(path) = config_path {
+        // 单配置模式
+        let config = if std::path::Path::new(&path).exists() {
+            AppConfig::load_from_path(&path)?
+        } else {
+            anyhow::bail!("配置文件不存在: {}", path);
+        };
+
+        let result = run_backtest(&config, &bt_config);
+        result.print_report();
+
+        // 买入持有基准
+        let result_bnh = run_buy_and_hold(&bt_config);
+        print_comparison(&[result, result_bnh]);
+    } else {
+        // 默认配置 + 参数对比模式
+        let config = AppConfig::load()?;
+        let results = run_param_comparison(&config, &bt_config);
+
+        for result in &results {
+            result.print_report();
+        }
+        print_comparison(&results);
+    }
+
+    Ok(())
+}
+
+fn cmd_backtest_params() -> Result<()> {
+    println!("可调参数列表:");
+    println!();
+    println!("  【阈值参数】");
+    println!("    thresholds.extreme_fear    极度恐慌阈值 (默认: 25)");
+    println!("    thresholds.fear            恐慌阈值 (默认: 45)");
+    println!("    thresholds.neutral         中性阈值 (默认: 55)");
+    println!("    thresholds.greed           贪婪阈值 (默认: 75)");
+    println!();
+    println!("  【买入比例】");
+    println!("    buy_ratio.extreme_fear     极度恐慌买入比例 (默认: 50%)");
+    println!("    buy_ratio.fear             恐慌买入比例 (默认: 30%)");
+    println!("    buy_ratio.neutral          中性买入比例 (默认: 20%)");
+    println!("    buy_ratio.greed            贪婪买入比例 (默认: 0%)");
+    println!();
+    println!("  【卖出比例】");
+    println!("    sell_ratio.extreme_greed_target_high   极度贪婪+高年化卖出 (默认: 50%)");
+    println!("    sell_ratio.extreme_greed_target_low    极度贪婪+低年化卖出 (默认: 30%)");
+    println!("    sell_ratio.extreme_greed_below_target   极度贪婪+低年化卖出 (默认: 20%)");
+    println!("    sell_ratio.greed_target_high            贪婪+高年化卖出 (默认: 40%)");
+    println!("    sell_ratio.greed_target_low             贪婪+低年化卖出 (默认: 20%)");
+    println!("    sell_ratio.neutral_target_high          中性+高年化卖出 (默认: 30%)");
+    println!();
+    println!("  【其他参数】");
+    println!("    settings.annualized_target_low   低止盈线 (默认: 10%)");
+    println!("    settings.annualized_target_high  高止盈线 (默认: 15%)");
+    println!("    settings.min_holding_days         最小持仓天数 (默认: 30)");
+    println!("    settings.max_contrarian_weight    最大逆向权重 (默认: 2.0)");
+    println!();
+    println!("用法示例:");
+    println!("  mns backtest                           # 运行默认参数对比");
+    println!("  mns backtest --config my_config.toml   # 使用指定配置文件");
+    println!("  mns backtest --compare a.toml,b.toml    # 对比多个配置");
+    Ok(())
+}
+
+async fn cmd_update_prices() -> Result<()> {
+    let db = db::Database::open()?;
+    let positions = db.list_positions()?;
+
+    if positions.is_empty() {
+        println!("没有资产，请先使用 'mns add' 添加资产");
+        return Ok(());
+    }
+
+    println!("正在更新 {} 个资产的价格...\n", positions.len());
+
+    let updates = quote::update_all_prices(&positions).await?;
+
+    if updates.is_empty() {
+        println!("未能更新任何资产价格");
+        return Ok(());
+    }
+
+    // 更新数据库并显示结果
+    println!(
+        "{:<10} {:<20} {:>12} {:>12} {:>8}",
+        "代码", "名称", "原价格", "新价格", "来源"
+    );
+    println!("{}", "-".repeat(66));
+
+    for update in &updates {
+        // 更新数据库
+        db.update_price(&update.asset_code, update.new_price)?;
+
+        let old = update
+            .old_price
+            .map(|p| format!("{:.4}", p))
+            .unwrap_or("-".to_string());
+        println!(
+            "{:<10} {:<20} {:>12} {:>12} {:>8}",
+            update.asset_code,
+            if update.asset_name.len() > 18 {
+                &update.asset_name[..18]
+            } else {
+                &update.asset_name
+            },
+            old,
+            format!("{:.4}", update.new_price),
+            update.source
+        );
+    }
+
+    println!();
+    println!("✓ 已更新 {} 个资产价格", updates.len());
+
     Ok(())
 }

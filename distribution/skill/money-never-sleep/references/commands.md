@@ -497,7 +497,7 @@ chcp 65001
 
 ## 版本历史
 
-### v0.5.5 (当前)
+### v0.5.6 (当前)
 - 完整的 CLI 命令集
 - 异步 CNN Fear & Greed Index 获取
 - dot-path 配置管理
