@@ -35,74 +35,71 @@ metadata:
 
 ## 快速开始
 
-### 初始化（首次使用）
+### 安装（首次使用）
 
 ```bash
-# 需要安装 mns cli 二进制（通过 npm 安装）
-npx @never-sleeps/cli-darwin-arm64 init  # macOS Apple Silicon
-# 或
-npx @never-sleeps/cli-linux-x64 init     # Linux
-# 或
-npx @never-sleeps/cli-win-x64 init       # Windows
+# 安装 mns CLI，npm 会根据当前平台自动选择并安装对应的预编译 binary
+npm install -g @never-sleeps/mns-cli
 
-# 设置初始现金
-npx @never-sleeps/cli-darwin-arm64 cash set 100000
+# 安装完成后即可直接使用 mns 命令
+mns init
+mns cash set 100000
 ```
 
 ### 添加资产到持仓池
 
 ```bash
-npx @never-sleeps/cli-darwin-arm64 add QQQ "纳指100" us_stocks
-npx @never-sleeps/cli-darwin-arm64 add SH600000 "浦发银行" cn_stocks
+mns add QQQ "纳指100" us_stocks
+mns add SH600000 "浦发银行" cn_stocks
 ```
 
 ### 记录买入交易
 
 ```bash
-npx @never-sleeps/cli-darwin-arm64 buy QQQ 100 450.50
-npx @never-sleeps/cli-darwin-arm64 buy SH600000 500 12.30
+mns buy QQQ 100 450.50
+mns buy SH600000 500 12.30
 ```
 
 ### 查看持仓和策略建议
 
 ```bash
 # 查看当前持仓（含年化收益）
-npx @never-sleeps/cli-darwin-arm64 portfolio
+mns portfolio
 
 # 获取今日策略报告（基于最新恐贪指数）
-npx @never-sleeps/cli-darwin-arm64 report
+mns report
 
 # 查看当前恐贪指数
-npx @never-sleeps/cli-darwin-arm64 sentiment
+mns sentiment
 ```
 
 ### 更新价格和查看历史
 
 ```bash
 # 更新资产当前价格
-npx @never-sleeps/cli-darwin-arm64 price QQQ 460.00
+mns price QQQ 460.00
 
 # 查看最近交易历史
-npx @never-sleeps/cli-darwin-arm64 history --limit 50
+mns history --limit 50
 
 # 查看现金余额
-npx @never-sleeps/cli-darwin-arm64 cash
+mns cash
 ```
 
 ### 配置管理
 
 ```bash
 # 查看所有配置
-npx @never-sleeps/cli-darwin-arm64 config
+mns config
 
 # 查看特定配置项（支持 dot-path 语法）
-npx @never-sleeps/cli-darwin-arm64 config thresholds.fear
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear
+mns config thresholds.fear
+mns config buy_ratio.extreme_fear
 
 # 修改配置项（策略参数）
-npx @never-sleeps/cli-darwin-arm64 config thresholds.greed 75
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.fear 0.30
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","between") 0.20
+mns config thresholds.greed 75
+mns config buy_ratio.fear 0.30
+mns config sell_ratio.("greed","between") 0.20
 ```
 
 ## 数据存储
@@ -157,52 +154,52 @@ npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","between") 0.20
 
 ```bash
 # 1. 查看策略报告（包含买卖建议、现金预测、风险警告）
-npx @never-sleeps/cli-darwin-arm64 report
+mns report
 
 # 2. 根据建议执行买入（如有）
-npx @never-sleeps/cli-darwin-arm64 buy QQQ 50 445.00
+mns buy QQQ 50 445.00
 
 # 3. 更新价格（如有新价格）
-npx @never-sleeps/cli-darwin-arm64 price QQQ 448.50
+mns price QQQ 448.50
 
 # 4. 记录卖出（如有）
-npx @never-sleeps/cli-darwin-arm64 sell QQQ 100 455.00
+mns sell QQQ 100 455.00
 
 # 5. 查看最新持仓
-npx @never-sleeps/cli-darwin-arm64 portfolio
+mns portfolio
 ```
 
 ### 策略参数调优（Agent 负责优化）
 
 ```bash
 # 查看当前买入比例
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio
+mns config buy_ratio
 
 # 调整极端恐慌买入比例到 60%
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear 0.60
+mns config buy_ratio.extreme_fear 0.60
 
 # 降低中性区间买入到 10%
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.neutral 0.10
+mns config buy_ratio.neutral 0.10
 
 # 提高极度贪婪时的卖出比例
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.60
+mns config sell_ratio.("extreme_greed","above_high") 0.60
 
 # 调整年化止盈线
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_low 12.0
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_high 18.0
+mns config annualized_target_low 12.0
+mns config annualized_target_high 18.0
 ```
 
 ### 新资产添加流程
 
 ```bash
 # 1. 添加资产到池子
-npx @never-sleeps/cli-darwin-arm64 add TSLA "特斯拉" us_stocks
+mns add TSLA "特斯拉" us_stocks
 
 # 2. 初始建仓买入
-npx @never-sleeps/cli-darwin-arm64 buy TSLA 50 250.00
+mns buy TSLA 50 250.00
 
 # 3. 记录当前价格（后续需要定期更新）
-npx @never-sleeps/cli-darwin-arm64 price TSLA 255.00
+mns price TSLA 255.00
 ```
 
 ## 注意事项
@@ -229,10 +226,9 @@ npx @never-sleeps/cli-darwin-arm64 price TSLA 255.00
 
 ## 相关文件
 
-- `scripts/` - 可选的辅助脚本（如批量导入、数据导出）
 - `references/` - 详细的技术参考文档（配置结构、数据库 schema、策略参数）
 - `assets/` - 模板文件（如报告 HTML 模板）
 
 ## 规范说明
 
-本 skill 遵循 [Agent Skills Specification](https://agentskills.io/specification) v1.0 标准。Binary distribution 通过 npm 发布，agent 可通过 `npx @never-sleeps/cli-<platform>` 直接使用，无需本地安装。
+本 skill 遵循 [Agent Skills Specification](https://agentskills.io/specification) v1.0 标准。Binary distribution 通过独立 npm 包 `@never-sleeps/mns-cli` 发布，该包使用 optional dependencies 机制按平台分发预编译 binary。安装后 `mns` 命令即可直接使用。

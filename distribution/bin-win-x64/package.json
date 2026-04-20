@@ -1,7 +1,7 @@
 {
 	"name": "@never-sleeps/bin-win-x64",
 	"version": "0.5.0",
-	"description": "",
+	"description": "MNS binaries for Windows x64",
 	"publishConfig": {
 		"access": "public"
 	},
@@ -11,6 +11,9 @@
 	"cpu": [
 		"x64"
 	],
+	"bin": {
+		"mns": "bin/mns.exe"
+	},
 	"files": [
 		"bin/"
 	],
@@ -18,7 +21,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/sopaco/mns.git",
+		"url": "git+https://github.com/sopaco/money-never-sleep.git",
 		"directory": "distribution/bin-win-x64"
 	}
 }

@@ -1,7 +1,7 @@
 {
 	"name": "@never-sleeps/bin-linux-x64",
 	"version": "0.5.0",
-	"description": "",
+	"description": "MNS binaries for Linux x64",
 	"publishConfig": {
 		"access": "public"
 	},
@@ -11,6 +11,9 @@
 	"cpu": [
 		"x64"
 	],
+	"bin": {
+		"mns": "bin/mns"
+	},
 	"files": [
 		"bin/"
 	],

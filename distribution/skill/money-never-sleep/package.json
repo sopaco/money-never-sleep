@@ -7,7 +7,7 @@
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/sopaco/money-never-sleep.git",
-		"directory": "distribution/skill/mns-cli"
+		"directory": "distribution/skill/money-never-sleep"
 	},
 	"keywords": [
 		"agent-skill",
@@ -22,13 +22,9 @@
 	"files": [
 		"SKILL.md",
 		"README.md",
-		"scripts/",
 		"references/",
 		"assets/"
 	],
-	"engines": {
-		"node": ">=18.0.0"
-	},
 	"publishConfig": {
 		"access": "public"
 	}
