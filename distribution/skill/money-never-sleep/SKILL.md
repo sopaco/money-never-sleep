@@ -1,5 +1,6 @@
 ---
 name: money-never-sleep
+version: 0.5.6
 description: |
   MNS (Money Never Sleep, Market Neutral Strategist) CLI skill for autonomous agents. Provides investment
   portfolio tracking, market sentiment analysis using CNN Fear & Greed Index, and strategy
