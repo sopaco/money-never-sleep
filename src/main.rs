@@ -433,33 +433,22 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
 
     let bt_config = BacktestConfig::default();
     println!(
-        "[INFO] 数据量: {} 个点 ({} ~ {})",
-        bt_config.end_date.format("%Y-%m-%d"),
+        "[INFO] 回测期间: {} ~ {}",
         bt_config.start_date.format("%Y-%m-%d"),
         bt_config.end_date.format("%Y-%m-%d")
+    );
+    println!(
+        "[INFO] 初始资金: {:.0}, 年度注资: {:.0}",
+        bt_config.initial_cash, bt_config.annual_inflow
     );
     println!();
 
     if let Some(paths) = compare {
         // 多配置对比模式
-        let path_list: Vec<&str> = paths.split(',').collect();
-        let mut configs = Vec::new();
+        let path_list: Vec<&str> = paths.split(',').map(|s| s.trim()).collect();
+        let base_config = AppConfig::default_config();
 
-        for path in path_list {
-            let path = path.trim();
-            let config = if std::path::Path::new(path).exists() {
-                AppConfig::load_from_path(path)?
-            } else {
-                anyhow::bail!("配置文件不存在: {}", path);
-            };
-            let name = std::path::Path::new(path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string());
-            configs.push((name, config));
-        }
-
-        let results = run_custom_comparison(configs, &bt_config);
+        let results = run_custom_comparison(&base_config, &bt_config, &path_list);
 
         for result in &results {
             result.print_report();
