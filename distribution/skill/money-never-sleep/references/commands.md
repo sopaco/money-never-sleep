@@ -28,7 +28,7 @@
 
 **示例**:
 ```bash
-npx @never-sleeps/cli-darwin-arm64 init
+npx @never-sleeps/bin-darwin-arm64 init
 ```
 
 **输出**:
@@ -53,15 +53,15 @@ npx @never-sleeps/cli-darwin-arm64 init
 
 ### 查看所有配置
 ```bash
-npx @never-sleeps/cli-darwin-arm64 config
+npx @never-sleeps/bin-darwin-arm64 config
 ```
 
 输出 TOML 格式的完整配置。
 
 ### 查看特定配置项
 ```bash
-npx @never-sleeps/cli-darwin-arm64 config thresholds.fear
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear
+npx @never-sleeps/bin-darwin-arm64 config thresholds.fear
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_fear
 ```
 
 输出:
@@ -72,8 +72,8 @@ buy_ratio.extreme_fear = 0.50
 
 ### 修改配置项
 ```bash
-npx @never-sleeps/cli-darwin-arm64 config thresholds.greed 75
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.fear 0.30
+npx @never-sleeps/bin-darwin-arm64 config thresholds.greed 75
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.fear 0.30
 ```
 
 **支持的特殊语法**:
@@ -83,20 +83,20 @@ npx @never-sleeps/cli-darwin-arm64 config buy_ratio.fear 0.30
 **示例 - 完整参数调优**:
 ```bash
 # 调整买入比例
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear 0.60
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.fear 0.25
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.neutral 0.10
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_fear 0.60
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.fear 0.25
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.neutral 0.10
 
 # 调整卖出矩阵
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.60
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","above_high") 0.50
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.60
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("greed","above_high") 0.50
 
 # 调整止盈线
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_low 12.0
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_high 18.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_low 12.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_high 18.0
 
 # 调整最小持有天数（避免短期年化收益失真）
-npx @never-sleeps/cli-darwin-arm64 config min_holding_days 30
+npx @never-sleeps/bin-darwin-arm64 config min_holding_days 30
 ```
 
 ---
@@ -109,7 +109,7 @@ npx @never-sleeps/cli-darwin-arm64 config min_holding_days 30
 
 ### 查看余额
 ```bash
-npx @never-sleeps/cli-darwin-arm64 cash
+npx @never-sleeps/bin-darwin-arm64 cash
 ```
 
 输出:
@@ -119,12 +119,12 @@ npx @never-sleeps/cli-darwin-arm64 cash
 
 ### 设置现金余额
 ```bash
-npx @never-sleeps/cli-darwin-arm64 cash set 100000
+npx @never-sleeps/bin-darwin-arm64 cash set 100000
 ```
 
 ### 增加现金
 ```bash
-npx @never-sleeps/cli-darwin-arm64 cash add 5000
+npx @never-sleeps/bin-darwin-arm64 cash add 5000
 ```
 
 **注意**:
@@ -182,9 +182,9 @@ npx @never-sleeps/cli-darwin-arm64 cash add 5000
 
 **示例**:
 ```bash
-npx @never-sleeps/cli-darwin-arm64 add QQQ "纳指100" us_stocks
-npx @never-sleeps/cli-darwin-arm64 add SH600000 "浦发银行" cn_stocks
-npx @never-sleeps/cli-darwin-arm64 add GLD "黄金ETF" counter_cyclical
+npx @never-sleeps/bin-darwin-arm64 add QQQ "纳指100" us_stocks
+npx @never-sleeps/bin-darwin-arm64 add SH600000 "浦发银行" cn_stocks
+npx @never-sleeps/bin-darwin-arm64 add GLD "黄金ETF" counter_cyclical
 ```
 
 **注意**:
@@ -207,10 +207,10 @@ npx @never-sleeps/cli-darwin-arm64 add GLD "黄金ETF" counter_cyclical
 **示例**:
 ```bash
 # 买入 100 股 QQQ，单价 450.50 元
-npx @never-sleeps/cli-darwin-arm64 buy QQQ 100 450.50
+npx @never-sleeps/bin-darwin-arm64 buy QQQ 100 450.50
 
 # 买入 50 份黄金 ETF，单价 180.00 元
-npx @never-sleeps/cli-darwin-arm64 buy GLD 50 180.00
+npx @never-sleeps/bin-darwin-arm64 buy GLD 50 180.00
 ```
 
 **行为**:
@@ -234,10 +234,10 @@ npx @never-sleeps/cli-darwin-arm64 buy GLD 50 180.00
 **示例**:
 ```bash
 # 卖出 30 股 QQQ，单价 455.00 元
-npx @never-sleeps/cli-darwin-arm64 sell QQQ 30 455.00
+npx @never-sleeps/bin-darwin-arm64 sell QQQ 30 455.00
 
 # 清仓某资产
-npx @never-sleeps/cli-darwin-arm64 sell SH600000 500 13.20
+npx @never-sleeps/bin-darwin-arm64 sell SH600000 500 13.20
 ```
 
 **行为**:
@@ -255,7 +255,7 @@ npx @never-sleeps/cli-darwin-arm64 sell SH600000 500 13.20
 
 ### 查看当前价格
 ```bash
-npx @never-sleeps/cli-darwin-arm64 price QQQ
+npx @never-sleeps/bin-darwin-arm64 price QQQ
 ```
 
 输出:
@@ -265,7 +265,7 @@ QQQ (纳指100): ¥460.50
 
 ### 更新当前价格
 ```bash
-npx @never-sleeps/cli-darwin-arm64 price QQQ 460.50
+npx @never-sleeps/bin-darwin-arm64 price QQQ 460.50
 ```
 
 **注意**:
@@ -283,7 +283,7 @@ npx @never-sleeps/cli-darwin-arm64 price QQQ 460.50
 
 **示例**:
 ```bash
-npx @never-sleeps/cli-darwin-arm64 sentiment
+npx @never-sleeps/bin-darwin-arm64 sentiment
 ```
 
 输出:
@@ -314,7 +314,7 @@ Previous Close: 38
 
 **示例**:
 ```bash
-npx @never-sleeps/cli-darwin-arm64 report
+npx @never-sleeps/bin-darwin-arm64 report
 ```
 
 **输出节选**:
@@ -369,10 +369,10 @@ npx @never-sleeps/cli-darwin-arm64 report
 **示例**:
 ```bash
 # 查看最近 20 条
-npx @never-sleeps/cli-darwin-arm64 history
+npx @never-sleeps/bin-darwin-arm64 history
 
 # 查看最近 50 条
-npx @never-sleeps/cli-darwin-arm64 history --limit 50
+npx @never-sleeps/bin-darwin-arm64 history --limit 50
 ```
 
 **输出**:
@@ -400,8 +400,8 @@ npx @never-sleeps/cli-darwin-arm64 history --limit 50
 
 ### 在 Shell 中直接调用
 ```bash
-npx @never-sleeps/cli-darwin-arm64 sentiment
-npx @never-sleeps/cli-darwin-arm64 report
+npx @never-sleeps/bin-darwin-arm64 sentiment
+npx @never-sleeps/bin-darwin-arm64 report
 ```
 
 ### 在 Node.js/TypeScript 中调用
@@ -409,7 +409,7 @@ npx @never-sleeps/cli-darwin-arm64 report
 import { spawn } from 'child_process';
 
 const result = spawn('npx', [
-  '@never-sleeps/cli-darwin-arm64',
+  '@never-sleeps/bin-darwin-arm64',
   'report'
 ], { shell: true });
 
@@ -422,7 +422,7 @@ result.stderr.on('data', data => console.error(data.toString()));
 import subprocess
 
 result = subprocess.run(
-    ['npx', '@never-sleeps/cli-darwin-arm64', 'report'],
+    ['npx', '@never-sleeps/bin-darwin-arm64', 'report'],
     capture_output=True,
     text=True
 )
@@ -449,9 +449,9 @@ if result.returncode != 0:
 
 | 平台 | npm 包名 |
 |------|----------|
-| macOS (Apple Silicon) | `@never-sleeps/cli-darwin-arm64` |
-| Linux (x64) | `@never-sleeps/cli-linux-x64` |
-| Windows (x64) | `@never-sleeps/cli-win-x64` |
+| macOS (Apple Silicon) | `@never-sleeps/bin-darwin-arm64` |
+| Linux (x64) | `@never-sleeps/bin-linux-x64` |
+| Windows (x64) | `@never-sleeps/bin-win-x64` |
 
 **示例使用方式**:
 ```bash

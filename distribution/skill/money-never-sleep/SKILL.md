@@ -217,18 +217,13 @@ mns price TSLA 255.00
 - **数据库锁定**: 多进程并发操作 SQLite 会导致锁定，agent 应确保串行访问
 - **配置错误**: 检查 `~/.mns/config.toml` 语法，使用 `config` 命令验证可访问的配置项
 
-## 扩展建议
-
-- 集成 Yahoo Finance API 自动更新价格（当前需手动调用 `price`）
-- 添加多账户支持（当前为单用户设计）
-- 支持更多资产类别（ crypto、债券等）
-- 自动邮件/通知发送报告（当前仅文本输出）
-
 ## 相关文件
 
 - `references/` - 详细的技术参考文档（配置结构、数据库 schema、策略参数）
 - `assets/` - 模板文件（如报告 HTML 模板）
 
-## 规范说明
+## 开源信息
 
-本 skill 遵循 [Agent Skills Specification](https://agentskills.io/specification) v1.0 标准。Binary distribution 通过独立 npm 包 `@never-sleeps/mns-cli` 发布，该包使用 optional dependencies 机制按平台分发预编译 binary。安装后 `mns` 命令即可直接使用。
+MNS (money-never-sleep) 是开源项目，源码托管于 GitHub：
+
+**[https://github.com/sopaco/money-never-sleep](https://github.com/sopaco/money-never-sleep)**

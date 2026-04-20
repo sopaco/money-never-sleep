@@ -70,10 +70,10 @@ CNN Fear & Greed Index 是一个 0-100 的指数，0 表示极度恐慌（Extrem
 
 ```bash
 # 将贪婪阈值从 75 降至 70，使贪婪区间更早触发
-npx @never-sleeps/cli-darwin-arm64 config thresholds.greed 70
+npx @never-sleeps/bin-darwin-arm64 config thresholds.greed 70
 
 # 将极度恐慌阈值从 25 提升至 30，减少极端情况下的买入频率
-npx @never-sleeps/cli-darwin-arm64 config thresholds.extreme_fear 30
+npx @never-sleeps/bin-darwin-arm64 config thresholds.extreme_fear 30
 ```
 
 **注意**: 区间必须保持连续性，建议:
@@ -106,13 +106,13 @@ npx @never-sleeps/cli-darwin-arm64 config thresholds.extreme_fear 30
 
 ```bash
 # 策略1: 极度贪婪时也可能小幅买入（左侧布局）
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_greed 0.10
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_greed 0.10
 
 # 策略2: 中性区间也暂停买入，只在明确的恐慌区间出手
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.neutral 0.00
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.neutral 0.00
 
 # 策略3: 极端恐慌时全仓出击
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear 0.70
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.extreme_fear 0.70
 ```
 
 ---
@@ -154,13 +154,13 @@ npx @never-sleeps/cli-darwin-arm64 config buy_ratio.extreme_fear 0.70
 
 ```bash
 # 极度贪婪且大幅盈利时，卖出 70%
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.70
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("extreme_greed","above_high") 0.70
 
 # 贪婪区间小幅盈利时也卖出 30%
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","between") 0.30
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("greed","between") 0.30
 
 # 中性区间也开始部分止盈（保守策略）
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("neutral","above_high") 0.20
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("neutral","above_high") 0.20
 ```
 
 ---
@@ -181,12 +181,12 @@ npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("neutral","above_high") 0.
 
 ```bash
 # 保守止盈：年化 8% 就开始卖
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_low 8.0
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_high 12.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_low 8.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_high 12.0
 
 # 激进止盈：年化 20% 才开始卖
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_low 15.0
-npx @never-sleeps/cli-darwin-arm64 config annualized_target_high 25.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_low 15.0
+npx @never-sleeps/bin-darwin-arm64 config annualized_target_high 25.0
 ```
 
 ### `min_holding_days` (默认 30)
@@ -267,12 +267,12 @@ if absolute_return >= 0.30:
 
 ```bash
 # 查看所有配置
-npx @never-sleeps/cli-darwin-arm64 config
+npx @never-sleeps/bin-darwin-arm64 config
 
 # 查看特定分组
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio
-npx @never-sleeps/cli-darwin-arm64 config thresholds
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio
+npx @never-sleeps/bin-darwin-arm64 config thresholds
 ```
 
 ### 2. 基于回测结果调整
@@ -289,7 +289,7 @@ npx @never-sleeps/cli-darwin-arm64 config thresholds
 
 ```bash
 # 调整 - 降低中性买入
-npx @never-sleeps/cli-darwin-arm64 config buy_ratio.neutral 0.10
+npx @never-sleeps/bin-darwin-arm64 config buy_ratio.neutral 0.10
 
 # 观察 1 周后的 report 变化
 # 如果感觉买入频率下降明显，可继续微调
@@ -300,7 +300,7 @@ npx @never-sleeps/cli-darwin-arm64 config buy_ratio.neutral 0.10
 将满意配置备份到文件:
 
 ```bash
-npx @never-sleeps/cli-darwin-arm64 config > config_backup_2025-06-16.toml
+npx @never-sleeps/bin-darwin-arm64 config > config_backup_2025-06-16.toml
 ```
 
 ---
@@ -313,10 +313,10 @@ MNS 支持 Rust TOML crate 的 dot-path 访问:
 
 ```bash
 # 访问 thresholds.fear
-npx @never-sleeps/cli-darwin-arm64 config thresholds.fear
+npx @never-sleeps/bin-darwin-arm64 config thresholds.fear
 
 # 访问 sell_ratio 的元组键
-npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","above_high")
+npx @never-sleeps/bin-darwin-arm64 config sell_ratio.("greed","above_high")
 ```
 
 ### 特殊字符转义
@@ -325,7 +325,7 @@ npx @never-sleeps/cli-darwin-arm64 config sell_ratio.("greed","above_high")
 
 ```bash
 # 正确的写法（外层引号，内层转义）
-npx @never-sleeps/cli-darwin-arm64 config 'sell_ratio.("greed","above_high")' 0.50
+npx @never-sleeps/bin-darwin-arm64 config 'sell_ratio.("greed","above_high")' 0.50
 ```
 
 在 shell 中，建议用单引号包裹整个参数以避免转义问题。
