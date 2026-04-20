@@ -6,7 +6,7 @@
 
 ## What
 
-MNS (Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fear & Greed Index, analyzes portfolio positions against return targets, and generates daily buy/sell recommendations as text reports.
+MNS (Money Never Sleeps，Market Neutral Strategist) is a personal CLI tool that monitors the CNN Fear & Greed Index, analyzes portfolio positions against return targets, and generates daily buy/sell recommendations as text reports.
 
 ## Why
 

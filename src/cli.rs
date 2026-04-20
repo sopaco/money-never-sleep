@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mns",
     version,
-    about = "逆向投资助手 - Market Neutral Strategist"
+    about = "逆向投资助手 - Money Never Sleeps（Market Neutral Strategist）"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -88,6 +88,12 @@ pub enum Commands {
         #[arg(default_value = "20")]
         limit: i64,
     },
+
+    /// 策略回测 (基于历史数据验证策略表现)
+    Backtest {
+        #[command(subcommand)]
+        action: Option<BacktestAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,4 +108,19 @@ pub enum CashAction {
         /// 金额
         amount: f64,
     },
+}
+
+#[derive(Subcommand)]
+pub enum BacktestAction {
+    /// 运行回测
+    Run {
+        /// 配置文件路径 (省略则使用默认配置)
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 对比多个配置文件 (逗号分隔)
+        #[arg(short, long)]
+        compare: Option<String>,
+    },
+    /// 查看可调参数列表
+    Params,
 }

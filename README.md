@@ -1,4 +1,4 @@
-# MNS - Market Neutral Strategist
+# MNS - Money Never Sleeps（Market Neutral Strategist）
 
 逆向投资助手 CLI 工具，基于 CNN 恐贪指数监控市场情绪，结合持仓年化收益目标，每日生成买入/卖出建议。
 
