@@ -224,15 +224,16 @@ fn aggregate_fgi_to_monthly(fgi_data: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f6
         return Vec::new();
     }
 
+    // 先按日期排序
+    let mut sorted_data: Vec<_> = fgi_data.to_vec();
+    sorted_data.sort_by_key(|(d, _)| *d);
+
+    // 取每月最后一条数据
     let mut monthly_data: HashMap<(i32, u32), (NaiveDate, f64)> = HashMap::new();
-
-    for (date, score) in fgi_data {
+    for (date, score) in sorted_data {
         let key = (date.year(), date.month());
-        let entry = monthly_data.entry(key).or_insert((*date, *score));
-
-        if date.day() > entry.0.day() {
-            *entry = (*date, *score);
-        }
+        // 直接覆盖，因为已排序，最后的就是月末
+        monthly_data.insert(key, (date, score));
     }
 
     let mut result: Vec<_> = monthly_data.into_values().collect();
@@ -327,6 +328,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
 
     let mut state = BacktestState::new(bt_config.initial_cash);
     let mut prev_zone: Option<&str> = None;
+    let mut last_trade_month: i32 = -100; // 上次交易的月份（用于冷却期）
     let mut buy_count = 0usize;
     let mut sell_count = 0usize;
     let mut buy_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
@@ -334,11 +336,17 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
 
     for (date, score, price) in &combined_data {
         let year = date.year();
-        if year > state.last_inflow_year && date.month() >= 3 {
+        let month_key = year * 12 + date.month() as i32; // 用于冷却期计算
+        
+        // 年度注资（每年3月末）
+        let new_capital = if year > state.last_inflow_year && date.month() >= 3 {
             state.cash += bt_config.annual_inflow;
             state.total_inflow += bt_config.annual_inflow;
             state.last_inflow_year = year;
-        }
+            true
+        } else {
+            false
+        };
 
         let zone = get_zone_name(*score, config);
         let zone_changed = prev_zone.map_or(true, |pz| pz != zone);
@@ -348,15 +356,25 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
             .map(|p| vec![p])
             .unwrap_or_default();
 
-        let sell_suggestions = if zone_changed {
+        // 交易触发条件：
+        // 1. 区间变化时（常规触发）
+        // 2. 有新资金注入且处于可买入区间（恐慌及以下）
+        // 3. 距离上次交易超过3个月（冷却期后重新评估）
+        let months_since_trade = month_key - last_trade_month;
+        let should_trade = zone_changed 
+            || (new_capital && *score < config.thresholds.neutral) // 有新资金+可买入区间
+            || (months_since_trade >= 3 && *score < config.thresholds.neutral); // 冷却期后+恐慌区间
+
+        // 卖出：仅在贪婪及以上区间且区间变化时
+        let sell_suggestions = if zone_changed && *score >= config.thresholds.neutral {
             calculate_sell_suggestions(config, *score, &positions)
         } else {
             Vec::new()
         };
 
-        let risk_warnings = check_risk_warnings(config, *score, &positions);
-
-        let buy_suggestion = if zone_changed {
+        // 买入：在恐慌及以下区间，满足交易条件时
+        let buy_suggestion = if should_trade && *score < config.thresholds.neutral {
+            let risk_warnings = check_risk_warnings(config, *score, &positions);
             calculate_buy_suggestions(
                 config,
                 *score,
@@ -380,6 +398,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
             if sell.sell_shares >= 0.01 {
                 state.position.shares -= sell.sell_shares;
                 state.cash += sell.sell_amount;
+                last_trade_month = month_key;
 
                 sell_count += 1;
                 let zone_key = zone.to_string();
@@ -394,7 +413,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
                     shares: sell.sell_shares,
                     price: *price,
                     amount: sell.sell_amount,
-                    pct: format!("{}%", sell.sell_ratio as i32),
+                    pct: format!("{:.0}%", sell.sell_ratio),
                     ann_ret: sell.annualized_return,
                 });
 
@@ -420,12 +439,16 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
                 }
                 state.position.shares = total_shares;
                 state.cash -= buy_amount;
+                last_trade_month = month_key;
 
                 buy_count += 1;
                 let zone_key = zone.to_string();
                 buy_by_zone.entry(zone_key.clone()).or_insert((0, 0.0)).0 += 1;
                 buy_by_zone.get_mut(&zone_key).unwrap().1 += buy_amount;
 
+                // 计算买入金额占买入前可用现金的比例
+                let cash_before_buy = state.cash + buy_amount;
+                let pct = (buy_amount / cash_before_buy * 100.0) as i32;
                 state.trades.push(Trade {
                     date: *date,
                     action: "买入".to_string(),
@@ -434,10 +457,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
                     shares: buy_shares,
                     price: *price,
                     amount: buy_amount,
-                    pct: format!(
-                        "{}%",
-                        (buy_amount / (state.cash + buy_amount) * 100.0) as i32
-                    ),
+                    pct: format!("{}%", pct),
                     ann_ret: None,
                 });
             }

@@ -1,0 +1,36 @@
+# 极致逆向配置 - 最大化恐慌区间买入
+[settings]
+annualized_target_low = 8.0   # 降低止盈线，更快锁定利润
+annualized_target_high = 12.0
+min_holding_days = 21         # 缩短最小持仓天数
+min_absolute_profit_days = 60
+max_contrarian_weight = 3.0   # 提高逆向权重，更激进地加仓浮亏标的
+report_output_dir = "./reports"
+
+[allocation]
+us_stocks = 50.0
+cn_stocks = 30.0
+counter_cyclical = 20.0
+
+[thresholds]
+extreme_fear = 30.0           # 收紧极度恐慌区间
+fear = 45.0
+neutral = 55.0
+greed = 70.0                  # 提前进入贪婪区间
+
+[buy_ratio]
+extreme_fear = 80.0           # 极度恐慌时重仓
+fear = 50.0                   # 恐慌时半仓
+neutral = 0.0                 # 中性不买
+greed = 0.0
+
+[sell_ratio]
+extreme_greed_target_high = 70.0   # 极度贪婪高收益减仓70%
+extreme_greed_target_low = 50.0
+extreme_greed_below_target = 30.0
+greed_target_high = 60.0
+greed_target_low = 40.0
+neutral_target_high = 20.0
+
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
