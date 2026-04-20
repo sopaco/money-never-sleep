@@ -46,4 +46,4 @@ All in `d:\Workspace\toys\MNS\.ai-context\`
 
 - `PRD.txt` — Full product spec (V2.1, 2026-04-19)
 - `README.md` — User-facing quick start
-- `.codebuddy/skills/mns-backtest/SKILL.md` — Backtest skill (separate)
+- `.agents/skills/mns-backtest/SKILL.md` — Backtest skill (separate)
