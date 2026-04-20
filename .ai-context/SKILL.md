@@ -1,7 +1,7 @@
 # AI Context — MNS Project
 
 > **Activation triggers** — Read this directory when:
-> - Starting a coding session in `d:\Workspace\toys\MNS`
+> - Starting a coding session in `money-never-sleep`
 > - User asks about project structure, architecture, or decisions
 > - Implementing new features or debugging
 > - User says "create ai-context", "setup project knowledge"
@@ -41,7 +41,7 @@ mns report
 
 ## Key Facts
 
-- **Language**: Rust (edition 2021)
+- **Language**: Rust (edition 2024)
 - **Database**: SQLite via `rusqlite` (bundled)
 - **HTTP**: `reqwest` for CNN Fear & Greed API
 - **CLI**: `clap` v4 (derive mode)
