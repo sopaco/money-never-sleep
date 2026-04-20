@@ -61,7 +61,7 @@ mns history
 | `src/strategy.rs` | Buy/sell calculation engine |
 | `src/report.rs` | Text report generation |
 | `PRD.txt` | Full product spec (source of truth for features) |
-| `.codebuddy/skills/mns-backtest/SKILL.md` | Backtest skill — activates on "回测" / "backtest" |
+| `.agents/skills/mns-backtest/SKILL.md` | Backtest skill — activates on "回测" / "backtest" |
 
 ## Important Conventions
 

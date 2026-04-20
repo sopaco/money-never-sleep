@@ -1,0 +1,24 @@
+{
+  "name": "@mns/bin-darwin-arm64",
+  "version": "0.5.0",
+  "description": "MNS binaries for macOS Apple Silicon",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "author": "Sopaco",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sopaco/mns.git",
+    "directory": "distribution/bin-darwin-arm64"
+  }
+}

@@ -28,7 +28,7 @@ description: |
 ### 回测执行
 
 ```bash
-python .codebuddy/skills/mns-backtest/scripts/backtest_runner.py
+python .agents/skills/mns-backtest/scripts/backtest_runner.py
 ```
 
 输出内容:
