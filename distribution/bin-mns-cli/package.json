@@ -1,6 +1,6 @@
 {
 	"name": "@never-sleeps/mns-cli",
-	"version": "0.5.5",
+	"version": "0.5.6",
 	"description": "MNS (Money Never Sleep) CLI tool. Installs the correct prebuilt binary for the current platform via npm optional dependencies.",
 	"license": "MIT",
 	"author": "Sopaco",
