@@ -525,19 +525,11 @@ async fn cmd_update_prices() -> Result<()> {
     let positions = db.list_positions()?;
 
     if positions.is_empty() {
-        println!("没有持仓资产，请先使用 'mns add' 添加资产");
+        println!("没有资产，请先使用 'mns add' 添加资产");
         return Ok(());
     }
 
-    // 过滤出有份额的持仓
-    let active_positions: Vec<_> = positions.iter().filter(|p| p.shares > 0.0).collect();
-
-    if active_positions.is_empty() {
-        println!("没有需要更新价格的持仓");
-        return Ok(());
-    }
-
-    println!("正在更新 {} 个资产的价格...\n", active_positions.len());
+    println!("正在更新 {} 个资产的价格...\n", positions.len());
 
     let updates = quote::update_all_prices(&positions).await?;
 

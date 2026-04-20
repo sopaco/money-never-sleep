@@ -138,11 +138,6 @@ pub async fn update_all_prices(positions: &[Position]) -> Result<Vec<PriceUpdate
     let mut updates = Vec::new();
 
     for pos in positions {
-        // 跳过份额为0的持仓
-        if pos.shares <= 0.0 {
-            continue;
-        }
-
         match fetch_price(&pos.asset_code, &pos.category).await {
             Ok(Some(new_price)) => {
                 updates.push(PriceUpdate {
