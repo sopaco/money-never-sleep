@@ -34,6 +34,7 @@ cargo build --release
 ### Run
 ```bash
 # All commands go through the mns binary
+# ⚠️ init 命令会提示确认后再覆盖已有数据，使用 --force 跳过确认
 mns init
 mns cash set 100000
 mns portfolio
@@ -122,6 +123,7 @@ Edit `src/config.rs` — `buy_ratio_for()` and `sell_ratio_for()` contain all th
 1. Add to `models.rs` struct
 2. Add to `db.rs` SQL queries
 3. Run `mns init` to recreate schema (or manually ALTER TABLE in sqlite3)
+   > ⚠️ `mns init` 会覆盖已有数据，建议先备份或手动 ALTER TABLE
 
 ### Running backtests
 Use the skill: say "回测" or "backtest" to activate the mns-backtest skill.

@@ -16,7 +16,7 @@
 # Build
 cargo build --release
 
-# Initialize
+# Initialize (如有数据会提示确认，使用 --force 跳过)
 mns init
 
 # Common workflow

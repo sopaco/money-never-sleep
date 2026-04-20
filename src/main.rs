@@ -9,7 +9,7 @@ mod strategy;
 use anyhow::Result;
 use clap::Parser;
 use cli::{CashAction, Commands};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
+use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use config::AppConfig;
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
-        Commands::Init => cmd_init()?,
+        Commands::Init { force } => cmd_init(force)?,
         Commands::Config { key, value } => cmd_config(key, value)?,
         Commands::Cash { action } => match action {
             None => cmd_cash()?,
@@ -25,9 +25,21 @@ async fn main() -> Result<()> {
             Some(CashAction::Add { amount }) => cmd_cash_add(amount)?,
         },
         Commands::Portfolio => cmd_portfolio()?,
-        Commands::Add { code, name, category } => cmd_add(&code, &name, &category)?,
-        Commands::Buy { code, shares, price } => cmd_buy(&code, shares, price)?,
-        Commands::Sell { code, shares, price } => cmd_sell(&code, shares, price)?,
+        Commands::Add {
+            code,
+            name,
+            category,
+        } => cmd_add(&code, &name, &category)?,
+        Commands::Buy {
+            code,
+            shares,
+            price,
+        } => cmd_buy(&code, shares, price)?,
+        Commands::Sell {
+            code,
+            shares,
+            price,
+        } => cmd_sell(&code, shares, price)?,
         Commands::Price { code, price } => cmd_price(&code, price)?,
         Commands::Sentiment => cmd_sentiment().await?,
         Commands::Report => cmd_report().await?,
@@ -37,7 +49,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn cmd_init() -> Result<()> {
+fn cmd_init(force: bool) -> Result<()> {
+    use std::io::{self, Write};
+
+    let config_path = AppConfig::config_path()?;
+    let db_path = AppConfig::db_path()?;
+
+    let config_exists = config_path.exists();
+    let db_exists = db_path.exists();
+
+    if (config_exists || db_exists) && !force {
+        println!("⚠️  检测到已有数据：");
+        if config_exists {
+            println!("   配置文件: {}", config_path.display());
+        }
+        if db_exists {
+            println!("   数据库:   {}", db_path.display());
+        }
+        println!();
+        print!("继续将覆盖上述文件，数据将丢失。是否继续？[y/N]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            println!("已取消初始化。");
+            return Ok(());
+        }
+    }
+
     let config = AppConfig::default_config();
     config.save()?;
 
@@ -49,8 +91,8 @@ fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(report_dir)?;
 
     println!("✓ 初始化完成");
-    println!("  配置文件: {}", AppConfig::config_path()?.display());
-    println!("  数据库:   {}", AppConfig::db_path()?.display());
+    println!("  配置文件: {}", config_path.display());
+    println!("  数据库:   {}", db_path.display());
     println!("  报告目录: {}", report_dir);
     Ok(())
 }
@@ -120,7 +162,9 @@ fn cmd_portfolio() -> Result<()> {
     let today = chrono::Local::now().date_naive();
     let min_days = config.settings.min_holding_days;
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("代码"),
         Cell::new("名称"),
@@ -203,7 +247,10 @@ fn cmd_buy(code: &str, shares: f64, price: f64) -> Result<()> {
     let db = db::Database::open()?;
     let amount = shares * price;
     db.buy_position(code, shares, price)?;
-    println!("✓ 买入 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}", code, shares, price, amount);
+    println!(
+        "✓ 买入 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}",
+        code, shares, price, amount
+    );
     Ok(())
 }
 
@@ -211,7 +258,10 @@ fn cmd_sell(code: &str, shares: f64, price: f64) -> Result<()> {
     let db = db::Database::open()?;
     let amount = shares * price;
     db.sell_position(code, shares, price)?;
-    println!("✓ 卖出 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}", code, shares, price, amount);
+    println!(
+        "✓ 卖出 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}",
+        code, shares, price, amount
+    );
     Ok(())
 }
 
@@ -298,7 +348,14 @@ async fn cmd_report() -> Result<()> {
     // 策略计算（先算风险警告，再算买入建议以实现联动）
     let sell_suggestions = strategy::calculate_sell_suggestions(&config, score, &positions);
     let risk_warnings = strategy::check_risk_warnings(&config, score, &positions);
-    let buy_suggestion = strategy::calculate_buy_suggestions(&config, score, cash, &positions, &sell_suggestions, &risk_warnings);
+    let buy_suggestion = strategy::calculate_buy_suggestions(
+        &config,
+        score,
+        cash,
+        &positions,
+        &sell_suggestions,
+        &risk_warnings,
+    );
 
     // 生成报告
     let report = report::generate_report(
@@ -332,11 +389,17 @@ fn cmd_history(limit: i64) -> Result<()> {
     }
 
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec!["日期", "类型", "代码", "份额", "价格", "金额"]);
 
     for tx in &txs {
-        let type_label = if tx.tx_type == "buy" { "买入" } else { "卖出" };
+        let type_label = if tx.tx_type == "buy" {
+            "买入"
+        } else {
+            "卖出"
+        };
         table.add_row(vec![
             Cell::new(&tx.tx_date),
             Cell::new(type_label),

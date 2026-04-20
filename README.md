@@ -12,7 +12,7 @@ cargo build --release
 ## 快速开始
 
 ```bash
-# 1. 初始化
+# 1. 初始化（如有数据会提示确认，使用 --force 跳过确认）
 mns init
 
 # 2. 设置初始现金
@@ -43,7 +43,7 @@ mns report
 
 | 命令 | 说明 |
 :|------|------|
-| `mns init` | 初始化配置和数据库 |
+| `mns init [-f, --force]` | 初始化配置和数据库（已有数据会提示确认） |
 | `mns config [key] [value]` | 查看/修改配置项（支持 dot-path 如 `thresholds.fear`） |
 | `mns cash` | 查看现金余额 |
 | `mns cash set <amount>` | 设置现金余额 |

@@ -63,7 +63,7 @@ CREATE TABLE fear_greed_snapshots (
 
 | 命令 | 说明 |
 |------|------|
-| `mns init` | 初始化配置和数据库 |
+| `mns init [-f, --force]` | 初始化配置和数据库（已有数据会提示确认，--force跳过确认） |
 | `mns config [key] [value]` | 查看/修改配置项 |
 | `mns cash` | 查看现金余额 |
 | `mns cash set <amount>` | 设置现金余额 |

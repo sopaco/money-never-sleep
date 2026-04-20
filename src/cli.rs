@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mns", version, about = "逆向投资助手 - Market Neutral Strategist")]
+#[command(
+    name = "mns",
+    version,
+    about = "逆向投资助手 - Market Neutral Strategist"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -10,7 +14,12 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// 初始化配置文件和数据库
-    Init,
+    /// 使用 --force 跳过确认提示
+    Init {
+        /// 跳过确认，强制覆盖已有数据
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// 查看/修改配置项
     Config {

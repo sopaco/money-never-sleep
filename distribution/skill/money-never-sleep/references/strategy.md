@@ -358,4 +358,4 @@ npx @never-sleeps/bin-darwin-arm64 config 'sell_ratio.("greed","above_high")' 0.
 
 ---
 
-**文档版本**: v0.5.0 | **更新日期**: 2025-06-16
+**文档版本**: v0.5.5 | **更新日期**: 2026-04-20
