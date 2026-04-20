@@ -1,10 +1,9 @@
 use crate::config::AppConfig;
 use crate::models::Position;
 use crate::strategy::{
-    BuySuggestion, ExcludedFromBuy, RiskWarning, SellSuggestion, calculate_buy_suggestions,
-    calculate_sell_suggestions, check_risk_warnings,
+    BuySuggestion, calculate_buy_suggestions, calculate_sell_suggestions, check_risk_warnings,
 };
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, NaiveDate};
 use std::collections::HashMap;
 
 const HISTORICAL_FGI_2016_2020: &str =
@@ -74,6 +73,7 @@ impl BacktestPosition {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Trade {
     pub date: NaiveDate,
@@ -87,6 +87,7 @@ pub struct Trade {
     pub ann_ret: Option<f64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct MonthlyValue {
     pub date: NaiveDate,
@@ -492,7 +493,7 @@ pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
     let sp500_data = parse_sp500_data(SP500_MONTHLY);
 
     // 找到起始和结束价格
-    let start_price = sp500_data
+    let _start_price = sp500_data
         .iter()
         .find(|(d, _)| *d >= bt_config.start_date)
         .map(|(_, p)| *p)
@@ -504,15 +505,15 @@ pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
         .map(|(_, p)| *p)
         .unwrap_or(6049.06);
 
-    let start_date = sp500_data
+    let _start_date = sp500_data
         .iter()
         .find(|(d, _)| *d >= bt_config.start_date)
         .map(|(d, _)| *d)
         .unwrap_or(bt_config.start_date);
 
     // 计算总投入
-    let start_year = bt_config.start_date.year();
-    let end_year = bt_config.end_date.year();
+    let _start_year = bt_config.start_date.year();
+    let _end_year = bt_config.end_date.year();
     let mut total_inflow = bt_config.initial_cash;
     let mut total_shares = 0.0;
     let mut trades: Vec<Trade> = Vec::new();
@@ -663,7 +664,7 @@ pub fn run_param_comparison(
 }
 
 pub fn run_custom_comparison(
-    base_config: &AppConfig,
+    _base_config: &AppConfig,
     bt_config: &BacktestConfig,
     config_paths: &[&str],
 ) -> Vec<BacktestResult> {

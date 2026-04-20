@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod db;
 mod models;
+mod quote;
 mod report;
 mod sentiment;
 mod strategy;
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
             Some(BacktestAction::Run { config, compare }) => cmd_backtest(config, compare)?,
             Some(BacktestAction::Params) => cmd_backtest_params()?,
         },
+        Commands::UpdatePrices => cmd_update_prices().await?,
     }
 
     Ok(())
@@ -515,5 +517,66 @@ fn cmd_backtest_params() -> Result<()> {
     println!("  mns backtest                           # 运行默认参数对比");
     println!("  mns backtest --config my_config.toml   # 使用指定配置文件");
     println!("  mns backtest --compare a.toml,b.toml    # 对比多个配置");
+    Ok(())
+}
+
+async fn cmd_update_prices() -> Result<()> {
+    let db = db::Database::open()?;
+    let positions = db.list_positions()?;
+
+    if positions.is_empty() {
+        println!("没有持仓资产，请先使用 'mns add' 添加资产");
+        return Ok(());
+    }
+
+    // 过滤出有份额的持仓
+    let active_positions: Vec<_> = positions.iter().filter(|p| p.shares > 0.0).collect();
+
+    if active_positions.is_empty() {
+        println!("没有需要更新价格的持仓");
+        return Ok(());
+    }
+
+    println!("正在更新 {} 个资产的价格...\n", active_positions.len());
+
+    let updates = quote::update_all_prices(&positions).await?;
+
+    if updates.is_empty() {
+        println!("未能更新任何资产价格");
+        return Ok(());
+    }
+
+    // 更新数据库并显示结果
+    println!(
+        "{:<10} {:<20} {:>12} {:>12} {:>8}",
+        "代码", "名称", "原价格", "新价格", "来源"
+    );
+    println!("{}", "-".repeat(66));
+
+    for update in &updates {
+        // 更新数据库
+        db.update_price(&update.asset_code, update.new_price)?;
+
+        let old = update
+            .old_price
+            .map(|p| format!("{:.4}", p))
+            .unwrap_or("-".to_string());
+        println!(
+            "{:<10} {:<20} {:>12} {:>12} {:>8}",
+            update.asset_code,
+            if update.asset_name.len() > 18 {
+                &update.asset_name[..18]
+            } else {
+                &update.asset_name
+            },
+            old,
+            format!("{:.4}", update.new_price),
+            update.source
+        );
+    }
+
+    println!();
+    println!("✓ 已更新 {} 个资产价格", updates.len());
+
     Ok(())
 }

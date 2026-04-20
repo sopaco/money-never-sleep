@@ -50,6 +50,7 @@
 | `config.rs` | TOML load/save, 5-zone threshold logic, dot-path get/set | `AppConfig::load()`, `save()`, `sentiment_zone()`, `buy_ratio_for()`, `sell_ratio_for()`, `get_value()`, `set_value()` |
 | `db.rs` | SQLite CRUD (transactional, auto-create tables) | `Database::open()`, `get_cash_balance()`, `buy_position()`, `sell_position()`, `save_fear_greed_snapshot()`, etc. |
 | `models.rs` | Data structures + return calculations | `Position`, `Transaction`, `FearGreedResponse`; `annualized_return_with_min_days()`, `absolute_return()`, `market_value_or_cost()` |
+| `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） | `fetch_price(code, category)` async, `update_all_prices()` async, `PriceUpdate` |
 | `sentiment.rs` | CNN API fetch with custom headers | `fetch_fear_greed(config)` async |
 | `strategy.rs` | Strategy engine (sell→buy→risk order) | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
 | `report.rs` | Report generation with net flow + risk + presets | `generate_report()`, `save_report()` |

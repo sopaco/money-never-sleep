@@ -1,6 +1,6 @@
 # Dynamics — Active Issues & Constraints
 
-**Last updated**: 2026-04-20
+**Last updated**: 2026-04-21
 
 ---
 
@@ -23,6 +23,24 @@
 **Detail**: CNN Fear & Greed reflects US market sentiment only. Using it to drive buy/sell for A-shares and counter-cyclical assets may produce suboptimal signals (US fear ≠ China fear). No alternative data source implemented.
 **Workaround**: User interprets suggestions with judgment; counter-cyclical assets may move inversely to US sentiment by design.
 **Reported**: 2026-04-19
+
+### 4. QDII基金估值数据可能缺失
+**Severity**: Low
+**Detail**: 天天基金接口对部分QDII基金（如暂停申购的016668）不提供实时估值数据，`update-prices` 命令会跳过这类资产。
+**Workaround**: 用户需手动使用 `mns price <code> <价格>` 更新此类基金价格。
+**Reported**: 2026-04-21
+
+---
+
+## Recently Added Features
+
+### 自动更新资产价格 (`mns update-prices`)
+**Added**: 2026-04-21
+**Detail**: 新增 `mns update-prices` 命令，自动获取所有持仓资产的当前价格：
+- 国内基金（6位数字代码）：使用天天基金接口 `fundgz.1234567.com.cn`
+- 美股/ETF（字母代码）：使用 Yahoo Finance API
+- 失败时跳过该资产，继续处理其他资产
+- 显示更新结果表格（代码、名称、原价格、新价格、来源）
 
 ---
 

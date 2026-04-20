@@ -94,6 +94,9 @@ pub enum Commands {
         #[command(subcommand)]
         action: Option<BacktestAction>,
     },
+
+    /// 自动更新所有资产的当前价格
+    UpdatePrices,
 }
 
 #[derive(Subcommand)]
