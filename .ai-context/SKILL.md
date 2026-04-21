@@ -27,7 +27,7 @@ mns remove QQQ          # 删除资产（慎用）
 mns update-prices       # 自动更新所有资产价格
 mns portfolio
 mns report
-mns backtest            # 策略回测（使用保守配置）
+mns backtest            # 策略回测（多配置对比）
 ```
 
 ## File Map
@@ -37,6 +37,7 @@ mns backtest            # 策略回测（使用保守配置）
 | `SKILL.md` | This file — entry point |
 | `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） |
 | `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） |
+| `backtest.rs` | 回测引擎（多资产+多配置对比） |
 | `references/PROJECT-ESSENCE.md` | What & why |
 | `references/ARCHITECTURE.md` | Component relationships |
 | `references/DECISIONS.md` | Design decisions |
@@ -55,7 +56,7 @@ mns backtest            # 策略回测（使用保守配置）
 
 ## Architecture Summary
 
-8 source modules, single binary, no frontend yet (future Svelte 5).
+10 source modules, single binary, no frontend yet (future Svelte 5).
 
 Data flow: `sentiment` → `db` → `strategy` (sell→buy→risk) → `report`
 

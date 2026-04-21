@@ -1,6 +1,6 @@
 # Architecture — MNS
 
-**Last updated**: 2026-04-21
+**Last updated**: 2026-04-22
 
 ---
 
@@ -54,7 +54,7 @@
 | `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） | `fetch_fear_greed_index()` async |
 | `strategy.rs` | 策略引擎（sell→buy→risk 顺序） | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
 | `report.rs` | 报告生成（净操作+风险+预案） | `generate_report()`, `save_report()` |
-| `backtest.rs` | 回测引擎（单资产+多资产） | `run_backtest()`, `run_multi_asset_backtest()`, `print_comparison()` |
+| `backtest.rs` | 回测引擎（多资产+多配置对比） | `run_backtest()`, `run_multi_asset_backtest()`, `run_buy_and_hold()`, `print_comparison()` |
 | `main.rs` | 命令分发，UI输出 | 所有 `cmd_*` 函数 |
 
 ## Data Flow (report command)
@@ -102,20 +102,21 @@ Default configuration (保守配置):
 [settings]
 annualized_target_low = 10.0      # 年化10%开始减仓
 annualized_target_high = 15.0    # 年化15%大笔减仓
-min_holding_days = 45            # 更长最小持仓天数
-min_absolute_profit_days = 120  # 绝对收益持仓天数
+min_holding_days = 45            # 最小持仓天数
+min_absolute_profit_days = 120   # 绝对收益持仓天数
 max_contrarian_weight = 2.0     # 逆势加仓上限
+report_output_dir = "./reports"
 
 [allocation]
-us_stocks = 55.0                 # 降低美股占比
-cn_stocks = 25.0                 # 提高红利低波
-counter_cyclical = 20.0          # 提高黄金对冲
+us_stocks = 55.0                 # 美股占比
+cn_stocks = 25.0                 # A股占比
+counter_cyclical = 20.0          # 黄金对冲
 
 [thresholds]
-extreme_fear = 30.0              # 更严格的极度恐慌
+extreme_fear = 30.0              # 极度恐慌阈值
 fear = 45.0
 neutral = 55.0
-greed = 70.0                     # 更早触发贪婪
+greed = 70.0                     # 贪婪阈值
 
 [buy_ratio]
 extreme_fear = 60.0              # 极度恐慌60%仓位

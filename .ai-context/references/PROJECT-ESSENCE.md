@@ -1,12 +1,12 @@
 # Project Essence — MNS
 
-**Last updated**: 2026-04-21
+**Last updated**: 2026-04-22
 
 ---
 
 ## What
 
-MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that monitors market sentiment (Fear & Greed Index), analyzes portfolio positions against return targets, and generates daily buy/sell recommendations. Now includes backtesting with optimized parameters.
+MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that monitors market sentiment (Fear & Greed Index), analyzes portfolio positions against return targets, and generates daily buy/sell recommendations. Now includes backtesting with optimized parameters and multi-asset portfolio support.
 
 ## Why
 
@@ -22,12 +22,13 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 2. **Reads** current cash balance, positions, and cost basis from SQLite
 3. **Calculates** sell/buy suggestions based on:
    - Fear & Greed zone → whether/how much to sell or buy
-   - Annualized return (with min holding days) vs 15%/22% targets → profit-taking
+   - Annualized return (with min holding days) vs 10%/15% targets → profit-taking
    - Absolute return ≥ 30% → long-term profit-taking
    - Contrarian buy weighting → underwater positions get more allocation
 4. **Outputs** text report with sell/buy/risk/net operation guidance
 5. **Auto-updates** prices via `mns update-prices`
 6. **Backtests** strategy effectiveness with historical data (2016-2025)
+7. **Compares** multiple config variants in single run
 
 ## What It Does NOT Do
 
@@ -51,14 +52,14 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 ## Optimized Configuration (Default)
 
 Based on historical backtesting (2016-2025):
-- **年化收益**: 8-9%
-- **最大回撤**: 16-21%
-- **收益/回撤比**: 0.42+
+- **年化收益**: 8-9% (逆向策略) vs 11% (买入持有)
+- **最大回撤**: 21-28% (逆向策略) vs 15% (买入持有)
 
-Key parameters:
-- US stocks: 55% (reduced risk)
-- CN stocks: 25% (dividend low-vol)
-- Gold: 20% (enhanced hedge)
-- Extreme fear buy: 60% of cash
+Key parameters (保守配置):
+- US stocks: 55%
+- CN stocks: 25%
+- Gold: 20%
+- Extreme fear buy: 60%
 - Annualized targets: 10% / 15%
 - Min holding days: 45
+- Expected: 7-8% annual, 13-18% drawdown

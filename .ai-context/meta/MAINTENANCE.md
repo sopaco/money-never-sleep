@@ -1,8 +1,8 @@
 # Maintenance Guide — MNS AI Context
 
-**Last updated**: 2026-04-21
+**Last updated**: 2026-04-22
 
-> **2026-04-21**: Added `mns remove` command (cli.rs, db.rs, main.rs)
+> **2026-04-22**: 验证默认配置为保守配置 (US 55%, CN 25%, Gold 20%)，修正 .ai-context 与代码一致
 > **2026-04-21**: 切换恐贪指数数据源从 alternative.me (crypto) 到 CNN (stock market) (sentiment.rs, Cargo.toml, .ai-context/*)
 
 ---
