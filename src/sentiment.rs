@@ -7,10 +7,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-/// 默认 CNN API 端点
-pub const DEFAULT_CNN_API_URL: &str =
-    "https://production.dataviz.cnn.io/index/fearandgreed/graphdata";
-
 /// 请求超时时间（秒）
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
@@ -33,7 +29,6 @@ struct CnnResponse {
 #[derive(Debug, Deserialize)]
 struct FearGreed {
     score: f64,
-    rating: String,
 }
 
 /// 恐贪指数完整数据（含历史）
@@ -41,8 +36,6 @@ struct FearGreed {
 pub struct FearGreedData {
     /// 当前指数 (0-100)
     pub score: u8,
-    /// CNN 原始评级 (英文，如 "Fear", "Greed")
-    pub rating: String,
     /// 前日收盘值
     pub previous_close: Option<f64>,
     /// 一周前值
@@ -51,28 +44,6 @@ pub struct FearGreedData {
     pub previous_1_month: Option<f64>,
     /// 一年前值
     pub previous_1_year: Option<f64>,
-}
-
-/// 获取恐惧贪婪指数（使用默认 URL）
-///
-/// 便捷函数，使用默认 CNN API 端点
-pub async fn fetch_fear_greed_index() -> Result<u8> {
-    fetch_fear_greed_index_with_url(DEFAULT_CNN_API_URL).await
-}
-
-/// 获取恐惧贪婪指数（指定 URL）
-///
-/// 数据来源：CNN Business Fear & Greed Index (股票市场，范围 0-100)
-///
-/// # Arguments
-/// * `url` - CNN API 端点 URL
-///
-/// # Returns
-/// * `Ok(u8)` - 恐贪指数 (0-100)
-/// * `Err` - 网络错误或解析错误
-pub async fn fetch_fear_greed_index_with_url(url: &str) -> Result<u8> {
-    let data = fetch_fear_greed_data(url).await?;
-    Ok(data.score)
 }
 
 /// 获取完整恐贪指数数据（含历史）
@@ -157,7 +128,6 @@ fn parse_cnn_response(text: &str) -> Result<FearGreedData> {
 
     Ok(FearGreedData {
         score,
-        rating: cnn_data.fear_and_greed.rating,
         previous_close,
         previous_1_week,
         previous_1_month,
@@ -195,22 +165,14 @@ fn extract_historical_value(json_text: &str, field: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_fetch() {
-        let result = fetch_fear_greed_index().await;
-        assert!(result.is_ok());
-        let score = result.unwrap();
-        assert!(score <= 100);
-        println!("CNN FGI: {}", score);
-    }
+    const CNN_API_URL: &str = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata";
 
     #[tokio::test]
     async fn test_fetch_full_data() {
-        let result = fetch_fear_greed_data(DEFAULT_CNN_API_URL).await;
+        let result = fetch_fear_greed_data(CNN_API_URL).await;
         assert!(result.is_ok());
         let data = result.unwrap();
         println!("Score: {}", data.score);
-        println!("Rating: {}", data.rating);
         println!("Previous close: {:?}", data.previous_close);
         println!("Previous 1 week: {:?}", data.previous_1_week);
         println!("Previous 1 month: {:?}", data.previous_1_month);
