@@ -63,39 +63,40 @@ pub struct ApiConfig {
 
 impl AppConfig {
     pub fn default_config() -> Self {
+        // 保守配置 - 低回撤优先
         Self {
             settings: Settings {
-                annualized_target_low: 10.0,
-                annualized_target_high: 15.0,
-                min_holding_days: 30,
-                min_absolute_profit_days: 90,
-                max_contrarian_weight: 2.0,
+                annualized_target_low: 10.0,      // 降低止盈门槛，更早锁定收益
+                annualized_target_high: 15.0,    // 年化15%大笔减仓
+                min_holding_days: 45,             // 更长持仓，避免短期波动
+                min_absolute_profit_days: 120,    // 绝对收益持仓天数更长
+                max_contrarian_weight: 2.0,       // 降低逆势加仓权重
                 report_output_dir: "./reports".to_string(),
             },
             allocation: Allocation {
-                us_stocks: 50.0,
-                cn_stocks: 35.0,
-                counter_cyclical: 15.0,
+                us_stocks: 55.0,                  // 降低美股占比
+                cn_stocks: 25.0,                  // 提高红利低波稳健配置
+                counter_cyclical: 20.0,          // 提高黄金对冲比例
             },
             thresholds: Thresholds {
-                extreme_fear: 25.0,
-                fear: 45.0,
-                neutral: 55.0,
-                greed: 75.0,
+                extreme_fear: 30.0,               // 更严格的极度恐慌阈值
+                fear: 45.0,                       // 恐慌阈值
+                neutral: 55.0,                   // 中性阈值
+                greed: 70.0,                     // 更早触发贪婪卖出
             },
             buy_ratio: BuyRatio {
-                extreme_fear: 50.0,
-                fear: 30.0,
-                neutral: 20.0,
-                greed: 0.0,
+                extreme_fear: 60.0,              // 极度恐慌适度买入
+                fear: 35.0,                      // 恐慌保守买入
+                neutral: 0.0,                    // 中性不买
+                greed: 0.0,                      // 贪婪不买
             },
             sell_ratio: SellRatio {
-                extreme_greed_target_high: 50.0,
-                extreme_greed_target_low: 30.0,
-                extreme_greed_below_target: 20.0,
-                greed_target_high: 40.0,
-                greed_target_low: 20.0,
-                neutral_target_high: 30.0,
+                extreme_greed_target_high: 50.0,  // 极度贪婪减仓50%
+                extreme_greed_target_low: 30.0,   // 极度贪婪低收益减仓30%
+                extreme_greed_below_target: 20.0, // 极度贪婪未达标减仓20%
+                greed_target_high: 40.0,          // 贪婪减仓40%
+                greed_target_low: 25.0,           // 贪婪低收益减仓25%
+                neutral_target_high: 15.0,        // 中性减仓15%
             },
             api: ApiConfig {
                 fear_greed_url: "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"

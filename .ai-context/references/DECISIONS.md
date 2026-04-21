@@ -60,12 +60,12 @@
 ## Decision 6: Annualized return as the primary sell trigger, with min holding days guard
 
 **Context**: Needed a way to determine if a position has "earned enough" to take profit.
-**Choice**: `annualized = (current_price / cost_price) ^ (365 / holding_days) - 1`, with `min_holding_days` threshold (default 30).
+**Choice**: `annualized = (current_price / cost_price) ^ (365 / holding_days) - 1`, with `min_holding_days` threshold (default 21).
 **Rationale**:
 - Normalizes across positions held for different lengths
-- Directly maps to the user's 10%-15% annual target
-- Min days threshold prevents short-term noise from triggering extreme sell suggestions
-**Trade-off**: Positions held < 30 days show N/A for annualized — but absolute return still available as fallback.
+- Directly maps to the user's 15%-22% annual target
+- Min days threshold prevents short-term noise
+**Trade-off**: Positions held < 21 days show N/A for annualized — but absolute return still available.
 
 ---
 
@@ -76,21 +76,21 @@
 **Matrix**:
 
 ```
-              ≥15% annual   10-15%       <10%
-Extreme Greed    50%          30%        20%
-Greed            40%          20%         0% (hold)
-Neutral          30%          0%         0% (hold)
-Fear/EFear       0%           0%         0% (hold)
+              ≥22% annual   15-22%      <15%
+Extreme Greed    60%          40%        30%
+Greed            45%          30%        hold
+Neutral          25%          hold       hold
+Fear/EFear       hold         hold       hold
 ```
 
-**Rationale**: Full 3-zone matrix (neutral/greed/extreme_greed) matches PRD spec. Fear zones never trigger sell — contrarian strategy holds through fear.
+**Rationale**: Full 3-zone matrix matches PRD spec. Fear zones never trigger sell — contrarian strategy holds through fear.
 **Trade-off**: More parameters to tune. User can adjust via config.
 
 ---
 
 ## Decision 8: Absolute return ≥ 30% as secondary sell trigger
 
-**Context**: A position held 5 years may have 50% absolute gain but only 8.4% annualized — below the 10% target. It should still be a candidate for profit-taking.
+**Context**: A position held 5 years may have 50% absolute gain but only 8.4% annualized — below the 15% target. It should still be a candidate for profit-taking.
 **Choice**: If absolute return ≥ 30%, trigger sell in greedy environments even if annualized is below target.
 **Rationale**: Long-term positions with substantial unrealized gains deserve protection regardless of annualized rate.
 **Trade-off**: Hardcoded 30% threshold (could be made configurable).
@@ -115,7 +115,7 @@ Fear/EFear       0%           0%         0% (hold)
 **Choice**: Compute sell suggestions first, then pass sell proceeds into buy calculation.
 **Rationale**:
 - Available cash for buying = current balance + sell proceeds
-- Report shows net operation direction (net buy / net sell / hold)
+- Report shows net operation direction
 - More realistic view of what the user would actually do today
 **Trade-off**: Slightly more complex pipeline order (must compute sell before buy).
 
@@ -127,7 +127,7 @@ Fear/EFear       0%           0%         0% (hold)
 **Choice**: Only warn, never auto-sell. Warning advice varies by market zone:
 - Fear: "可能是加仓机会" (consider buying more)
 - Neutral: "审视基本面" (review fundamentals)
-- Greed: "紧急审视" (urgent review — market up but this position is down)
+- Greed: "紧急审视" (urgent review)
 **Rationale**: Selling at -20% locks in losses. Different sentiment contexts require different responses.
 **Trade-off**: If a position's fundamentals deteriorate, the user still needs to manually decide to exit.
 
@@ -142,14 +142,50 @@ Fear/EFear       0%           0%         0% (hold)
 
 ---
 
-## Decision 13: Multiple price data sources (Tian Tian Fund + Yahoo Finance)
+## Decision 13: finance-query crate for sentiment data
 
-**Context**: Needed a way to automatically update asset prices. Users hold both Chinese funds and US ETFs.
-**Choice**: Use two data sources based on code pattern:
-- 6-digit numeric codes → Tian Tian Fund (`fundgz.1234567.com.cn`)
-- Letter codes → Yahoo Finance (`query1.finance.yahoo.com`)
+**Context**: CNN Fear & Greed API is unreliable in some network environments.
+**Choice**: Use `finance-query = "2"` crate for sentiment data (alternative.me API).
 **Rationale**:
-- Tian Tian Fund is the de facto standard for Chinese fund data, free and reliable
-- Yahoo Finance covers global markets including US ETFs
-- Code pattern detection is simple and reliable
-**Trade-off**: Some QDII funds may not have real-time estimates on Tian Tian Fund; users must manually update those.
+- Better network reliability than CNN API
+- Free, no authentication required
+- Native async Rust support
+- Unified data access pattern
+**Trade-off**: alternative.me updates once per day vs CNN's real-time.
+
+---
+
+## Decision 14: Optimized conservative configuration as default
+
+**Context**: Original default config (US 70%, CN 15%, Gold 15%) was too aggressive for risk-averse users.
+**Choice**: Update default to conservative config (US 55%, CN 25%, Gold 20%) based on backtesting.
+**Rationale**:
+- Historical backtest shows 8-9% annualized return with lower drawdown
+- Better return/drawdown ratio (0.42+)
+- Lower volatility with higher hedge allocation
+- Moderate buy during extreme fear (60%)
+**Trade-off**: Lower expected return than aggressive config, but better risk-adjusted performance.
+
+---
+
+## Decision 15: Backtest embedded historical data
+
+**Context**: Need historical data for strategy validation without external dependencies.
+**Choice**: Embed CSV data in binary via `include_str!` macro.
+**Rationale**:
+- Zero runtime dependencies for backtest
+- Data travels with binary
+- No network calls during backtest
+**Trade-off**: Larger binary size, data updates require recompilation.
+
+---
+
+## Decision 16: Multiple backtest config variants
+
+**Context**: Need to compare different strategy parameters to find optimal configuration.
+**Choice**: Support loading multiple config files for comparison backtests.
+**Rationale**:
+- Systematic parameter exploration
+- Clear comparison of risk/return tradeoffs
+- Repeatable experiments
+**Trade-off**: More complex backtest module.

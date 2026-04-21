@@ -12,7 +12,7 @@ const HISTORICAL_FGI_2016_2020: &str =
 const SUPPLEMENTARY_FGI: &str =
     include_str!("../.agents/skills/mns-backtest/data/fgi_2020_2025.csv");
 
-const MONTHLY_DIVIDEND_LOW_VOL: &str = include_str!("../.agents/skills/mns-backtest/data/monthly_dividend_low_vol.csv");
+const MONTHLY_REAL_DATA: &str = include_str!("../.agents/skills/mns-backtest/data/monthly_real_final.csv");
 
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
@@ -206,12 +206,15 @@ impl BacktestResult {
 
 /// 多资产月度数据
 #[derive(Debug)]
+#[allow(dead_code)]
 struct MonthlyData {
     date: NaiveDate,
     fgi: f64,
     nasdaq: f64,
     dividend_low_vol: f64,
     gold_cny: f64,
+    india: f64,
+    japan: f64,
 }
 
 /// 多资产回测状态
@@ -427,6 +430,7 @@ pub struct MultiAssetMonthly {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct MultiAssetBacktestResult {
     pub name: String,
     pub total_inflow: f64,
@@ -518,12 +522,14 @@ fn parse_multi_asset_data(data: &str) -> Vec<MonthlyData> {
         .skip(1) // 跳过标题行
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 5 {
+            if parts.len() >= 7 {
                 let year_month = parts[0];
                 let fgi: f64 = parts[1].parse().ok()?;
                 let nasdaq: f64 = parts[2].parse().ok()?;
                 let dividend_low_vol: f64 = parts[3].parse().ok()?;
                 let gold_cny: f64 = parts[4].parse().ok()?;
+                let india: f64 = parts[5].parse().ok()?;
+                let japan: f64 = parts[6].parse().ok()?;
 
                 // 解析年月为日期（取月末）
                 let ym: Vec<&str> = year_month.split('-').collect();
@@ -546,6 +552,8 @@ fn parse_multi_asset_data(data: &str) -> Vec<MonthlyData> {
                             nasdaq,
                             dividend_low_vol,
                             gold_cny,
+                            india,
+                            japan,
                         });
                     }
                 }
@@ -571,7 +579,7 @@ fn get_zone_name(score: f64, config: &AppConfig) -> &'static str {
 
 /// 执行多资产回测
 pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> MultiAssetBacktestResult {
-    let monthly_data = parse_multi_asset_data(MONTHLY_DIVIDEND_LOW_VOL);
+    let monthly_data = parse_multi_asset_data(MONTHLY_REAL_DATA);
     
     // 过滤日期范围
     let filtered_data: Vec<_> = monthly_data
@@ -602,7 +610,7 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
         }
 
         let zone = get_zone_name(data.fgi, config);
-        let zone_changed = prev_zone.map_or(true, |pz| pz != zone);
+        let zone_changed = prev_zone != Some(zone);
         prev_zone = Some(zone);
 
         // 计算持仓信息
@@ -619,7 +627,7 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
             
             for sell in &sell_suggestions {
                 if sell.sell_shares >= 0.01 {
-                    let (shares, cost, first_buy) = if sell.asset_code == "NASDAQ" {
+                    let (shares, _cost, _first_buy) = if sell.asset_code == "NASDAQ" {
                         (state.us_shares, state.us_cost, state.us_first_buy)
                     } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
                         (state.cn_shares, state.cn_cost, state.cn_first_buy)
@@ -689,14 +697,14 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
 
             // 执行买入
             if us_amount > 0.0 && data.nasdaq > 0.0 {
-                let cash_before = state.cash;
+                let _cash_before = state.cash;
                 state.buy_us(us_amount, data.nasdaq, data.date);
                 
                 buy_count += 1;
                 buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
                 buy_by_asset.entry("NASDAQ".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(&zone.to_string()).unwrap().1 += us_amount;
-                buy_by_asset.get_mut(&"NASDAQ".to_string()).unwrap().1 += us_amount;
+                buy_by_zone.get_mut(zone).unwrap().1 += us_amount;
+                buy_by_asset.get_mut("NASDAQ").unwrap().1 += us_amount;
 
                 state.trades.push(MultiAssetTrade {
                     date: data.date,
@@ -718,8 +726,8 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
                 buy_count += 1;
                 buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
                 buy_by_asset.entry("DIVIDEND_LOW_VOL".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(&zone.to_string()).unwrap().1 += cn_amount;
-                buy_by_asset.get_mut(&"DIVIDEND_LOW_VOL".to_string()).unwrap().1 += cn_amount;
+                buy_by_zone.get_mut(zone).unwrap().1 += cn_amount;
+                buy_by_asset.get_mut("DIVIDEND_LOW_VOL").unwrap().1 += cn_amount;
 
                 state.trades.push(MultiAssetTrade {
                     date: data.date,
@@ -741,8 +749,8 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
                 buy_count += 1;
                 buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
                 buy_by_asset.entry("GOLD".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(&zone.to_string()).unwrap().1 += gold_amount;
-                buy_by_asset.get_mut(&"GOLD".to_string()).unwrap().1 += gold_amount;
+                buy_by_zone.get_mut(zone).unwrap().1 += gold_amount;
+                buy_by_asset.get_mut("GOLD").unwrap().1 += gold_amount;
 
                 state.trades.push(MultiAssetTrade {
                     date: data.date,
@@ -850,11 +858,12 @@ fn aggregate_fgi_to_monthly(fgi_data: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f6
 
 fn parse_sp500_data(data: &str) -> Vec<(NaiveDate, f64)> {
     data.lines()
+        .skip(1) // 跳过表头
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 2 {
+            if parts.len() >= 3 {
                 let year_month = parts[0];
-                let price: f64 = parts[1].parse().ok()?;
+                let price: f64 = parts[2].parse().ok()?; // nasdaq 列
 
                 let ym: Vec<&str> = year_month.split('-').collect();
                 if ym.len() == 2 {
@@ -902,7 +911,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
     fgi_data.sort_by_key(|(d, _)| *d);
 
     let monthly_fgi = aggregate_fgi_to_monthly(&fgi_data);
-    let sp500_data = parse_sp500_data(include_str!("../.agents/skills/mns-backtest/data/sp500_monthly.csv"));
+    let sp500_data = parse_sp500_data(MONTHLY_REAL_DATA);
 
     let mut combined_data: Vec<(NaiveDate, f64, f64)> = Vec::new();
     for (fgi_date, fgi_score) in &monthly_fgi {
@@ -942,7 +951,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
         };
 
         let zone = get_zone_name(*score, config);
-        let zone_changed = prev_zone.map_or(true, |pz| pz != zone);
+        let zone_changed = prev_zone != Some(zone);
         prev_zone = Some(zone);
 
         let positions: Vec<Position> = create_position(&state, *price, *date)
@@ -1103,7 +1112,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
 }
 
 pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
-    let sp500_data = parse_sp500_data(include_str!("../.agents/skills/mns-backtest/data/sp500_monthly.csv"));
+    let sp500_data = parse_sp500_data(MONTHLY_REAL_DATA);
 
     let end_price = sp500_data
         .iter()
@@ -1267,17 +1276,17 @@ pub fn run_custom_comparison(
     let mut results = Vec::new();
 
     for path in config_paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(custom_config) = toml::from_str::<AppConfig>(&content) {
-                let mut result = run_backtest(&custom_config, bt_config);
-                let name = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("自定义")
-                    .to_string();
-                result.name = name;
-                results.push(result);
-            }
+        if let Ok(content) = std::fs::read_to_string(path)
+            && let Ok(custom_config) = toml::from_str::<AppConfig>(&content)
+        {
+            let mut result = run_backtest(&custom_config, bt_config);
+            let name = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("自定义")
+                .to_string();
+            result.name = name;
+            results.push(result);
         }
     }
 
@@ -1289,7 +1298,7 @@ pub fn run_custom_comparison(
 
 /// 多资产买入持有基准
 pub fn run_multi_asset_buy_and_hold(bt_config: &BacktestConfig) -> MultiAssetBacktestResult {
-    let monthly_data = parse_multi_asset_data(MONTHLY_DIVIDEND_LOW_VOL);
+    let monthly_data = parse_multi_asset_data(MONTHLY_REAL_DATA);
     
     // 过滤日期范围
     let filtered_data: Vec<_> = monthly_data
@@ -1300,15 +1309,12 @@ pub fn run_multi_asset_buy_and_hold(bt_config: &BacktestConfig) -> MultiAssetBac
     let first_data = filtered_data.first().expect("No data");
     let last_data = filtered_data.last().expect("No data");
     
-    // 配置比例
-    let us_ratio = 0.50;
-    let cn_ratio = 0.35;
+    // 配置比例 - 使用优化后的激进配置
+    let us_ratio = 0.70;
+    let cn_ratio = 0.15;
     let gold_ratio = 0.15;
     
     let mut total_inflow = bt_config.initial_cash;
-    let mut us_shares = 0.0;
-    let mut cn_shares = 0.0;
-    let mut gold_shares = 0.0;
     let mut trades: Vec<MultiAssetTrade> = Vec::new();
     let mut monthly_values: Vec<MultiAssetMonthly> = Vec::new();
     let mut last_inflow_year = 0;
@@ -1318,9 +1324,9 @@ pub fn run_multi_asset_buy_and_hold(bt_config: &BacktestConfig) -> MultiAssetBac
     let cn_amount = bt_config.initial_cash * cn_ratio;
     let gold_amount = bt_config.initial_cash * gold_ratio;
     
-    us_shares = us_amount / first_data.nasdaq;
-    cn_shares = cn_amount / first_data.dividend_low_vol;
-    gold_shares = gold_amount / first_data.gold_cny;
+    let mut us_shares = us_amount / first_data.nasdaq;
+    let mut cn_shares = cn_amount / first_data.dividend_low_vol;
+    let mut gold_shares = gold_amount / first_data.gold_cny;
     
     trades.push(MultiAssetTrade {
         date: first_data.date,

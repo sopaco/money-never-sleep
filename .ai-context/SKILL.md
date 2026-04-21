@@ -26,6 +26,7 @@ mns buy QQQ 100 350.00
 mns update-prices       # 自动更新所有资产价格
 mns portfolio
 mns report
+mns backtest            # 策略回测（使用保守配置）
 ```
 
 ## File Map
@@ -34,6 +35,7 @@ mns report
 |------|---------|
 | `SKILL.md` | This file — entry point |
 | `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） |
+| `sentiment.rs` | 恐贪指数获取（finance-query/alternative.me） |
 | `references/PROJECT-ESSENCE.md` | What & why |
 | `references/ARCHITECTURE.md` | Component relationships |
 | `references/DECISIONS.md` | Design decisions |
@@ -44,7 +46,7 @@ mns report
 
 - **Language**: Rust (edition 2024)
 - **Database**: SQLite via `rusqlite` (bundled)
-- **HTTP**: `reqwest` for CNN Fear & Greed API, Tian Tian Fund, Yahoo Finance
+- **HTTP**: `reqwest` for APIs; `finance-query` crate for sentiment
 - **CLI**: `clap` v4 (derive mode)
 - **Config**: TOML at `~/.mns/config.toml`
 - **Data**: SQLite at `~/.mns/mns.db`
@@ -55,5 +57,7 @@ mns report
 8 source modules, single binary, no frontend yet (future Svelte 5).
 
 Data flow: `sentiment` → `db` → `strategy` (sell→buy→risk) → `report`
+
+Default config: **保守配置** (US 55%, CN 25%, Gold 20%)
 
 See `references/ARCHITECTURE.md` for details.

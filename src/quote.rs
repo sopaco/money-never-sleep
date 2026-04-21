@@ -94,16 +94,13 @@ async fn fetch_from_yahoo(symbol: &str) -> Result<Option<f64>> {
     let json: serde_json::Value = resp.json().await.context("解析 Yahoo Finance 响应失败")?;
 
     // 解析 Yahoo Finance v8 API 响应
-    if let Some(result) = json.get("chart").and_then(|c| c.get("result")) {
-        if let Some(first) = result.as_array().and_then(|arr| arr.first()) {
-            if let Some(meta) = first.get("meta") {
-                if let Some(price) = meta.get("regularMarketPrice").and_then(|v| v.as_f64()) {
-                    if price > 0.0 {
-                        return Ok(Some(price));
-                    }
-                }
-            }
-        }
+    if let Some(result) = json.get("chart").and_then(|c| c.get("result"))
+        && let Some(first) = result.as_array().and_then(|arr| arr.first())
+        && let Some(meta) = first.get("meta")
+        && let Some(price) = meta.get("regularMarketPrice").and_then(|v| v.as_f64())
+        && price > 0.0
+    {
+        return Ok(Some(price));
     }
 
     Ok(None)
@@ -126,7 +123,7 @@ pub async fn fetch_price(code: &str, category: &str) -> Result<Option<f64>> {
         }
         // 如果天天基金没有数据，可能是 QDII 等特殊基金，尝试 Yahoo
         // QDII 在 Yahoo 可能有对应代码，但通常不完整
-        return Ok(None);
+        Ok(None)
     } else {
         // 美股/ETF: 使用 Yahoo Finance
         fetch_from_yahoo(code).await

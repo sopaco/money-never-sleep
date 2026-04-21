@@ -299,35 +299,16 @@ fn cmd_price(code: &str, price: Option<f64>) -> Result<()> {
 
 async fn cmd_sentiment() -> Result<()> {
     let config = AppConfig::load()?;
-    println!("正在获取 CNN 恐贪指数...");
-    let data = sentiment::fetch_fear_greed(&config).await?;
-
-    let zone = config.sentiment_zone(data.fear_and_greed.score);
-    println!("CNN 恐贪指数: {:.2} ({})", data.fear_and_greed.score, zone);
-    if let Some(pc) = data.fear_and_greed.previous_close {
-        println!("前日收盘: {:.2}", pc);
-    }
-    if let Some(pw) = data.fear_and_greed.previous_1_week {
-        println!("周环比: {:.2} → {:.2}", pw, data.fear_and_greed.score);
-    }
-    if let Some(pm) = data.fear_and_greed.previous_1_month {
-        println!("月环比: {:.2} → {:.2}", pm, data.fear_and_greed.score);
-    }
-    if let Some(py) = data.fear_and_greed.previous_1_year {
-        println!("年同比: {:.2} → {:.2}", py, data.fear_and_greed.score);
-    }
-
+    println!("正在获取恐贪指数...");
+    let score = sentiment::fetch_fear_greed_index().await?;
+    let score_f64 = score as f64;
+    let zone = config.sentiment_zone(score_f64);
+    println!("恐贪指数: {} ({})", score, zone);
+    
     // 保存快照
     let db = db::Database::open()?;
-    db.save_fear_greed_snapshot(
-        data.fear_and_greed.score,
-        zone,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
-    )?;
-
+    db.save_fear_greed_snapshot(score_f64, zone, None, None, None, None)?;
+    
     Ok(())
 }
 
@@ -335,30 +316,23 @@ async fn cmd_report() -> Result<()> {
     let config = AppConfig::load()?;
     let db = db::Database::open()?;
 
-    println!("正在获取 CNN 恐贪指数...");
-    let data = sentiment::fetch_fear_greed(&config).await?;
-    let score = data.fear_and_greed.score;
-    let rating = config.sentiment_zone(score);
+    println!("正在获取恐贪指数...");
+    let score = sentiment::fetch_fear_greed_index().await?;
+    let score_f64 = score as f64;
+    let rating = config.sentiment_zone(score_f64);
 
     // 保存快照
-    db.save_fear_greed_snapshot(
-        score,
-        rating,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
-    )?;
+    db.save_fear_greed_snapshot(score_f64, rating, None, None, None, None)?;
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
 
     // 策略计算（先算风险警告，再算买入建议以实现联动）
-    let sell_suggestions = strategy::calculate_sell_suggestions(&config, score, &positions);
-    let risk_warnings = strategy::check_risk_warnings(&config, score, &positions);
+    let sell_suggestions = strategy::calculate_sell_suggestions(&config, score_f64, &positions);
+    let risk_warnings = strategy::check_risk_warnings(&config, score_f64, &positions);
     let buy_suggestion = strategy::calculate_buy_suggestions(
         &config,
-        score,
+        score_f64,
         cash,
         &positions,
         &sell_suggestions,
@@ -368,12 +342,12 @@ async fn cmd_report() -> Result<()> {
     // 生成报告
     let report = report::generate_report(
         &config,
-        score,
+        score_f64,
         rating,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
+        None,
+        None,
+        None,
+        None,
         cash,
         &positions,
         &buy_suggestion,

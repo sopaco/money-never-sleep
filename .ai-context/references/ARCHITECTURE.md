@@ -1,6 +1,6 @@
 # Architecture — MNS
 
-**Last updated**: 2026-04-20
+**Last updated**: 2026-04-21
 
 ---
 
@@ -21,11 +21,11 @@
 └────────┘       │
            ┌─────┴─────┐
            ▼           ▼
-      ┌────────┐  ┌─────────┐
+      ┌────────┐  ┌──────────┐
       │ db.rs  │  │sentiment.rs│
-      │SQLite  │  │ HTTP reqwest│
+      │SQLite  │  │finance-query│
       │(txn)   │  └────┬────┘
-      └────┬───┘  └────┬────┘
+      └────┬───┘       │
            │           │
            ▼           ▼
       ┌────────┐  ┌──────────┐
@@ -35,11 +35,11 @@
            │       └────┬─────┘
            │            │
            ▼            ▼
-      ┌──────────┐
-      │report.rs │
-      │ text +   │
-      │ net flow │
-      └──────────┘
+      ┌──────────┐  ┌───────────┐
+      │report.rs │  │backtest.rs │
+      │ text +   │  │ 多资产回测 │
+      │ net flow │  │ 参数优化   │
+      └──────────┘  └───────────┘
 ```
 
 ## Module Responsibilities
@@ -47,61 +47,92 @@
 | Module | Responsibility | Public API |
 |--------|---------------|------------|
 | `cli.rs` | Clap command definitions | `Cli`, `Commands`, `CashAction` |
-| `config.rs` | TOML load/save, 5-zone threshold logic, dot-path get/set | `AppConfig::load()`, `save()`, `sentiment_zone()`, `buy_ratio_for()`, `sell_ratio_for()`, `get_value()`, `set_value()` |
-| `db.rs` | SQLite CRUD (transactional, auto-create tables) | `Database::open()`, `get_cash_balance()`, `buy_position()`, `sell_position()`, `save_fear_greed_snapshot()`, etc. |
-| `models.rs` | Data structures + return calculations | `Position`, `Transaction`, `FearGreedResponse`; `annualized_return_with_min_days()`, `absolute_return()`, `market_value_or_cost()` |
+| `config.rs` | TOML load/save, 5-zone threshold logic, dot-path get/set | `AppConfig::load()`, `save()`, `sentiment_zone()`, `buy_ratio_for()`, `sell_ratio_for()` |
+| `db.rs` | SQLite CRUD (transactional, auto-create tables) | `Database::open()`, `get_cash_balance()`, `buy_position()`, `sell_position()`, `save_fear_greed_snapshot()` |
+| `models.rs` | Data structures + return calculations | `Position`, `Transaction`; `annualized_return_with_min_days()`, `absolute_return()`, `market_value_or_cost()` |
 | `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） | `fetch_price(code, category)` async, `update_all_prices()` async, `PriceUpdate` |
-| `sentiment.rs` | CNN API fetch with custom headers | `fetch_fear_greed(config)` async |
-| `strategy.rs` | Strategy engine (sell→buy→risk order) | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
-| `report.rs` | Report generation with net flow + risk + presets | `generate_report()`, `save_report()` |
-| `main.rs` | Command dispatch, UI output | All `cmd_*` functions |
+| `sentiment.rs` | 恐贪指数获取（finance-query） | `fetch_fear_greed_index()` async |
+| `strategy.rs` | 策略引擎（sell→buy→risk 顺序） | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
+| `report.rs` | 报告生成（净操作+风险+预案） | `generate_report()`, `save_report()` |
+| `backtest.rs` | 回测引擎（单资产+多资产） | `run_backtest()`, `run_multi_asset_backtest()`, `print_comparison()` |
+| `main.rs` | 命令分发，UI输出 | 所有 `cmd_*` 函数 |
 
 ## Data Flow (report command)
 
 ```
 cmd_report()
-  1. sentiment::fetch_fear_greed()      → score, rating, prev values
-  2. db::Database::open()               → cash balance, positions
-  3. db::save_fear_greed_snapshot()     → persist daily snapshot
-  4. strategy::calculate_sell()         → Vec<SellSuggestion> (with reason: AnnualizedHigh | AbsoluteProfit)
-  5. strategy::calculate_buy(sell_refs) → BuySuggestion (available_cash = cash + sell_proceeds, contrarian weighting)
-  6. strategy::check_risk_warnings()    → Vec<RiskWarning> (sentiment-aware: ConsiderBuyMore | ReviewFundamentals | UrgentReview)
-  7. report::generate_report()          → formatted text (情绪+概览+持仓+卖出+买入+净操作+风险+预案)
-  8. report::save_report()              → write to {report_output_dir}/YYYY-MM-DD.txt
+  1. sentiment::fetch_fear_greed_index()   → score (0-100)
+  2. db::Database::open()                  → cash balance, positions
+  3. db::save_fear_greed_snapshot()        → persist daily snapshot
+  4. strategy::calculate_sell()             → Vec<SellSuggestion>
+  5. strategy::calculate_buy(sell_refs)    → BuySuggestion (available = cash + proceeds)
+  6. strategy::check_risk_warnings()       → Vec<RiskWarning>
+  7. report::generate_report()             → formatted text
+  8. report::save_report()                 → write to reports/
 ```
 
-**Key**: sell is computed first, so buy suggestions include sell proceeds.
+**Key**: sell 先计算，buy 使用 sell 回收金额。
+
+## Data Flow (backtest command)
+
+```
+cmd_backtest()
+  1. load historical data from embedded CSV
+  2. run_multi_asset_backtest() for 美股+红利低波+黄金
+  3. run_buy_and_hold() for baseline
+  4. run_backtest() with multiple config variants
+  5. print_comparison() showing all results
+```
 
 ## Database Schema
 
-Located at `~/.mns/mns.db` (auto-created on first `Database::open()`):
+Located at `~/.mns/mns.db`:
 
-- **cash** — single-row table (id=1): `balance`, `updated_at`
+- **cash** — single row: `balance`, `updated_at`
 - **positions** — `asset_code` (unique), `asset_name`, `category`, `shares`, `cost_price`, `current_price`, `first_buy_date`
-- **transactions** — `type` (buy/sell), `asset_code`, `shares`, `price`, `amount`, `tx_date`, `note`
-- **fear_greed_snapshots** — daily FGI scores (one per day, DELETE+INSERT on re-fetch)
+- **transactions** — `type`, `asset_code`, `shares`, `price`, `amount`, `tx_date`, `note`
+- **fear_greed_snapshots** — daily FGI scores (one per day)
 
 ## Configuration (TOML)
 
 Path: `~/.mns/config.toml`
 
-Key sections:
-- `[settings]` — `annualized_target_low/high`, `min_holding_days`, `report_output_dir`
-- `[allocation]` — `us_stocks`, `cn_stocks`, `counter_cyclical` (must sum to 100)
-- `[thresholds]` — `extreme_fear`, `fear`, `neutral`, `greed` score boundaries
-- `[buy_ratio]` — cash deployment % per sentiment zone (5 zones incl. extreme_greed=0%)
-- `[sell_ratio]` — profit-taking % per sentiment × return matrix (6 fields: 3 zones × 2 return levels + extreme_greed_below_target + neutral_target_high)
-- `[api]` — CNN API URL
+Default configuration (保守配置):
+```toml
+[settings]
+annualized_target_low = 10.0      # 年化10%开始减仓
+annualized_target_high = 15.0    # 年化15%大笔减仓
+min_holding_days = 45            # 更长最小持仓天数
+min_absolute_profit_days = 120  # 绝对收益持仓天数
+max_contrarian_weight = 2.0     # 逆势加仓上限
+
+[allocation]
+us_stocks = 55.0                 # 降低美股占比
+cn_stocks = 25.0                 # 提高红利低波
+counter_cyclical = 20.0          # 提高黄金对冲
+
+[thresholds]
+extreme_fear = 30.0              # 更严格的极度恐慌
+fear = 45.0
+neutral = 55.0
+greed = 70.0                     # 更早触发贪婪
+
+[buy_ratio]
+extreme_fear = 60.0              # 极度恐慌60%仓位
+fear = 35.0                      # 恐慌35%
+neutral = 0.0                    # 中性不买
+greed = 0.0
+```
 
 ## Key Design Patterns
 
-- **Weighted average cost** — `buy_position()` recalculates cost_price as `(old_total + new_amount) / new_shares`
-- **Annualized return with min days** — `(current / cost) ^ (365 / holding_days) - 1`, N/A if < `min_holding_days`
-- **Absolute return** — `(current - cost) / cost`, used for long-term profit-taking regardless of annualized
-- **Contrarian buy distribution** — `distribute_amount_contrarian()` uses weight = `max(1.0, cost/current)`, favoring underwater positions
-- **Sentiment zone** — 5 zones determined by `thresholds.*` in config
-- **Sell matrix** — `sell_ratio_for(score, annualized_pct)` returns the % to sell based on 3×3 matrix (neutral/greed/extreme_greed × return level)
-- **Dual sell triggers** — annualized return (primary) + absolute return ≥ 30% (secondary, for long-held positions)
-- **Transactional DB** — `buy_position()` and `sell_position()` use SQLite transactions for atomicity
-- **Sentiment-aware risk** — `check_risk_warnings()` gives different advice based on market zone (fear=buy opportunity, neutral=review, greed=urgent)
-- **Dot-path config** — `get_value("thresholds.fear")` / `set_value("buy_ratio.extreme_fear", "50")` for CLI config management
+- **Weighted average cost** — `buy_position()` recalculates cost_price
+- **Annualized return with min days** — N/A if < `min_holding_days`
+- **Absolute return** — for long-term profit-taking
+- **Contrarian buy distribution** — weight = `max(1.0, cost/current)`
+- **Sentiment zone** — 5 zones from thresholds
+- **Sell matrix** — zone × return level
+- **Dual sell triggers** — annualized + absolute ≥ 30%
+- **Transactional DB** — SQLite transactions
+- **Sentiment-aware risk** — different advice per zone
+- **Dot-path config** — `get_value("thresholds.fear")`

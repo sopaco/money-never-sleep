@@ -1,32 +1,27 @@
+//! 恐惧贪婪指数获取模块
+//!
+//! 使用 finance-query crate 获取数据
+
 use anyhow::{Context, Result};
-use crate::config::AppConfig;
-use crate::models::FearGreedResponse;
+use finance_query::finance;
 
-pub async fn fetch_fear_greed(config: &AppConfig) -> Result<FearGreedResponse> {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+/// 获取恐惧贪婪指数
+///
+/// 数据来源：alternative.me (0-100)
+pub async fn fetch_fear_greed_index() -> Result<u8> {
+    let fg = finance::fear_and_greed().await
+        .context("获取恐惧贪婪指数失败")?;
+    Ok(fg.value)
+}
 
-    let resp = client
-        .get(&config.api.fear_greed_url)
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://www.cnn.com/markets/fear-and-greed")
-        .send()
-        .await
-        .context("请求 CNN 恐贪指数 API 失败")?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("API 请求失败，状态码: {}", status);
+    #[tokio::test]
+    async fn test_fetch() {
+        let result = fetch_fear_greed_index().await;
+        assert!(result.is_ok());
+        println!("FGI: {}", result.unwrap());
     }
-
-    let data: FearGreedResponse = resp
-        .json()
-        .await
-        .context("解析 CNN 恐贪指数响应失败")?;
-
-    Ok(data)
 }
