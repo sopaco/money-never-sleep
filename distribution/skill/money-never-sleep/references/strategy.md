@@ -6,46 +6,44 @@
 
 ## 配置层级
 
-MNS 配置采用分层结构：
+MNS 配置采用分层结构，存储于 `~/.mns/config.toml`：
 
 ```toml
-[database]
-path = "~/.mns/mns.db"
-
 [settings]
-min_holding_days = 30          # 最小持有天数（年化收益计算用）
-annualized_target_low = 10.0   # 年化止盈线下限
-annualized_target_high = 15.0  # 年化止盈线上限
-report_output_dir = "./reports"
+annualized_target_low = 10.0      # 年化止盈线下限(%)
+annualized_target_high = 15.0     # 年化止盈线上限(%)
+min_holding_days = 30             # 年化收益计算最小天数
+min_absolute_profit_days = 90     # 绝对收益止盈最小天数
+max_contrarian_weight = 2.0      # 逆向权重上限
+report_output_dir = "./reports"   # 报告输出目录
+
+[allocation]
+us_stocks = 50.0          # 美股目标配置比例(%)
+cn_stocks = 35.0          # A股目标配置比例(%)
+counter_cyclical = 15.0   # 逆周期资产配置比例(%)
 
 [thresholds]
-extreme_fear = 25      # 极度恐慌阈值
-fear = 45              # 恐慌阈值
-neutral = 55           # 中性阈值
-greed = 75             # 贪婪阈值
-extreme_greed = 100    # 极度贪婪阈值（通常固定为 100）
+extreme_fear = 25.0       # 极度恐慌阈值
+fear = 45.0               # 恐慌阈值
+neutral = 55.0            # 中性阈值
+greed = 75.0              # 贪婪阈值
 
 [buy_ratio]
-extreme_fear = 0.50    # 极度恐慌时买入比例（可用现金的 50%）
-fear = 0.30            # 恐慌时买入比例
-neutral = 0.20         # 中性时买入比例
-greed = 0.00           # 贪婪时不买入
-# extreme_greed 默认 0.00（通常不买入）
+extreme_fear = 50.0       # 极度恐慌买入比例(%)
+fear = 30.0               # 恐慌买入比例(%)
+neutral = 20.0            # 中性买入比例(%)
+greed = 0.0               # 贪婪买入比例(%)
 
 [sell_ratio]
-# 格式: ("情绪", "价格位置") = 卖出比例
-# 价格位置定义:
-#   above_high  - 当前价格高于阻力位（盈利状态）
-#   between     - 价格在支撑位和阻力位之间
-#   below_low   - 当前价格低于支撑位（浮亏状态）
+extreme_greed_target_high = 50.0    # 极度贪婪+高年化卖出(%)
+extreme_greed_target_low = 30.0     # 极度贪婪+低年化卖出(%)
+extreme_greed_below_target = 20.0  # 极度贪婪+未达标卖出(%)
+greed_target_high = 40.0            # 贪婪+高年化卖出(%)
+greed_target_low = 20.0             # 贪婪+低年化卖出(%)
+neutral_target_high = 30.0          # 中性+高年化卖出(%)
 
-"sell_ratio.(\"extreme_greed\",\"above_high\")" = 0.50
-"sell_ratio.(\"extreme_greed\",\"between\")" = 0.30
-"sell_ratio.(\"extreme_greed\",\"below_low\")" = 0.20
-"sell_ratio.(\"greed\",\"above_high\")" = 0.40
-"sell_ratio.(\"greed\",\"between\")" = 0.20
-"sell_ratio.(\"greed\",\"below_low\")" = 0.00
-# neutral/fear/extreme_fear 默认无卖出（值为 0.00）
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 ```
 
 ---
@@ -70,15 +68,15 @@ CNN Fear & Greed Index 是一个 0-100 的指数，0 表示极度恐慌（Extrem
 
 ```bash
 # 将贪婪阈值从 75 降至 70，使贪婪区间更早触发
-mns config thresholds.greed 70
+mns config thresholds.greed 70.0
 
 # 将极度恐慌阈值从 25 提升至 30，减少极端情况下的买入频率
-mns config thresholds.extreme_fear 30
+mns config thresholds.extreme_fear 30.0
 ```
 
 **注意**: 区间必须保持连续性，建议:
-- `extreme_fear < fear < neutral < greed < extreme_greed`
-- 通常 `extreme_greed` 固定为 100
+- `extreme_fear < fear < neutral < greed`
+- 阈值单位为百分比数值（如 25.0 表示 25）
 
 ---
 
@@ -88,79 +86,70 @@ mns config thresholds.extreme_fear 30
 
 ### 参数说明
 
-- **可用现金**: `cash_balance + 卖出回笼资金`
-- **分配方式**: 按 contrarian 权重（浮亏资产权重更高）分配到各资产
-- **单次买入上限**: 单个资产不超过该比例 × 总可用现金
+- **可用现金**: `cash_balance + 卖出回笼资金`（买卖互感知）
+- **分配方式**: 按 contrarian 权重分配到各资产类别
+- **类别配置**: 按 `allocation` 比例分配到美股/A股/逆周期
 
 ### 默认配置
 
 | 情绪区间 | 买入比例 | 适用场景 |
 |---------|---------|---------|
-| extreme_fear | 0.50 | 恐慌极致，重仓抄底 |
-| fear | 0.30 | 恐慌情绪，积极建仓 |
-| neutral | 0.20 | 中性市场，小额布局 |
-| greed | 0.00 | 贪婪时暂停买入 |
-| extreme_greed | 0.00 | 极度贪婪时完全不买入 |
+| extreme_fear | 50.0% | 恐慌极致，重仓抄底 |
+| fear | 30.0% | 恐慌情绪，积极建仓 |
+| neutral | 20.0% | 中性市场，小额布局 |
+| greed | 0.0% | 贪婪时暂停买入 |
 
 ### 调优示例
 
 ```bash
 # 策略1: 极度贪婪时也可能小幅买入（左侧布局）
-mns config buy_ratio.extreme_greed 0.10
+mns config buy_ratio.greed 10.0
 
 # 策略2: 中性区间也暂停买入，只在明确的恐慌区间出手
-mns config buy_ratio.neutral 0.00
+mns config buy_ratio.neutral 0.0
 
-# 策略3: 极端恐慌时全仓出击
-mns config buy_ratio.extreme_fear 0.70
+# 策略3: 极端恐慌时加大买入
+mns config buy_ratio.extreme_fear 70.0
 ```
 
 ---
 
 ## 卖出比例矩阵 (`sell_ratio`)
 
-定义在特定情绪区间和价格位置下的卖出比例。卖出逻辑基于 **双准则**:
+定义在特定情绪区间和年化收益档位下的卖出比例。卖出逻辑基于 **双准则**:
 
-1. **年化收益止盈**: 当持仓年化收益率达到 `annualized_target_high` 且在对应情绪区间
-2. **绝对收益**: 当持仓绝对收益 ≥ 30% 时，也可考虑卖出（即使年化收益未达阈值）
+1. **年化收益止盈**: 当持仓年化收益率达标且处于可卖出情绪区间
+2. **绝对收益止盈**: 当持仓绝对收益 ≥ 30% 且持有天数足够长
 
-### 价格位置定义
+### 收益档位定义
 
-- `above_high`: 当前价格高于某个阻力位（通常意味着盈利）
-- `between`: 价格在支撑位和阻力位之间（中性区域）
-- `below_low`: 当前价格低于支撑位（浮亏状态）
-
-实际实现中，"价格位置" 是通过比较当前价格与成本价来判断的：
-- `above_high`: 当前价格显著高于成本（如 +10% 以上）
-- `between`: 价格在成本附近浮动（如 -10% ~ +10%）
-- `below_low`: 当前价格显著低于成本（如 -10% 以下）
+- `target_high`: 年化收益 ≥ `annualized_target_high`（默认 15%）
+- `target_low`: 年化收益 ≥ `annualized_target_low`（默认 10%）但 < target_high
+- `below_target`: 年化收益 < target_low（仅在极度贪婪时考虑部分卖出）
 
 ### 默认卖出矩阵
 
-| 情绪区间 | above_high | between | below_low |
-|---------|-----------|---------|-----------|
+| 情绪区间 | target_high | target_low | below_target |
+|---------|-------------|------------|--------------|
 | extreme_greed | 50% | 30% | 20% |
 | greed | 40% | 20% | 0% |
-| neutral | 0% | 0% | 0% |
-| fear | 0% | 0% | 0% |
-| extreme_fear | 0% | 0% | 0% |
+| neutral | 30% | 0% | 0% |
+| fear/extreme_fear | 0% | 0% | 0% |
 
-**解读**:
-- 只在 `Greed` 和 `Extreme Greed` 区间考虑卖出
-- 极度贪婪时卖出更激进（above_high 卖出 50%）
-- 浮亏状态（below_low）即使在贪婪区间也只部分卖出或持有
-
-### 调优示例
+### 配置路径
 
 ```bash
-# 极度贪婪且大幅盈利时，卖出 70%
-mns config sell_ratio.("extreme_greed","above_high") 0.70
+# 查看卖出配置
+mns config sell_ratio
 
-# 贪婪区间小幅盈利时也卖出 30%
-mns config sell_ratio.("greed","between") 0.30
+# 调整极度贪婪时的高收益卖出比例
+mns config sell_ratio.extreme_greed_target_high 70.0
 
-# 中性区间也开始部分止盈（保守策略）
-mns config sell_ratio.("neutral","above_high") 0.20
+# 调整贪婪时的中等收益卖出比例
+mns config sell_ratio.greed_target_low 30.0
+
+# 启用中性区间的部分止盈
+mns config sell_ratio.neutral_target_high 20.0
 ```
 
 ---
@@ -169,95 +158,150 @@ mns config sell_ratio.("neutral","above_high") 0.20
 
 ### `annualized_target_low` (默认 10.0)
 
-年化收益率的下限阈值。当持仓年化收益 ≥ 此值且处于可卖出的情绪区间时，触发部分卖出建议。
-
-**单位**: 百分比（0-100）
+年化收益率的下限阈值。当持仓年化收益 ≥ 此值且处于可卖出情绪区间时，触发部分卖出建议。
 
 ### `annualized_target_high` (默认 15.0)
 
-年化收益率的上限阈值。当持仓年化收益 ≥ 此值时，建议卖出比例达到最大。
+年化收益率的上限阈值。当持仓年化收益 ≥ 此值时，卖出比例达到该情绪区间的最大值。
 
 **调优示例**:
 
 ```bash
 # 保守止盈：年化 8% 就开始卖
-mns config annualized_target_low 8.0
-mns config annualized_target_high 12.0
+mns config settings.annualized_target_low 8.0
+mns config settings.annualized_target_high 12.0
 
 # 激进止盈：年化 20% 才开始卖
-mns config annualized_target_low 15.0
-mns config annualized_target_high 25.0
+mns config settings.annualized_target_low 15.0
+mns config settings.annualized_target_high 25.0
 ```
 
 ### `min_holding_days` (默认 30)
 
 最小持有天数。持仓天数小于此值时，不计算年化收益率（显示为 N/A），避免短期波动误导。
 
-**建议**: 
-- 短线策略可降至 7-15 天
-- 长线投资可提升至 60-90 天
+### `min_absolute_profit_days` (默认 90)
+
+绝对收益止盈的最小天数。只有持仓天数 ≥ 此值且绝对收益 ≥ 30% 时，才触发绝对收益止盈。
+
+**目的**: 避免短期投机操作，确保长期持有才能享受"坐过山车保护"。
 
 ---
 
-## 买入资金分配: Contrarian 权重
+## 逆向权重参数 (`settings`)
 
-MNS 的买入资金不是平均分配到各资产，而是采用 **逆向权重**:
+### `max_contrarian_weight` (默认 2.0)
+
+逆向权重的上限。防止浮亏过大的标的获得过多资金，导致过度集中风险。
+
+**权重公式**:
+```
+weight = min(max_contrarian_weight, max(1.0, cost_price / current_price))
+```
+
+**调优示例**:
+
+```bash
+# 降低权重上限，避免过度集中
+mns config settings.max_contrarian_weight 1.5
+
+# 提高权重上限，更激进抄底
+mns config settings.max_contrarian_weight 3.0
+```
+
+---
+
+## 资产配置参数 (`allocation`)
+
+定义买入资金在不同资产类别间的目标分配比例。
+
+### 默认配置
+
+| 类别 | 比例 | 说明 |
+|------|------|------|
+| us_stocks | 50% | 美股（如 QQQ, SPY） |
+| cn_stocks | 35% | A股（如沪深300成分股） |
+| counter_cyclical | 15% | 逆周期资产（如黄金ETF, 债券） |
+
+### 注意事项
+
+- 配置比例之和必须为 100%
+- 这是**目标参考比例**，非强制约束
+- 实际分配还会受 contrarian 权重影响
+
+### 调整示例
+
+```bash
+# 查看当前配置
+mns config allocation
+
+# 调整美股占比
+mns config allocation.us_stocks 60.0
+mns config allocation.cn_stocks 30.0
+mns config allocation.counter_cyclical 10.0
+```
+
+---
+
+## 买入资金分配: Contrarian 权重详解
+
+MNS 的买入资金不是平均分配，而是采用 **逆向权重**：
 
 ```
-weight_i = max(1.0, cost_price_i / current_price_i)
+weight_i = min(max_contrarian_weight, max(1.0, cost_price_i / current_price_i))
 ```
 
 ### 权重计算示例
 
-假设可用现金 100,000 元，有两个资产可供买入:
+假设 Fear 区间可用买入资金 30,000 元，有两个美股持仓：
 
 | 资产 | 成本价 | 当前价 | 浮亏/浮盈 | 权重计算 | 权重 |
 |------|--------|--------|----------|---------|------|
-| QQQ  | 450.00 | 460.50 | +2.3%    | max(1.0, 450/460.5) = 1.0 | 1.0 |
-| SH600| 12.30  | 11.80  | -4.1%    | max(1.0, 12.3/11.8) = 1.043 | 1.043 |
+| QQQ  | 450.00 | 460.50 | +2.3%    | min(2.0, max(1.0, 450/460.5)) = 1.0 | 1.0 |
+| AAPL | 180.00 | 150.00 | -16.7%   | min(2.0, max(1.0, 180/150)) = 1.2 | 1.2 |
 
 **分配结果**:
-- QQQ: `100000 × (1.0 / 2.043) × buy_ratio(fear) = 100000 × 0.489 × 0.30 = 14,670 元`
-- SH600: `100000 × (1.043 / 2.043) × buy_ratio(fear) = 100000 × 0.511 × 0.30 = 15,330 元`
+- QQQ: `30000 × (1.0 / 2.2) = 13,636 元`
+- AAPL: `30000 × (1.2 / 2.2) = 16,364 元`
 
-浮亏资产获得更高权重，符合 "越跌越买" 的逆向逻辑。
+浮亏资产获得更高权重，符合"越跌越买"的逆向逻辑，但权重上限防止过度集中。
+
+### 高浮亏排除机制
+
+当持仓浮亏 ≥ 30% 时，该标的会被**排除加仓列表**，避免"越亏越买"的基本面恶化风险。
 
 ---
 
 ## 卖出决策双准则详解
 
-### 准则1：年化收益率 + 情绪区间
+### 准则1：年化收益 + 情绪区间
 
-当同时满足以下条件时，触发基于年化收益的卖出建议:
+当同时满足以下条件时触发：
+1. 当前情绪在可卖出区间（neutral 及以上）
+2. 持仓年化收益 ≥ `annualized_target_low`
+3. 持仓天数 ≥ `min_holding_days`
 
-1. 当前情绪区间在 `sell_ratio` 矩阵中定义了卖出比例（如 `greed` 或 `extreme_greed`）
-2. 持仓年化收益率 ≥ `annualized_target_low`
-3. 根据年化收益率所处的区间（low/high）和情绪区间，查出对应的卖出比例
+卖出比例根据年化收益档位和情绪区间从 `sell_ratio` 矩阵查出。
 
-**卖出比例插值**:
-```rust
-// 伪代码
-if annualized < annualized_target_low:
-    ratio = 0.0
-else if annualized >= annualized_target_high:
-    ratio = sell_ratio[emotion][price_position]
-else:
-    // 线性插值
-    t = (annualized - low) / (high - low)
-    ratio = t * sell_ratio[emotion][price_position]
-```
+### 准则2：绝对收益止盈
 
-### 准则2：绝对收益 ≥ 30%
+当满足以下条件时触发：
+- 绝对收益 = (当前价 - 成本价) / 成本价 ≥ 30%
+- 持仓天数 ≥ `min_absolute_profit_days`（默认 90 天）
 
-当持仓满足以下条件时，即使年化收益率未达阈值，也建议卖出:
+**目的**: 锁定长期盈利，即使年化收益率因持有时间较长而降低。
 
-```
-absolute_return = (current_price - cost_price) / cost_price
-if absolute_return >= 0.30:
-    建议卖出比例 = sells 矩阵中对应值（根据情绪和价格位置）
-```
+---
 
-**目的**: 锁定长期盈利，避免 "坐过山车"。
+## 风险警告机制
+
+当持仓浮亏 ≥ 20% 时触发风险警告，建议根据市场情绪差异化处理：
+
+| 情绪环境 | 建议操作 |
+|---------|---------|
+| Extreme Fear/Fear | 可能是加仓机会 |
+| Neutral | 审视基本面 |
+| Greed/Extreme Greed | 紧急审视（别人赚钱你还在亏） |
 
 ---
 
@@ -266,69 +310,72 @@ if absolute_return >= 0.30:
 ### 1. 查看当前配置
 
 ```bash
-# 查看所有配置
 mns config
 
 # 查看特定分组
 mns config buy_ratio
 mns config sell_ratio
-mns config thresholds
+mns config settings
 ```
 
-### 2. 基于回测结果调整
-
-参考 `回测结果`（见 `backtest_runner.py` 输出）调整:
-
-- 如果回测显示 "中性区间买入过多"，降低 `buy_ratio.neutral` 到 0.10 或 0.00
-- 如果回测显示 "极度恐慌时收益高但仓位不足"，提升 `buy_ratio.extreme_fear` 到 0.60-0.70
-- 如果回测显示 "极度贪婪时卖出不够及时"，提升 `sell_ratio.("extreme_greed","above_high")` 到 0.60-0.70
-
-### 3. 小步快跑验证
-
-每次只调整 1-2 个参数，观察后续 `report` 输出和实际持仓表现。
+### 2. 运行回测验证
 
 ```bash
-# 调整 - 降低中性买入
-mns config buy_ratio.neutral 0.10
+# 查看可调参数
+mns backtest params
 
-# 观察 1 周后的 report 变化
-# 如果感觉买入频率下降明显，可继续微调
+# 运行默认配置回测
+mns backtest run
+
+# 测试新参数组合
+mns backtest run --config my_strategy.toml
 ```
 
-### 4. 保存参数快照
-
-将满意配置备份到文件:
+### 3. 调整参数
 
 ```bash
-mns config > config_backup_2025-06-16.toml
+# 每次只调整 1-2 个参数
+mns config buy_ratio.extreme_fear 60.0
+
+# 观察 report 变化
+mns report
+```
+
+### 4. 备份配置
+
+```bash
+mns config > config_backup_$(date +%Y%m%d).toml
 ```
 
 ---
 
-## 参数命名空间说明
+## 配置路径速查表
 
-### dot-path 语法
-
-MNS 支持 Rust TOML crate 的 dot-path 访问:
-
-```bash
-# 访问 thresholds.fear
-mns config thresholds.fear
-
-# 访问 sell_ratio 的元组键
-mns config sell_ratio.("greed","above_high")
-```
-
-### 特殊字符转义
-
-当键名包含引号或括号时，需转义:
-
-```bash
-# 正确的写法（外层引号，内层转义）
-mns config 'sell_ratio.("greed","above_high")' 0.50
-```
-
-在 shell 中，建议用单引号包裹整个参数以避免转义问题。
+| 配置路径 | 说明 | 默认值 |
+|---------|------|--------|
+| `settings.annualized_target_low` | 年化止盈下限(%) | 10.0 |
+| `settings.annualized_target_high` | 年化止盈上限(%) | 15.0 |
+| `settings.min_holding_days` | 年化收益最小天数 | 30 |
+| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 90 |
+| `settings.max_contrarian_weight` | 逆向权重上限 | 2.0 |
+| `settings.report_output_dir` | 报告输出目录 | ./reports |
+| `allocation.us_stocks` | 美股目标比例(%) | 50.0 |
+| `allocation.cn_stocks` | A股目标比例(%) | 35.0 |
+| `allocation.counter_cyclical` | 逆周期比例(%) | 15.0 |
+| `thresholds.extreme_fear` | 极度恐慌阈值 | 25.0 |
+| `thresholds.fear` | 恐慌阈值 | 45.0 |
+| `thresholds.neutral` | 中性阈值 | 55.0 |
+| `thresholds.greed` | 贪婪阈值 | 75.0 |
+| `buy_ratio.extreme_fear` | 极度恐慌买入(%) | 50.0 |
+| `buy_ratio.fear` | 恐慌买入(%) | 30.0 |
+| `buy_ratio.neutral` | 中性买入(%) | 20.0 |
+| `buy_ratio.greed` | 贪婪买入(%) | 0.0 |
+| `sell_ratio.extreme_greed_target_high` | 极度贪婪高收益卖(%) | 50.0 |
+| `sell_ratio.extreme_greed_target_low` | 极度贪婪低收益卖(%) | 30.0 |
+| `sell_ratio.extreme_greed_below_target` | 极度贪婪未达标卖(%) | 20.0 |
+| `sell_ratio.greed_target_high` | 贪婪高收益卖(%) | 40.0 |
+| `sell_ratio.greed_target_low` | 贪婪低收益卖(%) | 20.0 |
+| `sell_ratio.neutral_target_high` | 中性高收益卖(%) | 30.0 |
 
 ---
 
@@ -336,25 +383,8 @@ mns config 'sell_ratio.("greed","above_high")' 0.50
 
 - **参数调优需结合实际市场环境**: 回测结果是历史数据，不代表未来表现
 - **避免频繁调整**: 每次调整后至少观察 1-2 个月的实盘表现
-- **极端行情测试**: 回测中已包含 2020 年疫情、2022 年熊市等极端情况，但实际黑天鹅可能更严重
+- **分散投资**: `max_contrarian_weight` 可防止单一标的过度集中
 
 ---
 
-## 进阶话题
-
-### 动态阈值调整（未来方向）
-
-当前阈值为静态配置。未来可考虑:
-- 基于 VIX 指数动态调整 `thresholds`
-- 根据账户总资产规模调整 `buy_ratio`（规模越大，单次买入比例越低）
-- 基于持仓集中度调整 `sell_ratio`（单一资产占比过高时优先卖出）
-
-### 多因子情绪模型
-
-当前仅使用 CNN Fear & Greed Index。可扩展:
-- 加入 A 股情绪指标（沪深 300 波动率、涨跌停家数等）
-- 加入技术指标（RSI、MACD）作为补充过滤器
-
----
-
-**文档版本**: v0.5.6 | **更新日期**: 2026-04-20
+**文档版本**: v0.5.6 | **更新日期**: 2026-04-21

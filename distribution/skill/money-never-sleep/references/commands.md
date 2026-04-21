@@ -6,7 +6,7 @@
 
 | 命令 | 用途 | 异步 |
 |------|------|------|
-| `init` | 初始化和数据库 | 否 |
+| `init` | 初始化配置文件和数据库 | 否 |
 | `config` | 查看/修改配置 | 否 |
 | `cash` | 现金余额管理 | 否 |
 | `portfolio` | 查看持仓概览 | 否 |
@@ -17,6 +17,8 @@
 | `sentiment` | 查看当前恐贪指数 | 是 |
 | `report` | 生成策略报告 | 是 |
 | `history` | 查看交易历史 | 否 |
+| `backtest` | 策略回测 | 否 |
+| `update-prices` | 自动更新所有资产价格 | 是 |
 
 ---
 
@@ -24,7 +26,7 @@
 
 **语法**: `mns init [-f, --force]`
 
-**功能**: 初始化。
+**功能**: 初始化配置文件和数据库。
 
 **参数**:
 - `-f, --force`: 跳过确认提示，强制覆盖已有数据
@@ -48,12 +50,8 @@ mns init --force
 
 继续将覆盖上述文件，数据将丢失。是否继续？[y/N]: y
 ✓ 初始化完成
-  报告目录: ./reports
-```
-
-**输出示例（使用 --force）**:
-```
-✓ 初始化完成
+  配置文件: ~/.mns/config.toml
+  数据库: ~/.mns/mns.db
   报告目录: ./reports
 ```
 
@@ -80,41 +78,67 @@ mns config
 ```bash
 mns config thresholds.fear
 mns config buy_ratio.extreme_fear
+mns config sell_ratio.extreme_greed_target_high
 ```
 
 输出:
 ```
 thresholds.fear = 45
-buy_ratio.extreme_fear = 0.50
+buy_ratio.extreme_fear = 50.0
+sell_ratio.extreme_greed_target_high = 50.0
 ```
 
 ### 修改配置项
 ```bash
 mns config thresholds.greed 75
-mns config buy_ratio.fear 0.30
+mns config buy_ratio.fear 30.0
 ```
 
-**支持的特殊语法**:
-- 嵌套键: `thresholds.fear`
-- 数组索引: `sell_ratio.("greed","between")`（注意引号和括号）
+**支持的配置路径**:
+
+| 路径 | 说明 | 默认值 |
+|------|------|--------|
+| `settings.annualized_target_low` | 年化止盈下限(%) | 10.0 |
+| `settings.annualized_target_high` | 年化止盈上限(%) | 15.0 |
+| `settings.min_holding_days` | 最小持仓天数 | 30 |
+| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 90 |
+| `settings.max_contrarian_weight` | 最大逆向权重 | 2.0 |
+| `settings.report_output_dir` | 报告输出目录 | ./reports |
+| `allocation.us_stocks` | 美股配置比例(%) | 50.0 |
+| `allocation.cn_stocks` | A股配置比例(%) | 35.0 |
+| `allocation.counter_cyclical` | 逆周期配置比例(%) | 15.0 |
+| `thresholds.extreme_fear` | 极度恐慌阈值 | 25.0 |
+| `thresholds.fear` | 恐慌阈值 | 45.0 |
+| `thresholds.neutral` | 中性阈值 | 55.0 |
+| `thresholds.greed` | 贪婪阈值 | 75.0 |
+| `buy_ratio.extreme_fear` | 极度恐慌买入比例(%) | 50.0 |
+| `buy_ratio.fear` | 恐慌买入比例(%) | 30.0 |
+| `buy_ratio.neutral` | 中性买入比例(%) | 20.0 |
+| `buy_ratio.greed` | 贪婪买入比例(%) | 0.0 |
+| `sell_ratio.extreme_greed_target_high` | 极度贪婪+高收益卖出(%) | 50.0 |
+| `sell_ratio.extreme_greed_target_low` | 极度贪婪+低收益卖出(%) | 30.0 |
+| `sell_ratio.extreme_greed_below_target` | 极度贪婪+未达标卖出(%) | 20.0 |
+| `sell_ratio.greed_target_high` | 贪婪+高收益卖出(%) | 40.0 |
+| `sell_ratio.greed_target_low` | 贪婪+低收益卖出(%) | 20.0 |
+| `sell_ratio.neutral_target_high` | 中性+高收益卖出(%) | 30.0 |
 
 **示例 - 完整参数调优**:
 ```bash
 # 调整买入比例
-mns config buy_ratio.extreme_fear 0.60
-mns config buy_ratio.fear 0.25
-mns config buy_ratio.neutral 0.10
+mns config buy_ratio.extreme_fear 60.0
+mns config buy_ratio.fear 25.0
+mns config buy_ratio.neutral 10.0
 
 # 调整卖出矩阵
-mns config sell_ratio.("extreme_greed","above_high") 0.60
-mns config sell_ratio.("greed","above_high") 0.50
+mns config sell_ratio.extreme_greed_target_high 60.0
+mns config sell_ratio.greed_target_high 50.0
 
 # 调整止盈线
-mns config annualized_target_low 12.0
-mns config annualized_target_high 18.0
+mns config settings.annualized_target_low 12.0
+mns config settings.annualized_target_high 18.0
 
-# 调整最小持有天数（避免短期年化收益失真）
-mns config min_holding_days 30
+# 调整逆向权重上限
+mns config settings.max_contrarian_weight 1.5
 ```
 
 ---
@@ -269,7 +293,7 @@ mns sell SH600000 500 13.20
 
 **语法**: `mns price <CODE> [PRICE]`
 
-**功能**: 查看或更新资产的当前价格。
+**功能**: 查看或更新单个资产的当前价格。
 
 ### 查看当前价格
 ```bash
@@ -289,7 +313,40 @@ mns price QQQ 460.50
 **注意**:
 - 每次更新价格会更新对应持仓的 `current_price` 和 `current_at` 字段
 - 不更新价格会导致 `portfolio` 和 `report` 显示的市值不准确
-- 建议每日运行 `report` 前先更新价格，或编写脚本自动更新
+- 如需批量更新所有资产价格，请使用 `update-prices` 命令
+
+---
+
+## `update-prices`
+
+**语法**: `mns update-prices`
+
+**功能**: 自动更新所有持仓资产的当前价格。
+
+**行为说明**:
+- 遍历所有有持仓的资产
+- 尝试从网络获取最新价格（需要网络连接）
+- 更新数据库中的 `current_price` 字段
+- 此命令为异步命令
+
+**示例**:
+```bash
+mns update-prices
+```
+
+**输出示例**:
+```
+正在更新所有资产价格...
+✓ QQQ: 460.50
+✓ SH600000: 12.80
+✓ GLD: 182.35
+已完成 3 个资产的价格更新
+```
+
+**注意**:
+- 需要网络连接
+- 部分资产可能无法获取价格（如 A 股需要特定数据源）
+- 建议在执行 `report` 前先运行此命令
 
 ---
 
@@ -315,7 +372,7 @@ Previous Close: 38
 **注意**:
 - 此命令是异步的，需要网络访问
 - 如果 API 不可用，可能返回错误
-- 数据来自 `https://cnn.com/data/api/ Fear & Greed` 端点
+- 数据来自 CNN 官方 API 端点
 
 ---
 
@@ -338,7 +395,7 @@ mns report
 **输出节选**:
 ```
 ╔═══════════════════════════════════════════════════════════════╗
-║           MNS 逆向投资策略报告 - 2026-04-20                     ║
+║           MNS 逆向投资策略报告 - 2026-04-21                     ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 📊 市场情绪 (CNN Fear & Greed)
@@ -382,7 +439,7 @@ mns report
 **功能**: 查看最近的交易历史。
 
 **参数**:
-- `--limit N`: 显示条数，默认 20，最大 100
+- `--limit N`: 显示条数，默认 20
 
 **示例**:
 ```bash
@@ -399,9 +456,9 @@ mns history --limit 50
 ┌─────────────────┬───────┬────────┬──────┬────────┬──────────┐
 │ 时间            │ 类型  │ 资产   │ 份额 │ 价格   │ 金额     │
 ├─────────────────┼───────┼────────┼──────┼────────┼──────────┤
-│ 2025-06-15 10:3│ buy   │ QQQ    │ 50   │ 448.50 │ 22425.00 │
-│ 2025-06-14 14:2│ sell  │ SH600  │ 100  │ 13.00  │ 1300.00  │
-│ 2025-06-14 09:1│ price │ QQQ    │ -    │ 445.00 │ -        │
+│ 2025-06-15 10:30│ buy   │ QQQ    │ 50   │ 448.50 │ 22425.00 │
+│ 2025-06-14 14:20│ sell  │ SH600  │ 100  │ 13.00  │ 1300.00  │
+│ 2025-06-14 09:15│ price │ QQQ    │ -    │ 445.00 │ -        │
 └─────────────────┴───────┴────────┴──────┴────────┴──────────┘
 ```
 
@@ -412,13 +469,78 @@ mns history --limit 50
 
 ---
 
+## `backtest`
+
+**语法**: `mns backtest [SUBCOMMAND]`
+
+**功能**: 策略回测相关命令，基于历史数据验证策略表现。
+
+### 子命令
+
+#### `backtest run`
+运行回测。
+
+**语法**: `mns backtest run [-c, --config <PATH>] [-C, --compare <PATHS>]`
+
+**参数**:
+- `-c, --config <PATH>`: 配置文件路径，省略则使用默认配置
+- `-C, --compare <PATHS>`: 对比多个配置文件，逗号分隔
+
+**示例**:
+```bash
+# 使用默认配置运行回测
+mns backtest run
+
+# 指定配置文件
+mns backtest run --config ./my_strategy.toml
+
+# 对比多个策略配置
+mns backtest run --compare config1.toml,config2.toml,config3.toml
+```
+
+#### `backtest params`
+查看可调参数列表。
+
+**语法**: `mns backtest params`
+
+**示例**:
+```bash
+mns backtest params
+```
+
+**输出示例**:
+```
+可调参数列表:
+┌─────────────────────────────┬────────────────┬─────────────────┐
+│ 参数名                       │ 默认值          │ 说明             │
+├─────────────────────────────┼────────────────┼─────────────────┤
+│ buy_ratio.extreme_fear      │ 50.0           │ 极度恐慌买入比例  │
+│ buy_ratio.fear             │ 30.0           │ 恐慌买入比例     │
+│ ...                        │ ...            │ ...             │
+└─────────────────────────────┴────────────────┴─────────────────┘
+```
+
+---
+
 ## 通用 Exit Code
 
 | Code | 含义 |
 |------|------|
 | 0    | 成功 |
 | 1    | 通用错误（配置错误、参数错误、数据库错误等） |
-| 2    | 网络错误（仅影响 `sentiment`/`report`） |
+| 2    | 网络错误（仅影响 `sentiment`/`report`/`update-prices`） |
+
+---
+
+## 数据存储位置
+
+MNS 数据存储在用户主目录下的 `.mns` 文件夹：
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| 配置文件 | `~/.mns/config.toml` | TOML 格式的策略配置 |
+| 数据库 | `~/.mns/mns.db` | SQLite 数据库 |
+| 报告目录 | `./reports/` | 默认报告输出目录（可配置） |
 
 ---
 
@@ -439,6 +561,7 @@ mns history --limit 50
 - `shares` REAL NOT NULL
 - `cost_price` REAL NOT NULL
 - `current_price` REAL NOT NULL
+- `first_buy_date` TEXT NOT NULL
 - `updated_at` TIMESTAMP
 - `created_at` TIMESTAMP
 
@@ -450,10 +573,6 @@ mns history --limit 50
 - `price` REAL
 - `amount` REAL
 - `created_at` TIMESTAMP
-
-### `snapshots` (用于数据导出和审计)
-- `id` INTEGER PRIMARY KEY
-- `data` TEXT (JSON 格式的快照)
 
 ---
 
@@ -470,41 +589,4 @@ mns history --limit 50
 
 ---
 
-## 常见问题
-
-### Q: 如何批量导入历史交易？
-A: 暂无批量导入命令。可编写脚本依次调用 `buy`、`sell`、`price`，或直接操作 SQLite 数据库。
-
-### Q: 年化收益显示为 `N/A`？
-A: 持仓天数小于 `min_holding_days`（默认 30 天）时不计算年化收益，避免短期波动误导。
-
-### Q: 如何查看详细的卖出建议计算过程？
-A: 查看 `report` 输出中的 "卖出建议" 部分，或读取数据库中的 `positions` 表计算 `annualized_return`。
-
-### Q: 怎样将报告导出为 HTML？
-A: 当前报告为纯文本格式。可将输出重定向到文件后用第三方工具转换，或自行编写 wrapper 脚本生成 HTML。
-
-### Q: 能否在 Windows PowerShell 中正确显示中文？
-A: PowerShell 默认 GBK 编码可能导致乱码。解决方案：
-```powershell
-# 使用 UTF-8 编码
-chcp 65001
-# 或在命令前设置
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-```
-
----
-
-## 版本历史
-
-### v0.5.6 (当前)
-- 完整的 CLI 命令集
-- 异步 CNN Fear & Greed Index 获取
-- dot-path 配置管理
-- contrarian 买入分配
-- 双准则卖出决策
-- 多平台二进制分发（npm）
-
----
-
-**最后更新**: 2026-04-20
+**最后更新**: 2026-04-21

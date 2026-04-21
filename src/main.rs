@@ -425,7 +425,8 @@ fn cmd_history(limit: i64) -> Result<()> {
 fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<()> {
     use backtest::{
         BacktestConfig, print_comparison, run_backtest, run_buy_and_hold, run_custom_comparison,
-        run_param_comparison,
+        run_param_comparison, run_multi_asset_backtest, run_multi_asset_buy_and_hold,
+        print_multi_asset_comparison,
     };
 
     println!("=================================================================");
@@ -443,6 +444,21 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
         "[INFO] 初始资金: {:.0}, 年度注资: {:.0}",
         bt_config.initial_cash, bt_config.annual_inflow
     );
+    println!();
+
+    // 运行多资产回测
+    println!("[INFO] 运行多资产回测（美股+红利低波+黄金）...");
+    let config = AppConfig::load()?;
+    let multi_result = run_multi_asset_backtest(&config, &bt_config);
+    multi_result.print_report();
+    
+    // 多资产买入持有基准
+    println!("[INFO] 运行多资产买入持有基准...");
+    let multi_bnh_result = run_multi_asset_buy_and_hold(&bt_config);
+    multi_bnh_result.print_report();
+    
+    // 打印多资产对比
+    print_multi_asset_comparison(&[multi_result, multi_bnh_result]);
     println!();
 
     if let Some(paths) = compare {

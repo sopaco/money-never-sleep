@@ -13,7 +13,7 @@ description: |
   and then recorded via CLI commands.
 
   Triggers include: "管理投资组合", "生成策略建议", "获取市场报告", "查看持仓收益",
-  "更新现金余额", "记录买入卖出", "查看恐贪指数", "投资组合再平衡", "MNS 报告"
+  "更新现金余额", "记录买入卖出", "查看恐贪指数", "投资组合再平衡", "MNS 报告", "回测策略"
 license: MIT
 compatibility: Requires Node.js 18+ or Bun.
 metadata:
@@ -27,6 +27,7 @@ metadata:
         "os": ["darwin", "linux", "win32"]
       }
   }
+  
 ---
 
 # MNS CLI 投资管理 Skill
@@ -44,28 +45,41 @@ metadata:
 ## 核心能力
 
 1. **投资组合管理**: 查看持仓、现金余额、资产配置、年化收益
-2. **交易记录**: 记录买入/卖出操作，更新资产当前价格（手动输入，非自动抓取）
+2. **交易记录**: 记录买入/卖出操作，更新资产当前价格（手动输入或自动获取）
 3. **策略建议**: 自动生成基于最新恐贪指数的买卖建议报告（仅建议，不执行交易）
 4. **配置管理**: 查看和调整策略参数（阈值、买入/卖出比例、止盈线）
 5. **历史查询**: 查看交易历史、价格更新记录
+6. **策略回测**: 基于历史数据验证策略参数表现
 
 > **重要说明**: 本工具仅提供策略建议和记录功能，不连接任何券商 API。
 > 用户需自行在券商平台执行交易后，通过 CLI 记录交易结果。
 
 ## 快速开始
 
-### 安装（首次使用）
+### 安装
 
 ```bash
-# 安装 mns CLI（所有源码公开托管于 [GitHub](https://github.com/sopaco/money-never-sleep)）
+# 通过 npm 安装（推荐）
 npm install -g @never-sleeps/mns-cli
+
+# 或通过 bun 安装
+bun install -g @never-sleeps/mns-cli
+
+# 或直接使用 npx（无需安装）
+npx @never-sleeps/mns-cli --help
 ```
 
 ### 初始化
 
 ```bash
+# 初始化配置文件和数据库
 # 如果已有数据，会提示确认后再覆盖
 mns init
+
+# 使用 --force 跳过确认直接覆盖
+mns init --force
+
+# 设置初始现金
 mns cash set 100000
 ```
 
@@ -74,6 +88,7 @@ mns cash set 100000
 ```bash
 mns add QQQ "纳指100" us_stocks
 mns add SH600000 "浦发银行" cn_stocks
+mns add GLD "黄金ETF" counter_cyclical
 ```
 
 ### 记录买入交易
@@ -99,8 +114,11 @@ mns sentiment
 ### 更新价格和查看历史
 
 ```bash
-# 更新资产当前价格
+# 手动更新单个资产价格
 mns price QQQ 460.00
+
+# 自动更新所有资产价格（需要网络）
+mns update-prices
 
 # 查看最近交易历史
 mns history --limit 50
@@ -121,12 +139,31 @@ mns config buy_ratio.extreme_fear
 
 # 修改配置项（策略参数）
 mns config thresholds.greed 75
-mns config buy_ratio.fear 0.30
-mns config sell_ratio.("greed","between") 0.20
+mns config buy_ratio.fear 30.0
+mns config sell_ratio.extreme_greed_target_high 60.0
+```
+
+### 策略回测
+
+```bash
+# 查看可调参数列表
+mns backtest params
+
+# 运行默认配置回测
+mns backtest run
+
+# 使用自定义配置回测
+mns backtest run --config path/to/config.toml
+
+# 对比多个配置
+mns backtest run --compare config1.toml,config2.toml
 ```
 
 ## 数据存储
-- **报告输出**: `./reports/`（执行MNS CLI到目录），或通过 `settings.report_output_dir` 指定
+
+- **配置文件**: `~/.mns/config.toml`
+- **数据库**: `~/.mns/mns.db`
+- **报告输出**: `./reports/`（可通过 `settings.report_output_dir` 配置）
 
 ## 策略逻辑详解
 
@@ -146,41 +183,51 @@ mns config sell_ratio.("greed","between") 0.20
 
 卖出建议综合考虑：
 1. **年化收益止盈**: 基于持有天数计算年化收益率，对照卖出矩阵
-2. **绝对收益线**: 绝对收益 ≥ 30% 时也可考虑卖出（即使年化收益率不高）
+2. **绝对收益线**: 绝对收益 ≥ 30% 且持仓 ≥ 90 天时也可考虑卖出
 
-卖出矩阵（按情绪区间和价格位置）：
+卖出矩阵（按情绪区间和收益档位）：
 
-| 情绪 | 价格位置 | 卖出比例 |
-|------|---------|---------|
-| Extreme Greed | 高于阻力位 | 50% |
-| Extreme Greed | 在支撑阻力间 | 30% |
-| Extreme Greed | 低于支撑位 | 20% |
-| Greed | 高于阻力位 | 40% |
-| Greed | 在支撑阻力间 | 20% |
-| Greed | 低于支撑位 | 0% |
-| Neutral/Fear | 任何位置 | 0% |
+| 情绪区间 | target_high | target_low | below_target |
+|---------|-------------|------------|--------------|
+| Extreme Greed | 50% | 30% | 20% |
+| Greed | 40% | 20% | 0% |
+| Neutral | 30% | 0% | 0% |
+| Fear/Extreme Fear | 0% | 0% | 0% |
+
+> 注：target_high = 年化收益 ≥ annualized_target_high（默认15%），target_low = 年化收益 ≥ annualized_target_low（默认10%）
 
 ### 买入资金分配：Contrarian 权重
 
 可用现金按 contrarian 权重分配到各资产：
 
-- **权重公式**: `weight = max(1.0, cost_price / current_price)`
+- **权重公式**: `weight = min(max_weight, max(1.0, cost_price / current_price))`
 - **解释**: 浮亏资产（当前价格 < 成本价）获得更高权重，符合逆向抄底逻辑
+- **上限控制**: `max_contrarian_weight`（默认 2.0）防止过度集中单一标的
 - **浮盈资产**: 权重为 1.0（基线）
+
+### 风险警告机制
+
+当持仓浮亏 ≥ 20% 时触发风险警告，建议根据市场情绪差异化处理：
+
+| 情绪环境 | 建议操作 |
+|---------|---------|
+| Extreme Fear/Fear | 可能是加仓机会 |
+| Neutral | 审视基本面 |
+| Greed/Extreme Greed | 紧急审视（别人赚钱你还在亏） |
 
 ## 常见工作流
 
 ### 日常报告（Agent 每日执行）
 
 ```bash
-# 1. 查看策略报告（包含买卖建议、现金预测、风险警告）
+# 1. 自动更新所有资产价格
+mns update-prices
+
+# 2. 查看策略报告
 mns report
 
-# 2. 根据建议执行买入（如有）
+# 3. 根据建议执行买入（如有）
 mns buy QQQ 50 445.00
-
-# 3. 更新价格（如有新价格）
-mns price QQQ 448.50
 
 # 4. 记录卖出（如有）
 mns sell QQQ 100 455.00
@@ -189,24 +236,27 @@ mns sell QQQ 100 455.00
 mns portfolio
 ```
 
-### 策略参数调优（Agent 负责优化）
+### 策略参数调优
 
 ```bash
 # 查看当前买入比例
 mns config buy_ratio
 
 # 调整极端恐慌买入比例到 60%
-mns config buy_ratio.extreme_fear 0.60
+mns config buy_ratio.extreme_fear 60.0
 
 # 降低中性区间买入到 10%
-mns config buy_ratio.neutral 0.10
+mns config buy_ratio.neutral 10.0
 
-# 提高极度贪婪时的卖出比例
-mns config sell_ratio.("extreme_greed","above_high") 0.60
+# 调整卖出矩阵
+mns config sell_ratio.extreme_greed_target_high 70.0
 
-# 调整年化止盈线
-mns config annualized_target_low 12.0
-mns config annualized_target_high 18.0
+# 调整止盈线
+mns config settings.annualized_target_low 12.0
+mns config settings.annualized_target_high 18.0
+
+# 调整逆向权重上限（防止单标的过度集中）
+mns config settings.max_contrarian_weight 1.5
 ```
 
 ### 新资产添加流程
@@ -218,18 +268,46 @@ mns add TSLA "特斯拉" us_stocks
 # 2. 初始建仓买入
 mns buy TSLA 50 250.00
 
-# 3. 记录当前价格（后续需要定期更新）
+# 3. 更新当前价格
 mns price TSLA 255.00
 ```
 
+## 配置参数速查
+
+### 核心配置路径
+
+| 配置项 | 说明 | 默认值 |
+|-------|------|-------|
+| `settings.annualized_target_low` | 年化止盈下限 | 10.0 |
+| `settings.annualized_target_high` | 年化止盈上限 | 15.0 |
+| `settings.min_holding_days` | 年化收益计算最小天数 | 30 |
+| `settings.min_absolute_profit_days` | 绝对收益止盈最小天数 | 90 |
+| `settings.max_contrarian_weight` | 逆向权重上限 | 2.0 |
+| `thresholds.extreme_fear` | 极度恐慌阈值 | 25 |
+| `thresholds.fear` | 恐慌阈值 | 45 |
+| `thresholds.neutral` | 中性阈值 | 55 |
+| `thresholds.greed` | 贪婪阈值 | 75 |
+| `buy_ratio.extreme_fear` | 极度恐慌买入比例 | 50.0 |
+| `buy_ratio.fear` | 恐慌买入比例 | 30.0 |
+| `buy_ratio.neutral` | 中性买入比例 | 20.0 |
+| `buy_ratio.greed` | 贪婪买入比例 | 0.0 |
+| `sell_ratio.extreme_greed_target_high` | 极度贪婪且高年化卖出比例 | 50.0 |
+| `sell_ratio.extreme_greed_target_low` | 极度贪婪且中年化卖出比例 | 30.0 |
+| `sell_ratio.greed_target_high` | 贪婪且高年化卖出比例 | 40.0 |
+| `allocation.us_stocks` | 美股目标配置比例 | 50.0 |
+| `allocation.cn_stocks` | A股目标配置比例 | 35.0 |
+| `allocation.counter_cyclical` | 逆周期目标配置比例 | 15.0 |
+
+> 注：比例值单位为百分比（如 50.0 表示 50%）
+
 ## 注意事项
 
-- **价格更新**: 买入/卖出后必须调用 `price` 命令更新成本价到当前市值，否则持仓收益数据不准确
+- **价格更新**: 买入/卖出后建议调用 `price` 或 `update-prices` 命令更新价格，确保持仓收益数据准确
 - **时间敏感性**: `report` 和 `sentiment` 命令通过 HTTP 获取实时 CNN Fear & Greed Index，需要网络访问
 - **异步要求**: 这两个命令是异步的，agent 调用时需确保环境支持 async execution
 - **Windows 编码**: PowerShell 默认 GBK 编码可能导致中文乱码，建议使用 UTF-8 终端或重定向输出到文件
-- **年化收益计算**: 使用 `annualized = (current / cost) ^ (365 / holding_days) - 1`，短期持仓（< min_holding_days）的年化收益不显示
-- **绝对收益止盈**: 当持仓绝对收益 ≥ 30% 时，即使年化收益率未达阈值也可能触发卖出建议
+- **年化收益计算**: 使用 `annualized = (current / cost) ^ (365 / holding_days) - 1`，持仓天数 < min_holding_days 时不显示
+- **绝对收益止盈**: 持仓绝对收益 ≥ 30% 且天数 ≥ min_absolute_profit_days 时，即使年化收益率未达阈值也可能触发卖出
 
 ## 错误处理
 
@@ -238,8 +316,8 @@ mns price TSLA 255.00
 
 ## 相关文件
 
-- `references/` - 详细的技术参考文档（配置结构、数据库 schema、策略参数）
-- `assets/` - 模板文件（如报告 HTML 模板）
+- `references/commands.md` - 完整命令参考
+- `references/strategy.md` - 策略参数详解
 
 ## 开源信息
 
