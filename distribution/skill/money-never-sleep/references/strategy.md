@@ -12,26 +12,26 @@ MNS 配置采用分层结构，存储于 `~/.mns/config.toml`：
 [settings]
 annualized_target_low = 10.0      # 年化止盈线下限(%)
 annualized_target_high = 15.0     # 年化止盈线上限(%)
-min_holding_days = 30             # 年化收益计算最小天数
-min_absolute_profit_days = 90     # 绝对收益止盈最小天数
+min_holding_days = 45             # 年化收益计算最小天数
+min_absolute_profit_days = 120    # 绝对收益止盈最小天数
 max_contrarian_weight = 2.0      # 逆向权重上限
 report_output_dir = "./reports"   # 报告输出目录
 
 [allocation]
-us_stocks = 50.0          # 美股目标配置比例(%)
-cn_stocks = 35.0          # A股目标配置比例(%)
-counter_cyclical = 15.0   # 逆周期资产配置比例(%)
+us_stocks = 55.0          # 美股目标配置比例(%)
+cn_stocks = 25.0          # A股目标配置比例(%)
+counter_cyclical = 20.0   # 逆周期资产配置比例(%)
 
 [thresholds]
-extreme_fear = 25.0       # 极度恐慌阈值
+extreme_fear = 30.0       # 极度恐慌阈值
 fear = 45.0               # 恐慌阈值
 neutral = 55.0            # 中性阈值
-greed = 75.0              # 贪婪阈值
+greed = 70.0              # 贪婪阈值
 
 [buy_ratio]
-extreme_fear = 50.0       # 极度恐慌买入比例(%)
-fear = 30.0               # 恐慌买入比例(%)
-neutral = 20.0            # 中性买入比例(%)
+extreme_fear = 60.0       # 极度恐慌买入比例(%)
+fear = 35.0               # 恐慌买入比例(%)
+neutral = 0.0             # 中性买入比例(%)
 greed = 0.0               # 贪婪买入比例(%)
 
 [sell_ratio]
@@ -39,8 +39,8 @@ extreme_greed_target_high = 50.0    # 极度贪婪+高年化卖出(%)
 extreme_greed_target_low = 30.0     # 极度贪婪+低年化卖出(%)
 extreme_greed_below_target = 20.0  # 极度贪婪+未达标卖出(%)
 greed_target_high = 40.0            # 贪婪+高年化卖出(%)
-greed_target_low = 20.0             # 贪婪+低年化卖出(%)
-neutral_target_high = 30.0          # 中性+高年化卖出(%)
+greed_target_low = 25.0             # 贪婪+低年化卖出(%)
+neutral_target_high = 15.0          # 中性+高年化卖出(%)
 
 [api]
 fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -56,22 +56,22 @@ CNN Fear & Greed Index 是一个 0-100 的指数，0 表示极度恐慌（Extrem
 
 | 区间名称 | 指数范围 | 含义 | 买入比例 |
 |---------|---------|------|---------|
-| Extreme Fear | 0-25 | 市场极度恐慌，逆向买入信号强 | 50% |
-| Fear | 25-45 | 市场恐慌，适度买入 | 30% |
-| Neutral | 45-55 | 中性，小额买入或观望 | 20% |
-| Greed | 55-75 | 市场贪婪，谨慎持有 | 0% |
-| Extreme Greed | 75-100 | 市场极度贪婪，考虑减仓 | 0% |
+| Extreme Fear | 0-30 | 市场极度恐慌，逆向买入信号强 | 60% |
+| Fear | 30-45 | 市场恐慌，适度买入 | 35% |
+| Neutral | 45-55 | 中性，观望不买入 | 0% |
+| Greed | 55-70 | 市场贪婪，谨慎持有 | 0% |
+| Extreme Greed | 70-100 | 市场极度贪婪，考虑减仓 | 0% |
 
 ### 调整阈值
 
 通过修改 `thresholds` 可改变区间边界：
 
 ```bash
-# 将贪婪阈值从 75 降至 70，使贪婪区间更早触发
-mns config thresholds.greed 70.0
+# 将贪婪阈值从 70 降至 65，使贪婪区间更早触发
+mns config thresholds.greed 65.0
 
-# 将极度恐慌阈值从 25 提升至 30，减少极端情况下的买入频率
-mns config thresholds.extreme_fear 30.0
+# 将极度恐慌阈值从 30 提升至 35，减少极端情况下的买入频率
+mns config thresholds.extreme_fear 35.0
 ```
 
 **注意**: 区间必须保持连续性，建议:
@@ -94,9 +94,9 @@ mns config thresholds.extreme_fear 30.0
 
 | 情绪区间 | 买入比例 | 适用场景 |
 |---------|---------|---------|
-| extreme_fear | 50.0% | 恐慌极致，重仓抄底 |
-| fear | 30.0% | 恐慌情绪，积极建仓 |
-| neutral | 20.0% | 中性市场，小额布局 |
+| extreme_fear | 60.0% | 恐慌极致，重仓抄底 |
+| fear | 35.0% | 恐慌情绪，积极建仓 |
+| neutral | 0.0% | 中性市场，观望不买入 |
 | greed | 0.0% | 贪婪时暂停买入 |
 
 ### 调优示例
@@ -132,8 +132,8 @@ mns config buy_ratio.extreme_fear 70.0
 | 情绪区间 | target_high | target_low | below_target |
 |---------|-------------|------------|--------------|
 | extreme_greed | 50% | 30% | 20% |
-| greed | 40% | 20% | 0% |
-| neutral | 30% | 0% | 0% |
+| greed | 40% | 25% | 0% |
+| neutral | 15% | 0% | 0% |
 | fear/extreme_fear | 0% | 0% | 0% |
 
 ### 配置路径
@@ -176,11 +176,11 @@ mns config settings.annualized_target_low 15.0
 mns config settings.annualized_target_high 25.0
 ```
 
-### `min_holding_days` (默认 30)
+### `min_holding_days` (默认 45)
 
 最小持有天数。持仓天数小于此值时，不计算年化收益率（显示为 N/A），避免短期波动误导。
 
-### `min_absolute_profit_days` (默认 90)
+### `min_absolute_profit_days` (默认 120)
 
 绝对收益止盈的最小天数。只有持仓天数 ≥ 此值且绝对收益 ≥ 30% 时，才触发绝对收益止盈。
 
@@ -219,9 +219,9 @@ mns config settings.max_contrarian_weight 3.0
 
 | 类别 | 比例 | 说明 |
 |------|------|------|
-| us_stocks | 50% | 美股（如 QQQ, SPY） |
-| cn_stocks | 35% | A股（如沪深300成分股） |
-| counter_cyclical | 15% | 逆周期资产（如黄金ETF, 债券） |
+| us_stocks | 55% | 美股（如 QQQ, SPY） |
+| cn_stocks | 25% | A股（如沪深300成分股） |
+| counter_cyclical | 20% | 逆周期资产（如黄金ETF, 债券） |
 
 ### 注意事项
 
@@ -287,7 +287,7 @@ weight_i = min(max_contrarian_weight, max(1.0, cost_price_i / current_price_i))
 
 当满足以下条件时触发：
 - 绝对收益 = (当前价 - 成本价) / 成本价 ≥ 30%
-- 持仓天数 ≥ `min_absolute_profit_days`（默认 90 天）
+- 持仓天数 ≥ `min_absolute_profit_days`（默认 120 天）
 
 **目的**: 锁定长期盈利，即使年化收益率因持有时间较长而降低。
 
@@ -355,27 +355,27 @@ mns config > config_backup_$(date +%Y%m%d).toml
 |---------|------|--------|
 | `settings.annualized_target_low` | 年化止盈下限(%) | 10.0 |
 | `settings.annualized_target_high` | 年化止盈上限(%) | 15.0 |
-| `settings.min_holding_days` | 年化收益最小天数 | 30 |
-| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 90 |
+| `settings.min_holding_days` | 年化收益最小天数 | 45 |
+| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 120 |
 | `settings.max_contrarian_weight` | 逆向权重上限 | 2.0 |
 | `settings.report_output_dir` | 报告输出目录 | ./reports |
-| `allocation.us_stocks` | 美股目标比例(%) | 50.0 |
-| `allocation.cn_stocks` | A股目标比例(%) | 35.0 |
-| `allocation.counter_cyclical` | 逆周期比例(%) | 15.0 |
-| `thresholds.extreme_fear` | 极度恐慌阈值 | 25.0 |
+| `allocation.us_stocks` | 美股目标比例(%) | 55.0 |
+| `allocation.cn_stocks` | A股目标比例(%) | 25.0 |
+| `allocation.counter_cyclical` | 逆周期比例(%) | 20.0 |
+| `thresholds.extreme_fear` | 极度恐慌阈值 | 30.0 |
 | `thresholds.fear` | 恐慌阈值 | 45.0 |
 | `thresholds.neutral` | 中性阈值 | 55.0 |
-| `thresholds.greed` | 贪婪阈值 | 75.0 |
-| `buy_ratio.extreme_fear` | 极度恐慌买入(%) | 50.0 |
-| `buy_ratio.fear` | 恐慌买入(%) | 30.0 |
-| `buy_ratio.neutral` | 中性买入(%) | 20.0 |
+| `thresholds.greed` | 贪婪阈值 | 70.0 |
+| `buy_ratio.extreme_fear` | 极度恐慌买入(%) | 60.0 |
+| `buy_ratio.fear` | 恐慌买入(%) | 35.0 |
+| `buy_ratio.neutral` | 中性买入(%) | 0.0 |
 | `buy_ratio.greed` | 贪婪买入(%) | 0.0 |
 | `sell_ratio.extreme_greed_target_high` | 极度贪婪高收益卖(%) | 50.0 |
 | `sell_ratio.extreme_greed_target_low` | 极度贪婪低收益卖(%) | 30.0 |
 | `sell_ratio.extreme_greed_below_target` | 极度贪婪未达标卖(%) | 20.0 |
 | `sell_ratio.greed_target_high` | 贪婪高收益卖(%) | 40.0 |
-| `sell_ratio.greed_target_low` | 贪婪低收益卖(%) | 20.0 |
-| `sell_ratio.neutral_target_high` | 中性高收益卖(%) | 30.0 |
+| `sell_ratio.greed_target_low` | 贪婪低收益卖(%) | 25.0 |
+| `sell_ratio.neutral_target_high` | 中性高收益卖(%) | 15.0 |
 
 ---
 
@@ -387,4 +387,4 @@ mns config > config_backup_$(date +%Y%m%d).toml
 
 ---
 
-**文档版本**: v0.5.6 | **更新日期**: 2026-04-21
+**文档版本**: v0.5.7 | **更新日期**: 2026-04-21

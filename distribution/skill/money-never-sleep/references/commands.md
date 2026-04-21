@@ -100,27 +100,27 @@ mns config buy_ratio.fear 30.0
 |------|------|--------|
 | `settings.annualized_target_low` | 年化止盈下限(%) | 10.0 |
 | `settings.annualized_target_high` | 年化止盈上限(%) | 15.0 |
-| `settings.min_holding_days` | 最小持仓天数 | 30 |
-| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 90 |
+| `settings.min_holding_days` | 最小持仓天数 | 45 |
+| `settings.min_absolute_profit_days` | 绝对收益最小天数 | 120 |
 | `settings.max_contrarian_weight` | 最大逆向权重 | 2.0 |
 | `settings.report_output_dir` | 报告输出目录 | ./reports |
-| `allocation.us_stocks` | 美股配置比例(%) | 50.0 |
-| `allocation.cn_stocks` | A股配置比例(%) | 35.0 |
-| `allocation.counter_cyclical` | 逆周期配置比例(%) | 15.0 |
-| `thresholds.extreme_fear` | 极度恐慌阈值 | 25.0 |
+| `allocation.us_stocks` | 美股配置比例(%) | 55.0 |
+| `allocation.cn_stocks` | A股配置比例(%) | 25.0 |
+| `allocation.counter_cyclical` | 逆周期配置比例(%) | 20.0 |
+| `thresholds.extreme_fear` | 极度恐慌阈值 | 30.0 |
 | `thresholds.fear` | 恐慌阈值 | 45.0 |
 | `thresholds.neutral` | 中性阈值 | 55.0 |
-| `thresholds.greed` | 贪婪阈值 | 75.0 |
-| `buy_ratio.extreme_fear` | 极度恐慌买入比例(%) | 50.0 |
-| `buy_ratio.fear` | 恐慌买入比例(%) | 30.0 |
-| `buy_ratio.neutral` | 中性买入比例(%) | 20.0 |
+| `thresholds.greed` | 贪婪阈值 | 70.0 |
+| `buy_ratio.extreme_fear` | 极度恐慌买入比例(%) | 60.0 |
+| `buy_ratio.fear` | 恐慌买入比例(%) | 35.0 |
+| `buy_ratio.neutral` | 中性买入比例(%) | 0.0 |
 | `buy_ratio.greed` | 贪婪买入比例(%) | 0.0 |
 | `sell_ratio.extreme_greed_target_high` | 极度贪婪+高收益卖出(%) | 50.0 |
 | `sell_ratio.extreme_greed_target_low` | 极度贪婪+低收益卖出(%) | 30.0 |
 | `sell_ratio.extreme_greed_below_target` | 极度贪婪+未达标卖出(%) | 20.0 |
 | `sell_ratio.greed_target_high` | 贪婪+高收益卖出(%) | 40.0 |
-| `sell_ratio.greed_target_low` | 贪婪+低收益卖出(%) | 20.0 |
-| `sell_ratio.neutral_target_high` | 中性+高收益卖出(%) | 30.0 |
+| `sell_ratio.greed_target_low` | 贪婪+低收益卖出(%) | 25.0 |
+| `sell_ratio.neutral_target_high` | 中性+高收益卖出(%) | 15.0 |
 
 **示例 - 完整参数调优**:
 ```bash

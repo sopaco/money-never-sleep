@@ -1,6 +1,6 @@
 ---
 name: money-never-sleep
-version: 0.5.6
+version: 0.5.7
 description: |
   MNS (Money Never Sleep, Market Neutral Strategist) CLI skill for autonomous agents. Provides investment
   portfolio tracking, market sentiment analysis using CNN Fear & Greed Index, and strategy
@@ -272,33 +272,14 @@ mns buy TSLA 50 250.00
 mns price TSLA 255.00
 ```
 
-## 配置参数速查
+## 配置参数
 
-### 核心配置路径
+完整的配置参数说明请参考 `references/strategy.md`，其中包含：
+- 所有配置项的默认值速查表
+- 策略参数的详细解释
+- 买入/卖出比例矩阵说明
 
-| 配置项 | 说明 | 默认值 |
-|-------|------|-------|
-| `settings.annualized_target_low` | 年化止盈下限 | 10.0 |
-| `settings.annualized_target_high` | 年化止盈上限 | 15.0 |
-| `settings.min_holding_days` | 年化收益计算最小天数 | 30 |
-| `settings.min_absolute_profit_days` | 绝对收益止盈最小天数 | 90 |
-| `settings.max_contrarian_weight` | 逆向权重上限 | 2.0 |
-| `thresholds.extreme_fear` | 极度恐慌阈值 | 25 |
-| `thresholds.fear` | 恐慌阈值 | 45 |
-| `thresholds.neutral` | 中性阈值 | 55 |
-| `thresholds.greed` | 贪婪阈值 | 75 |
-| `buy_ratio.extreme_fear` | 极度恐慌买入比例 | 50.0 |
-| `buy_ratio.fear` | 恐慌买入比例 | 30.0 |
-| `buy_ratio.neutral` | 中性买入比例 | 20.0 |
-| `buy_ratio.greed` | 贪婪买入比例 | 0.0 |
-| `sell_ratio.extreme_greed_target_high` | 极度贪婪且高年化卖出比例 | 50.0 |
-| `sell_ratio.extreme_greed_target_low` | 极度贪婪且中年化卖出比例 | 30.0 |
-| `sell_ratio.greed_target_high` | 贪婪且高年化卖出比例 | 40.0 |
-| `allocation.us_stocks` | 美股目标配置比例 | 50.0 |
-| `allocation.cn_stocks` | A股目标配置比例 | 35.0 |
-| `allocation.counter_cyclical` | 逆周期目标配置比例 | 15.0 |
-
-> 注：比例值单位为百分比（如 50.0 表示 50%）
+命令使用方法请参考 `references/commands.md`。
 
 ## 注意事项
 
