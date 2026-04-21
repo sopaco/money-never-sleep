@@ -2,15 +2,17 @@
 
 **Last updated**: 2026-04-21
 
+> **2026-04-21**: Added `mns remove` command (cli.rs, db.rs, main.rs)
+
 ---
 
 ## When to Update
 
 | File | Update Trigger |
-|------|---------------|
+|------|----------------|
 | `DYNAMICS.md` | Any new issue, blocker, or workaround discovered |
 | `DECISIONS.md` | Any new design decision or parameter change |
-| `ARCHITECTURE.md` | New module (e.g., `quote.rs`), changed data flow, new dependencies |
+| `ARCHITECTURE.md` | New module, changed data flow, new dependencies |
 | `PROJECT-ESSENCE.md` | Mission change, new target user, dropped feature |
 | `SKILL.md` | Only if activation rules change |
 
@@ -30,7 +32,7 @@ Total should stay under ~4000 tokens across all files. If approaching limit:
 
 ## File Locations
 
-All in `d:\Workspace\toys\MNS\.ai-context\`
+All in `~/.mns/.ai-context/`
 
 ```
 .ai-context/
@@ -40,12 +42,11 @@ All in `d:\Workspace\toys\MNS\.ai-context\`
     ├── PROJECT-ESSENCE.md     ← Core identity (rarely changes)
     ├── ARCHITECTURE.md         ← Component map (monthly review)
     └── DECISIONS.md            ← Design rationale (per-change)
-
-# New modules in src/: quote.rs (auto price fetch)
 ```
 
 ## Related Documentation
 
-- `PRD.txt` — Full product spec (V2.1, 2026-04-19)
+- `PRD.txt` — Full product spec
 - `README.md` — User-facing quick start
-- `.agents/skills/mns-backtest/SKILL.md` — Backtest skill (separate)
+- `.agents/skills/mns-backtest/SKILL.md` — Backtest skill
+- `.agents/skills/mns-backtest/STRATEGY_OPTIMIZATION.md` — Optimization results

@@ -76,6 +76,12 @@ pub enum Commands {
         price: Option<f64>,
     },
 
+    /// 删除资产
+    Remove {
+        /// 资产代码
+        code: String,
+    },
+
     /// 查看当前恐贪指数
     Sentiment,
 

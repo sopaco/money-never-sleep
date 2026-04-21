@@ -100,24 +100,3 @@ pub struct FearGreedSnapshot {
     pub previous_1_year: Option<f64>,
     pub fetched_at: String,
 }
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct FearGreedResponse {
-    pub fear_and_greed: FearGreedData,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct FearGreedData {
-    pub score: f64,
-    pub rating: String,
-    pub timestamp: String,
-    #[serde(default)]
-    pub previous_close: Option<f64>,
-    #[serde(default)]
-    pub previous_1_week: Option<f64>,
-    #[serde(default)]
-    pub previous_1_month: Option<f64>,
-    #[serde(default)]
-    pub previous_1_year: Option<f64>,
-}

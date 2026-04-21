@@ -6,75 +6,74 @@
 
 ## Current Blockers / Known Issues
 
-### 1. CNN API may be inaccessible in some network environments
+### 1. 恐贪指数 API 网络可达性
 **Severity**: Environmental
-**Detail**: The CNN Fear & Greed API (`production.dataviz.cnn.io`) may timeout in certain network setups (tested: Windows PowerShell environment). The code is correct (200 response on actual API), but external network conditions can cause timeouts.
-**Workaround**: None — this is an external API with no authentication. If it goes down permanently, need to find alternative data source.
-**Reported**: 2026-04-19
-
-### 2. Absolute return threshold (30%) is hardcoded
-**Severity**: Low
-**Detail**: The 30% absolute return threshold for long-term profit-taking is not configurable via TOML. Should be added to `[settings]` as `absolute_profit_target`.
-**Workaround**: Edit `strategy.rs` directly to change the `0.30` constant.
-**Reported**: 2026-04-19
-
-### 3. Single sentiment index for multi-market portfolio
-**Severity**: Design limitation
-**Detail**: CNN Fear & Greed reflects US market sentiment only. Using it to drive buy/sell for A-shares and counter-cyclical assets may produce suboptimal signals (US fear ≠ China fear). No alternative data source implemented.
-**Workaround**: User interprets suggestions with judgment; counter-cyclical assets may move inversely to US sentiment by design.
-**Reported**: 2026-04-19
-
-### 4. QDII基金估值数据可能缺失
-**Severity**: Low
-**Detail**: 天天基金接口对部分QDII基金（如暂停申购的016668）不提供实时估值数据，`update-prices` 命令会跳过这类资产。
-**Workaround**: 用户需手动使用 `mns price <code> <价格>` 更新此类基金价格。
+**Detail**: `finance-query` 使用 alternative.me API，某些网络环境可能超时。
+**Workaround**: 使用代理或等待网络恢复。代码逻辑正确，非代码问题。
 **Reported**: 2026-04-21
+
+### 2. 绝对收益阈值 (30%) 硬编码
+**Severity**: Low
+**Detail**: 长期止盈的30%绝对收益阈值未通过TOML配置。
+**Workaround**: 直接编辑 `strategy.rs` 修改 `0.30` 常量。
+**Reported**: 2026-04-19
+
+### 3. 单一情绪指数驱动的多市场组合
+**Severity**: Design limitation
+**Detail**: CNN/alternative.me 恐贪指数仅反映美股情绪，用于A股和黄金可能产生次优信号。
+**Workaround**: 用户需结合判断；逆周期资产设计上可能与美股情绪反向。
+**Reported**: 2026-04-19
 
 ---
 
 ## Recently Added Features
 
-### 自动更新资产价格 (`mns update-prices`)
-**Added**: 2026-04-21
-**Detail**: 新增 `mns update-prices` 命令，自动获取所有持仓资产的当前价格：
-- 国内基金（6位数字代码）：使用天天基金接口 `fundgz.1234567.com.cn`
-- 美股/ETF（字母代码）：使用 Yahoo Finance API
-- 失败时跳过该资产，继续处理其他资产
-- 显示更新结果表格（代码、名称、原价格、新价格、来源）
+### 策略参数优化 (2026-04-21)
+**Detail**: 基于历史回测优化默认配置为保守配置：
+- 美股 55%（降低风险敞口）
+- A股 25%（红利低波稳健配置）
+- 黄金 20%（提高对冲比例）
+- 极度恐慌买入比例 60%
+- 年化止盈目标 10%/15%
+- 预期年化 8-9%，回撤 16-21%
+
+### finance-query 集成 (2026-04-21)
+**Detail**: 集成 `finance-query = "2"` crate：
+- 替换手动 HTTP 请求
+- 统一数据获取接口
+- 新增 `src/api/mod.rs`（预留，未来用于行情数据）
+
+### 自动更新资产价格 (2026-04-21)
+**Detail**: `mns update-prices` 自动获取所有持仓价格：
+- 国内基金：天天基金接口
+- 美股/ETF：Yahoo Finance API
+- 失败时跳过，继续处理其他资产
 
 ---
 
 ## Recently Resolved
 
-### 4. Strategy threshold mismatch with PRD
-**Resolved**: 2026-04-19
-**Detail**: `buy_ratio_for()` and `sell_ratio_for()` were missing the "Neutral" sentiment zone — scores in 45-55 range were incorrectly bucketed into Greed/Fear. Fixed by adding proper 5-zone and 3-zone logic respectively. Added `sell_ratio.neutral_target_high` config field.
+### 编译警告清理 (2026-04-21)
+**Resolved**: 清理所有编译警告
+**Detail**: 移除无用代码、修复 Clippy 警告
 
-### 5. Short-term annualized return distortion
-**Resolved**: 2026-04-19
-**Detail**: Positions held < 30 days could show extreme annualized returns (e.g., 1-day 1% gain → 3678% annualized), triggering aggressive sell suggestions. Fixed by adding `min_holding_days` threshold (default 30) — positions below threshold show N/A for annualized.
+### finance-query API 集成 (2026-04-21)
+**Resolved**: 集成 finance-query 作为数据引擎
+**Detail**: 替换 CNN API（不稳定）为 alternative.me（finance-query）
 
-### 6. Buy distribution "winner-take-more" effect
-**Resolved**: 2026-04-19
-**Detail**: `distribute_amount()` used market-value weighting, giving more funds to already-winning positions. Replaced with `distribute_amount_contrarian()` using weight = `max(1.0, cost/current)` — underwater positions get higher allocation.
+### 回测数据文件引用错误 (2026-04-21)
+**Resolved**: 修复 `include_str!` 引用已删除CSV的编译错误
+**Detail**: 更新数据文件路径和解析逻辑
 
-### 7. Buy/sell independent computation
-**Resolved**: 2026-04-19
-**Detail**: Buy suggestions didn't account for sell proceeds. Pipeline now computes sell first, then passes sell proceeds to buy calculation. Report includes "净操作指引" (net operation guidance).
-
-### 8. Non-transactional DB operations
-**Resolved**: 2026-04-19
-**Detail**: `buy_position()` and `sell_position()` executed 3 SQL statements without transaction. Now wrapped in `unchecked_transaction()` for atomicity. Also added input validation (non-negative cash, positive shares/price).
-
-### 9. Duplicate daily snapshots
-**Resolved**: 2026-04-19
-**Detail**: Running `mns report` multiple times per day created duplicate `fear_greed_snapshots` rows. Now uses DELETE+INSERT to keep only the latest snapshot per day.
+### Strategy threshold mismatch with PRD (2026-04-19)
+**Resolved**: 修复买卖比例缺少"中性"区间的逻辑错误
+**Detail**: 添加正确的5区和3区逻辑，新增 `neutral_target_high` 配置项
 
 ---
 
 ## Constraints
 
-- **No frontend yet** — PRD mentions Svelte 5 for future dashboard, but currently pure CLI only
-- **Single-user only** — SQLite, no auth, no multi-portfolio support
-- **Windows-first tested** — developed and tested on Windows PowerShell, though Rust code is cross-platform
-- **Existing config files lack new fields** — users with pre-existing `config.toml` must run `mns init` or manually add `min_holding_days` and `neutral_target_high`
+- **No frontend yet** — PRD mentions Svelte 5 for future dashboard
+- **Single-user only** — SQLite, no auth, no multi-portfolio
+- **Windows-first tested** — developed on Windows, cross-platform Rust
+- **Existing config files lack new fields** — run `mns init` or manually add new fields

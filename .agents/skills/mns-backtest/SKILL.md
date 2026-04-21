@@ -205,6 +205,8 @@ mns backtest run --config my_config.toml
 - `src/backtest.rs` - 回测引擎模块
 - `src/strategy.rs` - 策略核心逻辑
 - `src/config.rs` - 配置管理
-- `.agents/skills/mns-backtest/data/fgi_2016_2020.csv` - 2016-2020 逐日恐贪指数
-- `.agents/skills/mns-backtest/data/fgi_2020_2025.csv` - 2020-2025 月度恐贪指数
-- `.agents/skills/mns-backtest/data/sp500_monthly.csv` - S&P 500 月度收盘价
+- `data/fgi_2016_2020.csv` - 2016-2020 逐日恐贪指数
+- `data/fgi_2020_2025.csv` - 2020-2025 月度恐贪指数
+- `data/monthly_real_final.csv` - 全球配置真实历史数据
+- `data/backtest_final.py` - 全球配置回测脚本
+- `GLOBAL_PORTFOLIO_REPORT.md` - 全球配置回测报告

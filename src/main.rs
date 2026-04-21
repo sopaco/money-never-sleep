@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
             price,
         } => cmd_sell(&code, shares, price)?,
         Commands::Price { code, price } => cmd_price(&code, price)?,
+        Commands::Remove { code } => cmd_remove(&code)?,
         Commands::Sentiment => cmd_sentiment().await?,
         Commands::Report => cmd_report().await?,
         Commands::History { limit } => cmd_history(limit)?,
@@ -297,36 +298,23 @@ fn cmd_price(code: &str, price: Option<f64>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_remove(code: &str) -> Result<()> {
+    let db = db::Database::open()?;
+    db.remove_position(code)?;
+    Ok(())
+}
+
 async fn cmd_sentiment() -> Result<()> {
     let config = AppConfig::load()?;
-    println!("正在获取 CNN 恐贪指数...");
-    let data = sentiment::fetch_fear_greed(&config).await?;
-
-    let zone = config.sentiment_zone(data.fear_and_greed.score);
-    println!("CNN 恐贪指数: {:.2} ({})", data.fear_and_greed.score, zone);
-    if let Some(pc) = data.fear_and_greed.previous_close {
-        println!("前日收盘: {:.2}", pc);
-    }
-    if let Some(pw) = data.fear_and_greed.previous_1_week {
-        println!("周环比: {:.2} → {:.2}", pw, data.fear_and_greed.score);
-    }
-    if let Some(pm) = data.fear_and_greed.previous_1_month {
-        println!("月环比: {:.2} → {:.2}", pm, data.fear_and_greed.score);
-    }
-    if let Some(py) = data.fear_and_greed.previous_1_year {
-        println!("年同比: {:.2} → {:.2}", py, data.fear_and_greed.score);
-    }
+    println!("正在获取恐贪指数...");
+    let score = sentiment::fetch_fear_greed_index().await?;
+    let score_f64 = score as f64;
+    let zone = config.sentiment_zone(score_f64);
+    println!("恐贪指数: {} ({})", score, zone);
 
     // 保存快照
     let db = db::Database::open()?;
-    db.save_fear_greed_snapshot(
-        data.fear_and_greed.score,
-        zone,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
-    )?;
+    db.save_fear_greed_snapshot(score_f64, zone, None, None, None, None)?;
 
     Ok(())
 }
@@ -335,30 +323,23 @@ async fn cmd_report() -> Result<()> {
     let config = AppConfig::load()?;
     let db = db::Database::open()?;
 
-    println!("正在获取 CNN 恐贪指数...");
-    let data = sentiment::fetch_fear_greed(&config).await?;
-    let score = data.fear_and_greed.score;
-    let rating = config.sentiment_zone(score);
+    println!("正在获取恐贪指数...");
+    let score = sentiment::fetch_fear_greed_index().await?;
+    let score_f64 = score as f64;
+    let rating = config.sentiment_zone(score_f64);
 
     // 保存快照
-    db.save_fear_greed_snapshot(
-        score,
-        rating,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
-    )?;
+    db.save_fear_greed_snapshot(score_f64, rating, None, None, None, None)?;
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
 
     // 策略计算（先算风险警告，再算买入建议以实现联动）
-    let sell_suggestions = strategy::calculate_sell_suggestions(&config, score, &positions);
-    let risk_warnings = strategy::check_risk_warnings(&config, score, &positions);
+    let sell_suggestions = strategy::calculate_sell_suggestions(&config, score_f64, &positions);
+    let risk_warnings = strategy::check_risk_warnings(&config, score_f64, &positions);
     let buy_suggestion = strategy::calculate_buy_suggestions(
         &config,
-        score,
+        score_f64,
         cash,
         &positions,
         &sell_suggestions,
@@ -368,12 +349,12 @@ async fn cmd_report() -> Result<()> {
     // 生成报告
     let report = report::generate_report(
         &config,
-        score,
+        score_f64,
         rating,
-        data.fear_and_greed.previous_close,
-        data.fear_and_greed.previous_1_week,
-        data.fear_and_greed.previous_1_month,
-        data.fear_and_greed.previous_1_year,
+        None,
+        None,
+        None,
+        None,
         cash,
         &positions,
         &buy_suggestion,
@@ -424,8 +405,9 @@ fn cmd_history(limit: i64) -> Result<()> {
 
 fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<()> {
     use backtest::{
-        BacktestConfig, print_comparison, run_backtest, run_buy_and_hold, run_custom_comparison,
-        run_param_comparison,
+        BacktestConfig, print_comparison, print_multi_asset_comparison, run_backtest,
+        run_buy_and_hold, run_custom_comparison, run_multi_asset_backtest,
+        run_multi_asset_buy_and_hold, run_param_comparison,
     };
 
     println!("=================================================================");
@@ -443,6 +425,21 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
         "[INFO] 初始资金: {:.0}, 年度注资: {:.0}",
         bt_config.initial_cash, bt_config.annual_inflow
     );
+    println!();
+
+    // 运行多资产回测
+    println!("[INFO] 运行多资产回测（美股+红利低波+黄金）...");
+    let config = AppConfig::load()?;
+    let multi_result = run_multi_asset_backtest(&config, &bt_config);
+    multi_result.print_report();
+
+    // 多资产买入持有基准
+    println!("[INFO] 运行多资产买入持有基准...");
+    let multi_bnh_result = run_multi_asset_buy_and_hold(&bt_config);
+    multi_bnh_result.print_report();
+
+    // 打印多资产对比
+    print_multi_asset_comparison(&[multi_result, multi_bnh_result]);
     println!();
 
     if let Some(paths) = compare {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Local;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::models::{FearGreedSnapshot, Position, Transaction};
 
@@ -68,9 +68,11 @@ impl Database {
     // ── Cash ──────────────────────────────────────
 
     pub fn get_cash_balance(&self) -> Result<f64> {
-        let balance: f64 = self
-            .conn
-            .query_row("SELECT balance FROM cash WHERE id = 1", [], |row| row.get(0))?;
+        let balance: f64 =
+            self.conn
+                .query_row("SELECT balance FROM cash WHERE id = 1", [], |row| {
+                    row.get(0)
+                })?;
         Ok(balance)
     }
 
@@ -196,7 +198,9 @@ impl Database {
         };
 
         // 使用事务保证原子性
-        let tx = self.conn.unchecked_transaction()
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .with_context(|| "开启事务失败")?;
 
         tx.execute(
@@ -232,7 +236,11 @@ impl Database {
             .with_context(|| format!("未找到资产: {}", code))?;
 
         if shares > pos.shares + 1e-6 {
-            anyhow::bail!("卖出份额超出持有量: 持有 {:.2}, 欲卖 {:.2}", pos.shares, shares);
+            anyhow::bail!(
+                "卖出份额超出持有量: 持有 {:.2}, 欲卖 {:.2}",
+                pos.shares,
+                shares
+            );
         }
 
         let actual_shares = shares.min(pos.shares); // 防止浮点误差
@@ -244,7 +252,9 @@ impl Database {
         let balance = self.get_cash_balance()?;
 
         // 使用事务保证原子性
-        let tx = self.conn.unchecked_transaction()
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .with_context(|| "开启事务失败")?;
 
         tx.execute(
@@ -276,6 +286,17 @@ impl Database {
         if rows == 0 {
             anyhow::bail!("未找到资产: {}", code);
         }
+        Ok(())
+    }
+
+    pub fn remove_position(&self, code: &str) -> Result<()> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM positions WHERE asset_code = ?", params![code])?;
+        if rows == 0 {
+            anyhow::bail!("未找到资产: {}", code);
+        }
+        println!("已删除资产: {}", code);
         Ok(())
     }
 

@@ -1,0 +1,41 @@
+# 最优配置 - 基于历史回测调优
+# 目标：最大化收益/回撤比
+
+[settings]
+annualized_target_low = 15.0    # 提高止盈门槛
+annualized_target_high = 22.0
+min_holding_days = 21
+min_absolute_profit_days = 60
+max_contrarian_weight = 3.0
+report_output_dir = "./reports"
+
+[allocation]
+# 提高美股权重，降低A股
+us_stocks = 70.0        # 纳指+印度+日本
+cn_stocks = 15.0        # 红利低波
+counter_cyclical = 15.0 # 黄金（提高到15%）
+
+[thresholds]
+extreme_fear = 20.0     # 更低的极度恐慌阈值
+fear = 40.0
+neutral = 55.0
+greed = 75.0
+
+[buy_ratio]
+# 激进买入
+extreme_fear = 80.0     # 极度恐慌80%仓位
+fear = 55.0             # 恐慌55%
+neutral = 0.0           # 中性不买
+greed = 0.0
+
+[sell_ratio]
+# 更早止盈
+extreme_greed_target_high = 60.0
+extreme_greed_target_low = 40.0
+extreme_greed_below_target = 30.0
+greed_target_high = 50.0
+greed_target_low = 35.0
+neutral_target_high = 25.0
+
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
