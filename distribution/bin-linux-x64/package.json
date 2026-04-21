@@ -1,6 +1,6 @@
 {
 	"name": "@never-sleeps/bin-linux-x64",
-	"version": "0.5.6",
+	"version": "0.5.7",
 	"description": "MNS binaries for Linux x64",
 	"publishConfig": {
 		"access": "public"

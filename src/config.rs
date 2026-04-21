@@ -66,29 +66,29 @@ impl AppConfig {
         // 保守配置 - 低回撤优先
         Self {
             settings: Settings {
-                annualized_target_low: 10.0,      // 降低止盈门槛，更早锁定收益
-                annualized_target_high: 15.0,    // 年化15%大笔减仓
-                min_holding_days: 45,             // 更长持仓，避免短期波动
-                min_absolute_profit_days: 120,    // 绝对收益持仓天数更长
-                max_contrarian_weight: 2.0,       // 降低逆势加仓权重
+                annualized_target_low: 10.0,   // 降低止盈门槛，更早锁定收益
+                annualized_target_high: 15.0,  // 年化15%大笔减仓
+                min_holding_days: 45,          // 更长持仓，避免短期波动
+                min_absolute_profit_days: 120, // 绝对收益持仓天数更长
+                max_contrarian_weight: 2.0,    // 降低逆势加仓权重
                 report_output_dir: "./reports".to_string(),
             },
             allocation: Allocation {
-                us_stocks: 55.0,                  // 降低美股占比
-                cn_stocks: 25.0,                  // 提高红利低波稳健配置
-                counter_cyclical: 20.0,          // 提高黄金对冲比例
+                us_stocks: 55.0,        // 降低美股占比
+                cn_stocks: 25.0,        // 提高红利低波稳健配置
+                counter_cyclical: 20.0, // 提高黄金对冲比例
             },
             thresholds: Thresholds {
-                extreme_fear: 30.0,               // 更严格的极度恐慌阈值
-                fear: 45.0,                       // 恐慌阈值
-                neutral: 55.0,                   // 中性阈值
-                greed: 70.0,                     // 更早触发贪婪卖出
+                extreme_fear: 30.0, // 更严格的极度恐慌阈值
+                fear: 45.0,         // 恐慌阈值
+                neutral: 55.0,      // 中性阈值
+                greed: 70.0,        // 更早触发贪婪卖出
             },
             buy_ratio: BuyRatio {
-                extreme_fear: 60.0,              // 极度恐慌适度买入
-                fear: 35.0,                      // 恐慌保守买入
-                neutral: 0.0,                    // 中性不买
-                greed: 0.0,                      // 贪婪不买
+                extreme_fear: 60.0, // 极度恐慌适度买入
+                fear: 35.0,         // 恐慌保守买入
+                neutral: 0.0,       // 中性不买
+                greed: 0.0,         // 贪婪不买
             },
             sell_ratio: SellRatio {
                 extreme_greed_target_high: 50.0,  // 极度贪婪减仓50%
@@ -170,15 +170,15 @@ impl AppConfig {
     /// 根据恐贪指数判断情绪区间
     pub fn sentiment_zone(&self, score: f64) -> &'static str {
         if score < self.thresholds.extreme_fear {
-            "Extreme Fear"
+            "极度恐慌"
         } else if score < self.thresholds.fear {
-            "Fear"
+            "恐慌"
         } else if score < self.thresholds.neutral {
-            "Neutral"
+            "中性"
         } else if score < self.thresholds.greed {
-            "Greed"
+            "贪婪"
         } else {
-            "Extreme Greed"
+            "极度贪婪"
         }
     }
 

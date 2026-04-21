@@ -1,6 +1,6 @@
 # Design Decisions — MNS
 
-**Last updated**: 2026-04-21
+**Last updated**: 2026-04-22
 
 ---
 
@@ -142,29 +142,29 @@ Fear/EFear       hold         hold       hold
 
 ---
 
-## Decision 13: finance-query crate for sentiment data
+## Decision 13: CNN API for stock market Fear & Greed Index
 
-**Context**: CNN Fear & Greed API is unreliable in some network environments.
-**Choice**: Use `finance-query = "2"` crate for sentiment data (alternative.me API).
+**Context**: Need stock market Fear & Greed Index, not crypto sentiment. alternative.me provides crypto Fear & Greed Index, which is not appropriate for stock portfolio decisions.
+**Choice**: Direct HTTP request to CNN API (`https://production.dataviz.cnn.io/index/fearandgreed/graphdata`).
 **Rationale**:
-- Better network reliability than CNN API
+- CNN API provides stock market sentiment (not crypto)
 - Free, no authentication required
-- Native async Rust support
-- Unified data access pattern
-**Trade-off**: alternative.me updates once per day vs CNN's real-time.
+- Real-time updates
+- Direct control over request headers
+**Trade-off**: CNN API may block requests (418 error), requires proper User-Agent header to simulate browser request.
 
 ---
 
-## Decision 14: Optimized conservative configuration as default
+## Decision 14: Optimized aggressive configuration as default
 
-**Context**: Original default config (US 70%, CN 15%, Gold 15%) was too aggressive for risk-averse users.
-**Choice**: Update default to conservative config (US 55%, CN 25%, Gold 20%) based on backtesting.
+**Context**: Original default config was too aggressive, leading to higher drawdowns. After backtesting, conservative config provides better risk-adjusted returns.
+**Choice**: Default to conservative config (US 55%, CN 25%, Gold 20%) based on backtesting.
 **Rationale**:
-- Historical backtest shows 8-9% annualized return with lower drawdown
-- Better return/drawdown ratio (0.42+)
-- Lower volatility with higher hedge allocation
-- Moderate buy during extreme fear (60%)
-**Trade-off**: Lower expected return than aggressive config, but better risk-adjusted performance.
+- Lower drawdown priority: 13-18% vs 23-28% for aggressive
+- Better risk-adjusted returns: similar 7-8% annual with lower volatility
+- Users who prefer higher returns can manually switch to aggressive config
+- Longer holding periods (45 days) reduce short-term noise
+**Trade-off**: Lower absolute returns vs aggressive, but better sleep quality.
 
 ---
 

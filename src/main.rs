@@ -307,14 +307,25 @@ fn cmd_remove(code: &str) -> Result<()> {
 async fn cmd_sentiment() -> Result<()> {
     let config = AppConfig::load()?;
     println!("正在获取恐贪指数...");
-    let score = sentiment::fetch_fear_greed_index().await?;
-    let score_f64 = score as f64;
-    let zone = config.sentiment_zone(score_f64);
-    println!("恐贪指数: {} ({})", score, zone);
 
-    // 保存快照
+    // 使用配置的 API URL
+    let url = &config.api.fear_greed_url;
+    let data = sentiment::fetch_fear_greed_data(url).await?;
+    let score_f64 = data.score as f64;
+    let zone = config.sentiment_zone(score_f64);
+
+    println!("恐贪指数: {} ({})", data.score, zone);
+
+    // 保存快照（含历史数据）
     let db = db::Database::open()?;
-    db.save_fear_greed_snapshot(score_f64, zone, None, None, None, None)?;
+    db.save_fear_greed_snapshot(
+        score_f64,
+        zone,
+        data.previous_close,
+        data.previous_1_week,
+        data.previous_1_month,
+        data.previous_1_year,
+    )?;
 
     Ok(())
 }
@@ -324,12 +335,24 @@ async fn cmd_report() -> Result<()> {
     let db = db::Database::open()?;
 
     println!("正在获取恐贪指数...");
-    let score = sentiment::fetch_fear_greed_index().await?;
-    let score_f64 = score as f64;
-    let rating = config.sentiment_zone(score_f64);
 
-    // 保存快照
-    db.save_fear_greed_snapshot(score_f64, rating, None, None, None, None)?;
+    // 使用配置的 API URL
+    let url = &config.api.fear_greed_url;
+    let data = sentiment::fetch_fear_greed_data(url).await?;
+    let score_f64 = data.score as f64;
+    let zone = config.sentiment_zone(score_f64);
+
+    // 保存快照（含历史数据）
+    db.save_fear_greed_snapshot(
+        score_f64,
+        zone,
+        data.previous_close,
+        data.previous_1_week,
+        data.previous_1_month,
+        data.previous_1_year,
+    )?;
+
+    println!("恐贪指数: {} ({})", data.score, zone);
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
@@ -350,7 +373,7 @@ async fn cmd_report() -> Result<()> {
     let report = report::generate_report(
         &config,
         score_f64,
-        rating,
+        zone,
         None,
         None,
         None,
