@@ -1,0 +1,38 @@
+# 防御配置 - 低回撤优先
+# 目标：最小化回撤，稳健收益
+
+[settings]
+annualized_target_low = 10.0
+annualized_target_high = 15.0
+min_holding_days = 45        # 更长持仓
+min_absolute_profit_days = 120
+max_contrarian_weight = 2.0
+report_output_dir = "./reports"
+
+[allocation]
+us_stocks = 55.0             # 降低美股
+cn_stocks = 25.0             # 提高红利低波
+counter_cyclical = 20.0     # 提高黄金
+
+[thresholds]
+extreme_fear = 30.0          # 更严格的极度恐慌
+fear = 45.0
+neutral = 55.0
+greed = 70.0                 # 更早卖出
+
+[buy_ratio]
+extreme_fear = 60.0
+fear = 35.0
+neutral = 0.0
+greed = 0.0
+
+[sell_ratio]
+extreme_greed_target_high = 50.0
+extreme_greed_target_low = 30.0
+extreme_greed_below_target = 20.0
+greed_target_high = 40.0
+greed_target_low = 25.0
+neutral_target_high = 15.0
+
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
