@@ -1,0 +1,36 @@
+# 多资产平衡配置 - 三种资产均衡配置
+[settings]
+annualized_target_low = 10.0
+annualized_target_high = 15.0
+min_holding_days = 21
+min_absolute_profit_days = 60
+max_contrarian_weight = 3.0
+report_output_dir = "./reports"
+
+[allocation]
+us_stocks = 33.0
+cn_stocks = 33.0
+counter_cyclical = 34.0
+
+[thresholds]
+extreme_fear = 30.0
+fear = 45.0
+neutral = 55.0
+greed = 70.0
+
+[buy_ratio]
+extreme_fear = 70.0
+fear = 45.0
+neutral = 0.0
+greed = 0.0
+
+[sell_ratio]
+extreme_greed_target_high = 50.0
+extreme_greed_target_low = 35.0
+extreme_greed_below_target = 20.0
+greed_target_high = 35.0
+greed_target_low = 20.0
+neutral_target_high = 10.0
+
+[api]
+fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
