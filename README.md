@@ -7,6 +7,9 @@
 ```bash
 cargo build --release
 # 二进制文件在 target/release/mns.exe (Windows) / target/release/mns (Linux/macOS)
+# 
+# for Linux on macos/windows
+# cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ## 快速开始
