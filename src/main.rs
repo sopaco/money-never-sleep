@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
             price,
         } => cmd_sell(&code, shares, price)?,
         Commands::Price { code, price } => cmd_price(&code, price)?,
+        Commands::Remove { code } => cmd_remove(&code)?,
         Commands::Sentiment => cmd_sentiment().await?,
         Commands::Report => cmd_report().await?,
         Commands::History { limit } => cmd_history(limit)?,
@@ -297,6 +298,12 @@ fn cmd_price(code: &str, price: Option<f64>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_remove(code: &str) -> Result<()> {
+    let db = db::Database::open()?;
+    db.remove_position(code)?;
+    Ok(())
+}
+
 async fn cmd_sentiment() -> Result<()> {
     let config = AppConfig::load()?;
     println!("正在获取恐贪指数...");
@@ -304,11 +311,11 @@ async fn cmd_sentiment() -> Result<()> {
     let score_f64 = score as f64;
     let zone = config.sentiment_zone(score_f64);
     println!("恐贪指数: {} ({})", score, zone);
-    
+
     // 保存快照
     let db = db::Database::open()?;
     db.save_fear_greed_snapshot(score_f64, zone, None, None, None, None)?;
-    
+
     Ok(())
 }
 
@@ -398,9 +405,9 @@ fn cmd_history(limit: i64) -> Result<()> {
 
 fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<()> {
     use backtest::{
-        BacktestConfig, print_comparison, run_backtest, run_buy_and_hold, run_custom_comparison,
-        run_param_comparison, run_multi_asset_backtest, run_multi_asset_buy_and_hold,
-        print_multi_asset_comparison,
+        BacktestConfig, print_comparison, print_multi_asset_comparison, run_backtest,
+        run_buy_and_hold, run_custom_comparison, run_multi_asset_backtest,
+        run_multi_asset_buy_and_hold, run_param_comparison,
     };
 
     println!("=================================================================");
@@ -425,12 +432,12 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
     let config = AppConfig::load()?;
     let multi_result = run_multi_asset_backtest(&config, &bt_config);
     multi_result.print_report();
-    
+
     // 多资产买入持有基准
     println!("[INFO] 运行多资产买入持有基准...");
     let multi_bnh_result = run_multi_asset_buy_and_hold(&bt_config);
     multi_bnh_result.print_report();
-    
+
     // 打印多资产对比
     print_multi_asset_comparison(&[multi_result, multi_bnh_result]);
     println!();

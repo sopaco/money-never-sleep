@@ -23,6 +23,7 @@ mns init
 mns cash set 100000
 mns add QQQ "纳指100" us_stocks
 mns buy QQQ 100 350.00
+mns remove QQQ          # 删除资产（慎用）
 mns update-prices       # 自动更新所有资产价格
 mns portfolio
 mns report

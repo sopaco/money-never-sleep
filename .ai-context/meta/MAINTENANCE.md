@@ -2,6 +2,8 @@
 
 **Last updated**: 2026-04-21
 
+> **2026-04-21**: Added `mns remove` command (cli.rs, db.rs, main.rs)
+
 ---
 
 ## When to Update
@@ -48,11 +50,3 @@ All in `~/.mns/.ai-context/`
 - `README.md` — User-facing quick start
 - `.agents/skills/mns-backtest/SKILL.md` — Backtest skill
 - `.agents/skills/mns-backtest/STRATEGY_OPTIMIZATION.md` — Optimization results
-
-## Current Module Summary
-
-| Module | Added | Purpose |
-|--------|-------|---------|
-| `quote.rs` | 2026-04-21 | Auto price fetch (Tian Tian/Yahoo) |
-| `sentiment.rs` | Updated 2026-04-21 | finance-query integration |
-| `backtest.rs` | 2026-04-20 | Strategy backtesting |
