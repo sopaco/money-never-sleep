@@ -18,7 +18,7 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 
 ## What It Does
 
-1. **Fetches** Fear & Greed Index via finance-query (alternative.me API, 0-100)
+1. **Fetches** Fear & Greed Index via CNN API (股票市场，0-100)
 2. **Reads** current cash balance, positions, and cost basis from SQLite
 3. **Calculates** sell/buy suggestions based on:
    - Fear & Greed zone → whether/how much to sell or buy

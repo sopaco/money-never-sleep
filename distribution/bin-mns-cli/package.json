@@ -1,6 +1,6 @@
 {
 	"name": "@never-sleeps/mns-cli",
-	"version": "0.5.6",
+	"version": "0.5.7",
 	"description": "MNS (Money Never Sleep) CLI tool. Installs the correct prebuilt binary for the current platform via npm optional dependencies.",
 	"license": "MIT",
 	"author": "Sopaco",
@@ -17,9 +17,9 @@
 		"contrarian-investing"
 	],
 	"optionalDependencies": {
-		"@never-sleeps/bin-darwin-arm64": "^0.5.6",
-		"@never-sleeps/bin-linux-x64": "^0.5.6",
-		"@never-sleeps/bin-win-x64": "^0.5.5"
+		"@never-sleeps/bin-darwin-arm64": "^0.5.7",
+		"@never-sleeps/bin-linux-x64": "^0.5.7",
+		"@never-sleeps/bin-win-x64": "^0.5.7"
 	},
 	"files": [
 		"README.md"

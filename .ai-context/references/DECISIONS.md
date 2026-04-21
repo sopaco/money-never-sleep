@@ -142,16 +142,16 @@ Fear/EFear       hold         hold       hold
 
 ---
 
-## Decision 13: finance-query crate for sentiment data
+## Decision 13: CNN API for stock market Fear & Greed Index
 
-**Context**: CNN Fear & Greed API is unreliable in some network environments.
-**Choice**: Use `finance-query = "2"` crate for sentiment data (alternative.me API).
+**Context**: Need stock market Fear & Greed Index, not crypto sentiment. alternative.me provides crypto Fear & Greed Index, which is not appropriate for stock portfolio decisions.
+**Choice**: Direct HTTP request to CNN API (`https://production.dataviz.cnn.io/index/fearandgreed/graphdata`).
 **Rationale**:
-- Better network reliability than CNN API
+- CNN API provides stock market sentiment (not crypto)
 - Free, no authentication required
-- Native async Rust support
-- Unified data access pattern
-**Trade-off**: alternative.me updates once per day vs CNN's real-time.
+- Real-time updates
+- Direct control over request headers
+**Trade-off**: CNN API may block requests (418 error), requires proper User-Agent header to simulate browser request.
 
 ---
 

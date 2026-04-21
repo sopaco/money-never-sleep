@@ -8,8 +8,8 @@
 
 ### 1. 恐贪指数 API 网络可达性
 **Severity**: Environmental
-**Detail**: `finance-query` 使用 alternative.me API，某些网络环境可能超时。
-**Workaround**: 使用代理或等待网络恢复。代码逻辑正确，非代码问题。
+**Detail**: CNN API 在某些网络环境可能被反爬虫拦截（返回 418）。
+**Workaround**: 代码已设置 User-Agent 模拟浏览器，若仍失败可使用代理。
 **Reported**: 2026-04-21
 
 ### 2. 绝对收益阈值 (30%) 硬编码
@@ -20,7 +20,7 @@
 
 ### 3. 单一情绪指数驱动的多市场组合
 **Severity**: Design limitation
-**Detail**: CNN/alternative.me 恐贪指数仅反映美股情绪，用于A股和黄金可能产生次优信号。
+**Detail**: CNN 恐贪指数仅反映美股情绪，用于A股和黄金可能产生次优信号。
 **Workaround**: 用户需结合判断；逆周期资产设计上可能与美股情绪反向。
 **Reported**: 2026-04-19
 
@@ -37,11 +37,11 @@
 - 年化止盈目标 10%/15%
 - 预期年化 8-9%，回撤 16-21%
 
-### finance-query 集成 (2026-04-21)
-**Detail**: 集成 `finance-query = "2"` crate：
-- 替换手动 HTTP 请求
-- 统一数据获取接口
-- 新增 `src/api/mod.rs`（预留，未来用于行情数据）
+### CNN API 集成 (2026-04-21)
+**Detail**: 直接调用 CNN Fear & Greed API：
+- 获取股票市场恐贪指数（非 crypto）
+- 设置 User-Agent 避免反爬虫拦截
+- 移除 `finance-query` 依赖
 
 ### 自动更新资产价格 (2026-04-21)
 **Detail**: `mns update-prices` 自动获取所有持仓价格：
@@ -57,9 +57,9 @@
 **Resolved**: 清理所有编译警告
 **Detail**: 移除无用代码、修复 Clippy 警告
 
-### finance-query API 集成 (2026-04-21)
-**Resolved**: 集成 finance-query 作为数据引擎
-**Detail**: 替换 CNN API（不稳定）为 alternative.me（finance-query）
+### 恐贪指数数据源修正 (2026-04-21)
+**Resolved**: 切换为 CNN 股票市场恐贪指数
+**Detail**: 修复 alternative.me 返回 crypto 恐贪指数的问题，改为直接调用 CNN API 获取股票市场恐贪指数
 
 ### 回测数据文件引用错误 (2026-04-21)
 **Resolved**: 修复 `include_str!` 引用已删除CSV的编译错误

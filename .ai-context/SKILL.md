@@ -36,7 +36,7 @@ mns backtest            # 策略回测（使用保守配置）
 |------|---------|
 | `SKILL.md` | This file — entry point |
 | `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） |
-| `sentiment.rs` | 恐贪指数获取（finance-query/alternative.me） |
+| `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） |
 | `references/PROJECT-ESSENCE.md` | What & why |
 | `references/ARCHITECTURE.md` | Component relationships |
 | `references/DECISIONS.md` | Design decisions |
@@ -47,7 +47,7 @@ mns backtest            # 策略回测（使用保守配置）
 
 - **Language**: Rust (edition 2024)
 - **Database**: SQLite via `rusqlite` (bundled)
-- **HTTP**: `reqwest` for APIs; `finance-query` crate for sentiment
+- **HTTP**: `reqwest` for APIs (CNN Fear & Greed Index, 天天基金, Yahoo Finance)
 - **CLI**: `clap` v4 (derive mode)
 - **Config**: TOML at `~/.mns/config.toml`
 - **Data**: SQLite at `~/.mns/mns.db`

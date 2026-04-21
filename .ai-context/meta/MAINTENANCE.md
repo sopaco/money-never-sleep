@@ -3,6 +3,7 @@
 **Last updated**: 2026-04-21
 
 > **2026-04-21**: Added `mns remove` command (cli.rs, db.rs, main.rs)
+> **2026-04-21**: 切换恐贪指数数据源从 alternative.me (crypto) 到 CNN (stock market) (sentiment.rs, Cargo.toml, .ai-context/*)
 
 ---
 

@@ -23,7 +23,7 @@
            ▼           ▼
       ┌────────┐  ┌──────────┐
       │ db.rs  │  │sentiment.rs│
-      │SQLite  │  │finance-query│
+      │SQLite  │  │ CNN API    │
       │(txn)   │  └────┬────┘
       └────┬───┘       │
            │           │
@@ -51,7 +51,7 @@
 | `db.rs` | SQLite CRUD (transactional, auto-create tables) | `Database::open()`, `get_cash_balance()`, `buy_position()`, `sell_position()`, `remove_position()`, `save_fear_greed_snapshot()` |
 | `models.rs` | Data structures + return calculations | `Position`, `Transaction`; `annualized_return_with_min_days()`, `absolute_return()`, `market_value_or_cost()` |
 | `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） | `fetch_price(code, category)` async, `update_all_prices()` async, `PriceUpdate` |
-| `sentiment.rs` | 恐贪指数获取（finance-query） | `fetch_fear_greed_index()` async |
+| `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） | `fetch_fear_greed_index()` async |
 | `strategy.rs` | 策略引擎（sell→buy→risk 顺序） | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
 | `report.rs` | 报告生成（净操作+风险+预案） | `generate_report()`, `save_report()` |
 | `backtest.rs` | 回测引擎（单资产+多资产） | `run_backtest()`, `run_multi_asset_backtest()`, `print_comparison()` |

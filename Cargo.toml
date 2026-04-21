@@ -1,6 +1,6 @@
 [package]
 name = "mns"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 
 [dependencies]
@@ -15,4 +15,3 @@ chrono = { version = "0.4", features = ["serde"] }
 comfy-table = "7"
 dirs = "6"
 anyhow = "1"
-finance-query = "2"
