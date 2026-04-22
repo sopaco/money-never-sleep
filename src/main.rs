@@ -2,6 +2,7 @@ mod backtest;
 mod cli;
 mod config;
 mod db;
+mod market;
 mod models;
 mod quote;
 mod report;
@@ -53,6 +54,9 @@ async fn main() -> Result<()> {
             Some(BacktestAction::Params) => cmd_backtest_params()?,
         },
         Commands::UpdatePrices => cmd_update_prices().await?,
+        Commands::Market => cmd_market().await?,
+        Commands::MarketIndices => cmd_market_indices().await?,
+        Commands::Analyze { symbol } => cmd_analyze(&symbol).await?,
     }
 
     Ok(())
@@ -589,6 +593,129 @@ async fn cmd_update_prices() -> Result<()> {
 
     println!();
     println!("✓ 已更新 {} 个资产价格", updates.len());
+
+    Ok(())
+}
+
+/// 市场综合概况（指数 + 恐贪指数）
+async fn cmd_market() -> Result<()> {
+    println!("📊 市场综合概况\n");
+
+    // 获取指数数据
+    println!("正在获取全球主要指数...");
+    let indices = market::fetch_market_indices().await?;
+
+    // 显示指数表格
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["指数", "价格", "涨跌", "涨跌幅"]);
+
+    for quote in &indices {
+        let change_color = if quote.change >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
+
+        table.add_row(vec![
+            Cell::new(&format!("{} {}", quote.symbol, quote.name)),
+            Cell::new(&format!("{:.2}", quote.price)),
+            Cell::new(&format!("{:+.2}", quote.change)).fg(change_color),
+            Cell::new(&format!("{:+.2}%", quote.change_percent)).fg(change_color),
+        ]);
+    }
+
+    println!("{}", table);
+
+    // 获取恐贪指数
+    println!("\n正在获取 CNN Fear & Greed Index...");
+    let config = AppConfig::load()?;
+    let url = &config.api.fear_greed_url;
+    match sentiment::fetch_fear_greed_data(url).await {
+        Ok(data) => {
+            let zone = config.sentiment_zone(data.score as f64);
+            println!("📊 恐贪指数: {} ({})", data.score, zone);
+        }
+        Err(e) => {
+            println!("⚠️  获取恐贪指数失败: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// 全球主要指数查询
+async fn cmd_market_indices() -> Result<()> {
+    println!("📈 全球主要指数\n");
+
+    let indices = market::fetch_market_indices().await?;
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["指数", "价格", "涨跌", "涨跌幅"]);
+
+    for quote in &indices {
+        let change_color = if quote.change >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
+
+        table.add_row(vec![
+            Cell::new(&format!("{} {}", quote.symbol, quote.name)),
+            Cell::new(&format!("{:.2}", quote.price)),
+            Cell::new(&format!("{:+.2}", quote.change)).fg(change_color),
+            Cell::new(&format!("{:+.2}%", quote.change_percent)).fg(change_color),
+        ]);
+    }
+
+    println!("{}", table);
+
+    Ok(())
+}
+
+/// 个股基础分析
+async fn cmd_analyze(symbol: &str) -> Result<()> {
+    println!("📊 分析: {}\n", symbol);
+
+    // 获取报价数据
+    let quote = market::fetch_stock_quote(symbol).await?;
+
+    // 显示基础报价信息
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["项目", "数值"]);
+
+    table.add_row(vec![Cell::new("股票代码"), Cell::new(&quote.symbol)]);
+    table.add_row(vec![Cell::new("名称"), Cell::new(&quote.name)]);
+    table.add_row(vec![Cell::new("当前价格"), Cell::new(&format!("{:.2}", quote.price))]);
+
+    let change_color = if quote.change >= 0.0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    table.add_row(vec![
+        Cell::new("涨跌"),
+        Cell::new(&format!("{:+.2}", quote.change)).fg(change_color),
+    ]);
+    table.add_row(vec![
+        Cell::new("涨跌幅"),
+        Cell::new(&format!("{:+.2}%", quote.change_percent)).fg(change_color),
+    ]);
+
+    println!("{}", table);
+
+    // 显示估值指标占位
+    println!("\n📈 估值指标");
+    println!("(需要额外数据源支持，当前版本仅提供报价信息)");
 
     Ok(())
 }

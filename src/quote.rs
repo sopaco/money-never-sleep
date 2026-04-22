@@ -11,6 +11,16 @@ pub struct PriceUpdate {
     pub source: String,
 }
 
+/// 股票报价信息（用于市场分析）
+#[derive(Debug, Clone)]
+pub struct StockQuote {
+    pub symbol: String,
+    pub name: String,
+    pub price: f64,
+    pub change: f64,
+    pub change_percent: f64,
+}
+
 /// 从天天基金获取基金估值价格
 async fn fetch_from_tiantian(code: &str) -> Result<Option<f64>> {
     let url = format!("http://fundgz.1234567.com.cn/js/{}.js", code);
@@ -169,4 +179,88 @@ pub async fn update_all_prices(positions: &[Position]) -> Result<Vec<PriceUpdate
     }
 
     Ok(updates)
+}
+
+/// 获取单个股票的完整报价信息（用于市场分析）
+///
+/// # Arguments
+/// * `symbol` - 股票代码（如 AAPL, ^GSPC）
+///
+/// # Returns
+/// * `Ok(StockQuote)` - 完整报价信息
+/// * `Err` - 获取失败
+pub async fn fetch_full_quote(symbol: &str) -> Result<StockQuote> {
+    // 使用 Yahoo Finance v8 API 获取完整报价
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=2d",
+        symbol
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("构建 HTTP 客户端失败")?;
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://finance.yahoo.com/")
+        .send()
+        .await
+        .context("请求 Yahoo Finance API 失败")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Yahoo Finance API 返回 HTTP {}", resp.status());
+    }
+
+    let json: serde_json::Value = resp.json().await.context("解析 Yahoo Finance 响应失败")?;
+
+    // 解析响应
+    let chart = json.get("chart").context("响应缺少 chart 字段")?;
+    let result = chart
+        .get("result")
+        .and_then(|r| r.as_array())
+        .and_then(|arr| arr.first())
+        .context("响应缺少 result 数据")?;
+
+    let meta = result.get("meta").context("响应缺少 meta 字段")?;
+
+    let price = meta
+        .get("regularMarketPrice")
+        .and_then(|v| v.as_f64())
+        .filter(|&p| p > 0.0)
+        .context("缺少有效的价格数据")?;
+
+    let previous_close = meta
+        .get("previousClose")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(price);
+
+    let symbol_name = meta
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or(symbol);
+
+    let name = meta
+        .get("shortName")
+        .and_then(|v| v.as_str())
+        .unwrap_or(symbol_name)
+        .to_string();
+
+    let change = price - previous_close;
+    let change_percent = if previous_close > 0.0 {
+        (change / previous_close) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(StockQuote {
+        symbol: symbol_name.to_string(),
+        name,
+        price,
+        change,
+        change_percent,
+    })
 }

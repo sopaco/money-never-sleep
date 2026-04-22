@@ -103,6 +103,18 @@ pub enum Commands {
 
     /// 自动更新所有资产的当前价格
     UpdatePrices,
+
+    /// 市场综合概况（指数、恐贪指数）
+    Market,
+
+    /// 全球主要指数查询
+    MarketIndices,
+
+    /// 个股基础分析（报价、估值）
+    Analyze {
+        /// 股票代码 (如 AAPL, MSFT)
+        symbol: String,
+    },
 }
 
 #[derive(Subcommand)]
