@@ -117,17 +117,6 @@ MNS CLI 集成多种金融数据源，提供全面的市场分析、个股研究
 
 #### 2.3 基本面数据
 
-##### 估值指标
-```
-- pe_ratio: 市盈率（P/E）
-- pb_ratio: 市净率（P/B）
-- ps_ratio: 市销率（P/S）
-- ev_ebitda: 企业价值/EBITDA
-- peg_ratio: PEG 比率
-- dividend_yield: 股息率
-- earnings_yield: 收益率
-```
-
 ##### 财务指标
 ```
 - revenue: 营业收入

@@ -713,9 +713,5 @@ async fn cmd_analyze(symbol: &str) -> Result<()> {
 
     println!("{}", table);
 
-    // 显示估值指标占位
-    println!("\n📈 估值指标");
-    println!("(需要额外数据源支持，当前版本仅提供报价信息)");
-
     Ok(())
 }
