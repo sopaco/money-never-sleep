@@ -1,7 +1,8 @@
 # Maintenance Guide — MNS AI Context
 
-**Last updated**: 2026-04-22
+**Last updated**: 2026-04-23
 
+> **2026-04-23**: 新增市场数据功能 (v0.5.9)：market.rs 模块、market/analyze/market-indices 命令、Yahoo Finance v8 API；更新 DECISIONS.md 添加 Decision 17
 > **2026-04-22**: 验证默认配置为保守配置 (US 55%, CN 25%, Gold 20%)，修正 .ai-context 与代码一致
 > **2026-04-21**: 切换恐贪指数数据源从 alternative.me (crypto) 到 CNN (stock market) (sentiment.rs, Cargo.toml, .ai-context/*)
 
