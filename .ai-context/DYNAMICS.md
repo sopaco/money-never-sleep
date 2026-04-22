@@ -1,6 +1,6 @@
 # Dynamics — Active Issues & Constraints
 
-**Last updated**: 2026-04-22
+**Last updated**: 2026-04-23
 
 ---
 
@@ -11,22 +11,40 @@
 **Detail**: CNN API 在某些网络环境可能被反爬虫拦截（返回 418）。
 **Workaround**: 代码已设置 User-Agent 模拟浏览器，若仍失败可使用代理。
 **Reported**: 2026-04-21
+**Status**: Mitigated
 
 ### 2. 绝对收益阈值 (30%) 硬编码
 **Severity**: Low
 **Detail**: 长期止盈的30%绝对收益阈值未通过TOML配置。
 **Workaround**: 直接编辑 `strategy.rs` 修改 `0.30` 常量。
 **Reported**: 2026-04-19
+**Status**: Accepted limitation
 
 ### 3. 单一情绪指数驱动的多市场组合
 **Severity**: Design limitation
 **Detail**: CNN 恐贪指数仅反映美股情绪，用于A股和黄金可能产生次优信号。
 **Workaround**: 用户需结合判断；逆周期资产设计上可能与美股情绪反向。
 **Reported**: 2026-04-19
+**Status**: Documented design decision
+
+### 4. Yahoo Finance API 速率限制
+**Severity**: Low
+**Detail**: 免费 API 有速率限制（约 5次/分钟，500次/天估计）。
+**Workaround**: 避免短时间内频繁调用 market-indices 或 analyze 命令。
+**Reported**: 2026-04-23
+**Status**: Monitoring
 
 ---
 
 ## Recently Added Features
+
+### 市场数据功能 (v0.5.9) — 2026-04-23
+**Detail**: 新增市场数据获取模块和三个命令：
+- `mns market` — 综合市场概况（9个全球指数 + 恐贪指数）
+- `mns market-indices` — 专门查看全球主要指数
+- `mns analyze <symbol>` — 个股基础报价分析
+- 新增 `market.rs` 模块，使用 Yahoo Finance v8 API
+- 支持 9 个全球主要指数：S&P 500, Dow Jones, NASDAQ, VIX, FTSE 100, DAX, Nikkei 225, 上证指数, 恒生指数
 
 ### 策略参数优化 (2026-04-22)
 **Detail**: 基于历史回测验证，默认配置为保守配置（低回撤优先）：
@@ -54,9 +72,9 @@
 
 ## Recently Resolved
 
-### 编译警告清理 (2026-04-21)
+### 编译警告清理 (2026-04-23)
 **Resolved**: 清理所有编译警告
-**Detail**: 移除无用代码、修复 Clippy 警告
+**Detail**: 移除未使用的 `fetch_quotes`, `fetch_market_summary`, `MarketSummary`，以及 `quote.rs` 中未使用的 `Deserialize` 导入
 
 ### 恐贪指数数据源修正 (2026-04-21)
 **Resolved**: 切换为 CNN 股票市场恐贪指数
@@ -78,3 +96,16 @@
 - **Single-user only** — SQLite, no auth, no multi-portfolio
 - **Windows-first tested** — developed on Windows, cross-platform Rust
 - **Existing config files lack new fields** — run `mns init` or manually add new fields
+- **Free API rate limits** — Yahoo Finance ~5/min, 500/day estimated; CNN ~5/min
+- **15-20 min quote delay** — Free data sources have inherent delay
+- **No API keys required** — All data sources are free but rate-limited
+
+---
+
+## Upcoming Considerations
+
+- [ ] Add `--json` output format for market commands
+- [ ] Consider adding PE Ratio to `analyze` command
+- [ ] Expand market indices (Russell 2000, etc.)
+- [ ] Add sector ETF tracking (XLK, XLF, etc.)
+```

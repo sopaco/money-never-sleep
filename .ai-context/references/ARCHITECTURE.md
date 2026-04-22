@@ -1,6 +1,6 @@
 # Architecture — MNS
 
-**Last updated**: 2026-04-22
+**Last updated**: 2026-04-23
 
 ---
 
@@ -33,25 +33,39 @@
       │ structs │  │ sell→buy  │
       └────┬───┘  │ +risk     │
            │       └────┬─────┘
-           │            │
            ▼            ▼
       ┌──────────┐  ┌───────────┐
       │report.rs │  │backtest.rs │
       │ text +   │  │ 多资产回测 │
       │ net flow │  │ 参数优化   │
       └──────────┘  └───────────┘
+           │
+           ▼
+      ┌──────────┐
+      │market.rs │  ← NEW: 市场数据模块
+      │ 全球指数 │
+      │ 个股报价 │
+      └────┬─────┘
+           │
+           ▼
+      ┌──────────┐
+      │ quote.rs │
+      │ Yahoo v8 │
+      │ 天天基金 │
+      └──────────┘
 ```
 
 ## Module Responsibilities
 
 | Module | Responsibility | Public API |
 |--------|---------------|------------|
-| `cli.rs` | Clap command definitions | `Cli`, `Commands`, `CashAction`, `Remove` |
+| `cli.rs` | Clap command definitions | `Cli`, `Commands`, `CashAction`, `BacktestAction` |
 | `config.rs` | TOML load/save, 5-zone threshold logic, dot-path get/set | `AppConfig::load()`, `save()`, `sentiment_zone()`, `buy_ratio_for()`, `sell_ratio_for()` |
 | `db.rs` | SQLite CRUD (transactional, auto-create tables) | `Database::open()`, `get_cash_balance()`, `buy_position()`, `sell_position()`, `remove_position()`, `save_fear_greed_snapshot()` |
 | `models.rs` | Data structures + return calculations | `Position`, `Transaction`; `annualized_return_with_min_days()`, `absolute_return()`, `market_value_or_cost()` |
-| `quote.rs` | 自动价格获取（天天基金/Yahoo Finance） | `fetch_price(code, category)` async, `update_all_prices()` async, `PriceUpdate` |
-| `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） | `fetch_fear_greed_index()` async |
+| `quote.rs` | 自动价格获取（天天基金/Yahoo Finance v8） | `fetch_price(code, category)` async, `update_all_prices()` async, `fetch_full_quote(symbol)` async, `PriceUpdate`, `StockQuote` |
+| `market.rs` | 市场数据获取（全球指数/个股报价） | `fetch_market_indices()` async, `fetch_stock_quote(symbol)` async, `MarketQuote` |
+| `sentiment.rs` | 恐贪指数获取（CNN API，股票市场） | `fetch_fear_greed_data()` async |
 | `strategy.rs` | 策略引擎（sell→buy→risk 顺序） | `calculate_sell_suggestions()`, `calculate_buy_suggestions()`, `check_risk_warnings()` |
 | `report.rs` | 报告生成（净操作+风险+预案） | `generate_report()`, `save_report()` |
 | `backtest.rs` | 回测引擎（多资产+多配置对比） | `run_backtest()`, `run_multi_asset_backtest()`, `run_buy_and_hold()`, `print_comparison()` |
@@ -61,7 +75,7 @@
 
 ```
 cmd_report()
-  1. sentiment::fetch_fear_greed_index()   → score (0-100)
+  1. sentiment::fetch_fear_greed_data()   → score (0-100)
   2. db::Database::open()                  → cash balance, positions
   3. db::save_fear_greed_snapshot()        → persist daily snapshot
   4. strategy::calculate_sell()             → Vec<SellSuggestion>
@@ -73,16 +87,38 @@ cmd_report()
 
 **Key**: sell 先计算，buy 使用 sell 回收金额。
 
-## Data Flow (backtest command)
+## Data Flow (market command)
 
 ```
-cmd_backtest()
-  1. load historical data from embedded CSV
-  2. run_multi_asset_backtest() for 美股+红利低波+黄金
-  3. run_buy_and_hold() for baseline
-  4. run_backtest() with multiple config variants
-  5. print_comparison() showing all results
+cmd_market()
+  1. market::fetch_market_indices()       → Vec<MarketQuote> (9 global indices)
+  2. display indices table (color-coded changes)
+  3. sentiment::fetch_fear_greed_data()    → Fear & Greed score
+  4. display combined view
 ```
+
+## Data Flow (analyze command)
+
+```
+cmd_analyze(symbol)
+  1. market::fetch_stock_quote(symbol)    → MarketQuote
+  2. display quote table (price, change, change%)
+  3. placeholder for valuation metrics
+```
+
+## Market Indices Coverage
+
+| Symbol | Name | Region |
+|--------|------|--------|
+| `^GSPC` | S&P 500 | US |
+| `^DJI` | Dow Jones | US |
+| `^IXIC` | NASDAQ | US |
+| `^VIX` | VIX 波动率 | US |
+| `^FTSE` | FTSE 100 | UK |
+| `^GDAXI` | DAX | Germany |
+| `^N225` | Nikkei 225 | Japan |
+| `000001.SS` | 上证指数 | China |
+| `^HSI` | 恒生指数 | Hong Kong |
 
 ## Database Schema
 
@@ -137,3 +173,14 @@ greed = 0.0
 - **Transactional DB** — SQLite transactions
 - **Sentiment-aware risk** — different advice per zone
 - **Dot-path config** — `get_value("thresholds.fear")`
+- **Yahoo Finance v8 API** — `query1.finance.yahoo.com/v8/finance/chart`
+
+## External API Dependencies
+
+| API | Purpose | Rate Limit | Delay |
+|-----|---------|------------|-------|
+| CNN Fear & Greed | Market sentiment | ~5/min | Real-time |
+| Yahoo Finance v8 | Stock/Index quotes | ~5/min, 500/day | 15-20 min |
+| 天天基金 | CN fund prices | Unknown | Daily |
+
+**Note**: All APIs are free, no authentication required. Yahoo Finance requires proper User-Agent headers.

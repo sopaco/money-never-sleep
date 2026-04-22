@@ -1,6 +1,6 @@
 ---
 name: money-never-sleep
-version: 0.5.8
+version: 0.5.9
 description: |
   MNS (Money Never Sleep, Market Neutral Strategist) CLI skill for autonomous agents. Provides investment
   portfolio tracking, market sentiment analysis using CNN Fear & Greed Index, and strategy
@@ -272,6 +272,94 @@ mns buy TSLA 50 250.00
 mns price TSLA 255.00
 ```
 
+## 高级分析指南
+
+以下分析功能由 Agent 组合使用基础命令完成，非单一 CLI 命令。
+
+### 行业分析 (Agent 执行)
+
+组合使用基础命令分析行业表现：
+
+```bash
+# 1. 查询行业 ETF 表现
+mns analyze XLK    # 科技
+mns analyze XLF    # 金融
+mns analyze XLE    # 能源
+mns analyze XLV    # 医疗
+mns analyze XLY    # 消费
+mns analyze XLP    # 消费必需品
+mns analyze XLB    # 材料
+mns analyze XLU    # 公用事业
+mns analyze XLI    # 工业
+mns analyze XLRE   # 房地产
+
+# 2. 分析各行业龙头股
+mns analyze AAPL   # 科技龙头
+mns analyze JPM    # 金融龙头
+mns analyze XOM    # 能源龙头
+
+# 3. 对比行业表现与大盘指数
+mns market-indices  # 获取大盘指数参考
+mns portfolio       # 查看当前持仓行业分布
+```
+
+Agent 分析要点：
+- 比较各行业 ETF 涨跌幅，识别强势/弱势行业
+- 对比行业与大盘（S&P 500）的相对表现
+- 结合恐贪指数判断行业轮动机会
+
+### 组合深度分析 (Agent 执行)
+
+基于已有数据进行组合分析：
+
+```bash
+# 1. 查看当前持仓
+mns portfolio
+
+# 2. 获取市场情绪
+mns sentiment
+
+# 3. 获取策略报告
+mns report
+
+# 4. 查看历史表现
+mns history --limit 100
+```
+
+Agent 分析要点：
+- **配置合理性**: 持仓集中度是否过高（单一标的 > 30% 需警惕）
+- **收益分布**: 各持仓年化收益率分布，识别拖累/贡献主力
+- **情绪偏离**: 当前恐贪指数与持仓策略是否匹配（恐慌时应持有更多权益）
+- **现金比例**: 现金占比是否符合理想配置（参考买入比例建议）
+
+### 风险评估 (Agent 执行)
+
+组合计算风险指标：
+
+```bash
+# 1. 获取持仓成本与当前价格
+mns portfolio
+
+# 2. 获取历史价格记录
+mns history --limit 365
+
+# 3. 结合市场波动率
+mns market  # 包含 VIX 指数
+```
+
+Agent 风险指标计算：
+- **最大回撤**: 基于历史快照计算峰值到谷值的最大跌幅
+- **Sharpe 比率**: `(年化收益 - 无风险利率) / 波动率`（需历史数据支持）
+- **持仓集中度**: 前三大持仓占比总和
+- **浮亏暴露**: 当前浮亏 > 20% 的持仓数量及金额
+
+风险等级判定：
+| 风险等级 | 条件 |
+|---------|------|
+| 低风险 | 单一持仓 < 20%，无浮亏 > 20% 标的，现金 > 20% |
+| 中风险 | 单一持仓 20-30%，或 1-2 个标的浮亏 10-20% |
+| 高风险 | 单一持仓 > 30%，或 3+ 标的浮亏 > 20%，或 VIX > 30 |
+
 ## 配置参数
 
 完整的配置参数说明请参考 `references/strategy.md`，其中包含：
@@ -299,6 +387,8 @@ mns price TSLA 255.00
 
 - `references/commands.md` - 完整命令参考
 - `references/strategy.md` - 策略参数详解
+- `references/DATA_CAPABILITIES.md` - 数据能力说明
+- `references/TECHNICAL_INDICATORS.md` - 技术指标说明
 
 ## 开源信息
 

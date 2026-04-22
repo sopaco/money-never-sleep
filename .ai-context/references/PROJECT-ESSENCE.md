@@ -1,20 +1,20 @@
 # Project Essence — MNS
 
-**Last updated**: 2026-04-22
+**Last updated**: 2026-04-23
 
 ---
 
 ## What
 
-MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that monitors market sentiment (Fear & Greed Index), analyzes portfolio positions against return targets, and generates daily buy/sell recommendations. Now includes backtesting with optimized parameters and multi-asset portfolio support.
+MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that monitors market sentiment (Fear & Greed Index), analyzes portfolio positions against return targets, and generates daily buy/sell recommendations. Now includes market data features (global indices, stock analysis), backtesting with optimized parameters, and multi-asset portfolio support.
 
 ## Why
 
-逆向投资 (contrarian investing) — buy when fearful, sell when greedy. Most investors struggle with emotional discipline. This tool provides systematic, rules-based signals so the user makes decisions without panic.
+逆向投资 — buy when fearful, sell when greedy. Most investors struggle with emotional discipline. This tool provides systematic, rules-based signals so the user makes decisions without panic.
 
 ## Who
 
-个人投资者，需要一套系统化的投资决策辅助工具，包含历史回测验证策略有效性。
+个人投资者，需要一套系统化的投资决策辅助工具，包含市场概览、历史回测验证策略有效性。
 
 ## What It Does
 
@@ -27,8 +27,10 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
    - Contrarian buy weighting → underwater positions get more allocation
 4. **Outputs** text report with sell/buy/risk/net operation guidance
 5. **Auto-updates** prices via `mns update-prices`
-6. **Backtests** strategy effectiveness with historical data (2016-2025)
-7. **Compares** multiple config variants in single run
+6. **Shows market overview** via `mns market` (9 global indices + fear/greed)
+7. **Analyzes individual stocks** via `mns analyze <symbol>`
+8. **Backtests** strategy effectiveness with historical data (2016-2025)
+9. **Compares** multiple config variants in single run
 
 ## What It Does NOT Do
 
@@ -48,6 +50,21 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 - **Dual-criteria sell** — annualized + absolute return triggers
 - **Sentiment-aware risk** — different advice per market zone
 - **Optimized defaults** — conservative config: US 55%, CN 25%, Gold 20%
+- **Free data sources** — Yahoo Finance v8, CNN API, 天天基金; no API keys
+
+## New Features (v0.5.9)
+
+### Market Data Commands
+- `mns market` — Combined view: 9 global indices + Fear & Greed Index
+- `mns market-indices` — Dedicated global indices query
+- `mns analyze <symbol>` — Individual stock analysis (quote + valuation placeholder)
+
+### Supported Market Indices
+| Region | Indices |
+|--------|---------|
+| US | S&P 500, Dow Jones, NASDAQ, VIX |
+| Europe | FTSE 100 (UK), DAX (Germany) |
+| Asia | Nikkei 225 (Japan), 上证指数, 恒生指数 |
 
 ## Optimized Configuration (Default)
 

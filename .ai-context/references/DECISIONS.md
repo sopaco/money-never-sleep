@@ -1,6 +1,6 @@
 # Design Decisions — MNS
 
-**Last updated**: 2026-04-22
+**Last updated**: 2026-04-23
 
 ---
 
@@ -189,3 +189,20 @@ Fear/EFear       hold         hold       hold
 - Clear comparison of risk/return tradeoffs
 - Repeatable experiments
 **Trade-off**: More complex backtest module.
+
+---
+
+## Decision 17: Yahoo Finance v8 API for market data
+
+**Context**: Need reliable, free market data for global indices and stock quotes.
+**Choice**: Use Yahoo Finance v8 API (`query1.finance.yahoo.com/v8/finance/chart`).
+**Rationale**:
+- Free, no authentication required
+- Covers global indices (US, Europe, Asia)
+- Real-time-ish quotes (15-20 min delay)
+- Well-documented API structure
+**Trade-off**:
+- Rate limits (~5 requests/min, 500/day estimated)
+- 15-20 minute quote delay
+- May require proper User-Agent headers to avoid blocking
+- API is unofficial and may change without notice
