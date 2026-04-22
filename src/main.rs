@@ -577,14 +577,15 @@ async fn cmd_update_prices() -> Result<()> {
             .old_price
             .map(|p| format!("{:.4}", p))
             .unwrap_or("-".to_string());
+        let display_name = if update.asset_name.chars().count() > 18 {
+            update.asset_name.chars().take(18).collect()
+        } else {
+            update.asset_name.clone()
+        };
         println!(
             "{:<10} {:<20} {:>12} {:>12} {:>8}",
             update.asset_code,
-            if update.asset_name.len() > 18 {
-                &update.asset_name[..18]
-            } else {
-                &update.asset_name
-            },
+            &display_name,
             old,
             format!("{:.4}", update.new_price),
             update.source
