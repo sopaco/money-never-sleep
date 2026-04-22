@@ -1,27 +1,27 @@
 {
-	"name": "@never-sleeps/bin-darwin-arm64",
-	"version": "0.5.7",
-	"description": "MNS binaries for macOS Apple Silicon",
-	"publishConfig": {
-		"access": "public"
-	},
-	"os": [
-		"darwin"
-	],
-	"cpu": [
-		"arm64"
-	],
-	"bin": {
-		"mns": "bin/mns"
-	},
-	"files": [
-		"bin/"
-	],
-	"author": "Sopaco",
-	"license": "MIT",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/sopaco/money-never-sleep.git",
-		"directory": "distribution/bin-darwin-arm64"
-	}
+  "name": "@never-sleeps/bin-darwin-arm64",
+  "version": "0.5.9",
+  "description": "MNS binaries for macOS Apple Silicon",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "bin": {
+    "mns": "bin/mns"
+  },
+  "files": [
+    "bin/"
+  ],
+  "author": "Sopaco",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sopaco/money-never-sleep.git",
+    "directory": "distribution/bin-darwin-arm64"
+  }
 }
