@@ -9,7 +9,7 @@ mod report;
 mod sentiment;
 mod strategy;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{BacktestAction, CashAction, Commands};
 use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
@@ -91,6 +91,12 @@ fn cmd_init(force: bool) -> Result<()> {
             println!("已取消初始化。");
             return Ok(());
         }
+    }
+
+    // 用户确认后，删除旧的数据库文件
+    if db_exists {
+        std::fs::remove_file(&db_path)
+            .with_context(|| format!("删除数据库失败: {}", db_path.display()))?;
     }
 
     let config = AppConfig::default_config();
