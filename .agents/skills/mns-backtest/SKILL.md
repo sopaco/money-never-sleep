@@ -22,16 +22,16 @@ cargo build --release
 ### 2. 运行回测
 
 ```bash
-# 多配置对比（默认行为）
+# 默认行为：先输出多资产回测（美股+红利低波+黄金）对比，再输出单资产（纳指）参数对比
 mns backtest
 
-# 使用自定义配置文件
+# 使用自定义配置文件（仅单资产回测）
 mns backtest run --config path/to/config.toml
 
-# 多配置文件对比
+# 多配置文件对比（仅单资产回测）
 mns backtest run --compare config1.toml,config2.toml
 
-# 查看可调参数说明
+# 查看可调参数说明（含当前默认值）
 mns backtest params
 ```
 
@@ -58,6 +58,7 @@ mns config thresholds.fear 40
 | `config_swing.toml` | 波段操作 |
 | `config_extreme_contrarian.toml` | 极致逆向 |
 | `config_value.toml` | 价值导向 |
+| `config_historical_aggressive.toml` | 历史激进配置（⚠️ 过拟合风险，仅供研究参考） |
 
 ```bash
 mns backtest run --config .agents/skills/mns-backtest/data/config_defensive.toml
@@ -76,7 +77,7 @@ mns backtest run --config .agents/skills/mns-backtest/data/config_defensive.toml
 ## 核心逻辑文件
 
 - `src/backtest.rs` — 回测引擎，`run_backtest()`、`run_multi_asset_backtest()`、`run_param_comparison()`
-- `src/strategy.rs` — 策略核心，回测复用实际策略逻辑，结果与实盘一致
+- `src/strategy.rs` — 策略核心，回测复用相同的买卖/风险判断函数（`calculate_buy_suggestions` 等），执行流程为回测专用模拟
 - `src/config.rs` — 参数结构定义，`AppConfig::default_config()` 为防御配置默认值
 
 ## 解读结果
