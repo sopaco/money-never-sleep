@@ -233,9 +233,24 @@ pub async fn fetch_full_quote(symbol: &str) -> Result<StockQuote> {
         .filter(|&p| p > 0.0)
         .context("缺少有效的价格数据")?;
 
+    // Yahoo v8 chart API 对指数使用 chartPreviousClose，而非 previousClose
     let previous_close = meta
-        .get("previousClose")
+        .get("chartPreviousClose")
         .and_then(|v| v.as_f64())
+        .or_else(|| meta.get("previousClose").and_then(|v| v.as_f64()))
+        .or_else(|| {
+            // 从 indicators 的历史收盘价中取前一天数据
+            result
+                .get("indicators")
+                .and_then(|i| i.get("quote"))
+                .and_then(|q| q.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|q| q.get("close"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_f64())
+                .filter(|&p| p > 0.0 && p != price)
+        })
         .unwrap_or(price);
 
     let symbol_name = meta

@@ -387,5 +387,3 @@ Agent 风险指标计算：
 
 - `references/commands.md` - 完整命令参考
 - `references/strategy.md` - 策略参数详解
-- `references/DATA_CAPABILITIES.md` - 数据能力说明
-- `references/TECHNICAL_INDICATORS.md` - 技术指标说明
