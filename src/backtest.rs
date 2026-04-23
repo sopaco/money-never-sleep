@@ -649,25 +649,40 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
                     };
 
                     if sell.sell_shares <= shares {
-                        // 执行卖出
+                        // 执行卖出，按对应资产的实际价格计算金额
                         let actual_shares = sell.sell_shares;
-                        let actual_amount = actual_shares * (data.nasdaq.max(data.dividend_low_vol.max(data.gold_cny)));
+                        let actual_price = if sell.asset_code == "NASDAQ" {
+                            data.nasdaq
+                        } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
+                            data.dividend_low_vol
+                        } else {
+                            data.gold_cny
+                        };
+                        let actual_amount = actual_shares * actual_price;
 
                         if sell.asset_code == "NASDAQ" {
                             state.us_shares -= actual_shares;
-                            state.cash += actual_shares * data.nasdaq;
+                            state.cash += actual_amount;
                         } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
                             state.cn_shares -= actual_shares;
-                            state.cash += actual_shares * data.dividend_low_vol;
+                            state.cash += actual_amount;
                         } else {
                             state.gold_shares -= actual_shares;
-                            state.cash += actual_shares * data.gold_cny;
+                            state.cash += actual_amount;
                         }
 
                         last_trade_month = month_key;
                         sell_count += 1;
-                        sell_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
-                        sell_by_asset.entry(sell.asset_code.clone()).or_insert((0, 0.0)).0 += 1;
+                        {
+                            let e = sell_by_zone.entry(zone.to_string()).or_insert((0, 0.0));
+                            e.0 += 1;
+                            e.1 += actual_amount;
+                        }
+                        {
+                            let e = sell_by_asset.entry(sell.asset_code.clone()).or_insert((0, 0.0));
+                            e.0 += 1;
+                            e.1 += actual_amount;
+                        }
 
                         state.trades.push(MultiAssetTrade {
                             date: data.date,
@@ -676,7 +691,7 @@ pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) 
                             zone: zone.to_string(),
                             fgi: data.fgi,
                             shares: actual_shares,
-                            price: if sell.asset_code == "NASDAQ" { data.nasdaq } else if sell.asset_code == "DIVIDEND_LOW_VOL" { data.dividend_low_vol } else { data.gold_cny },
+                            price: actual_price,
                             amount: actual_amount,
                             pct: format!("{:.0}%", sell.sell_ratio),
                             ann_ret: sell.annualized_return,
@@ -869,7 +884,7 @@ fn aggregate_fgi_to_monthly(fgi_data: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f6
     result
 }
 
-fn parse_sp500_data(data: &str) -> Vec<(NaiveDate, f64)> {
+fn parse_nasdaq_data(data: &str) -> Vec<(NaiveDate, f64)> {
     data.lines()
         .skip(1) // 跳过表头
         .filter_map(|line| {
@@ -907,8 +922,8 @@ fn create_position(state: &BacktestState, price: f64, date: NaiveDate) -> Option
 
     Some(Position {
         id: 1,
-        asset_code: "SPY".to_string(),
-        asset_name: "S&P 500 ETF".to_string(),
+        asset_code: "NASDAQ".to_string(),
+        asset_name: "纳指ETF".to_string(),
         shares: state.position.shares,
         cost_price: state.position.cost_price,
         current_price: Some(price),
@@ -924,7 +939,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
     fgi_data.sort_by_key(|(d, _)| *d);
 
     let monthly_fgi = aggregate_fgi_to_monthly(&fgi_data);
-    let sp500_data = parse_sp500_data(MONTHLY_REAL_DATA);
+    let sp500_data = parse_nasdaq_data(MONTHLY_REAL_DATA);
 
     let mut combined_data: Vec<(NaiveDate, f64, f64)> = Vec::new();
     for (fgi_date, fgi_score) in &monthly_fgi {
@@ -1110,7 +1125,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
     }
 
     BacktestResult {
-        name: "逆向策略".to_string(),
+        name: "纳指逆向策略".to_string(),
         total_inflow: state.total_inflow,
         final_value,
         total_return,
@@ -1125,7 +1140,7 @@ pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestR
 }
 
 pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
-    let sp500_data = parse_sp500_data(MONTHLY_REAL_DATA);
+    let sp500_data = parse_nasdaq_data(MONTHLY_REAL_DATA);
 
     let end_price = sp500_data
         .iter()
@@ -1186,7 +1201,7 @@ pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
     let buy_count = trades.len();
 
     BacktestResult {
-        name: "买入持有".to_string(),
+        name: "纳指买入持有".to_string(),
         total_inflow,
         final_value,
         total_return,

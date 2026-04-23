@@ -63,7 +63,7 @@ pub struct ApiConfig {
 
 impl AppConfig {
     pub fn default_config() -> Self {
-        // 保守配置 - 低回撤优先
+        // 防御配置 - 低回撤优先，逆向策略
         Self {
             settings: Settings {
                 annualized_target_low: 10.0,   // 降低止盈门槛，更早锁定收益

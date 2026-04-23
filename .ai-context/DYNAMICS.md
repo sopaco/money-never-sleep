@@ -38,7 +38,7 @@
 
 ## Recently Added Features
 
-### 市场数据功能 (v0.5.9) — 2026-04-23
+### 市场数据功能 (v0.5.10) — 2026-04-23
 **Detail**: 新增市场数据获取模块和三个命令：
 - `mns market` — 综合市场概况（9个全球指数 + 恐贪指数）
 - `mns market-indices` — 专门查看全球主要指数
@@ -47,7 +47,7 @@
 - 支持 9 个全球主要指数：S&P 500, Dow Jones, NASDAQ, VIX, FTSE 100, DAX, Nikkei 225, 上证指数, 恒生指数
 
 ### 策略参数优化 (2026-04-22)
-**Detail**: 基于历史回测验证，默认配置为保守配置（低回撤优先）：
+**Detail**: 基于历史回测验证，默认配置为防御配置（低回撤优先）：
 - 美股 55%（降低美股占比）
 - A股 25%（红利低波稳健配置）
 - 黄金 20%（提高对冲比例）
@@ -87,6 +87,27 @@
 ### Strategy threshold mismatch with PRD (2026-04-19)
 **Resolved**: 修复买卖比例缺少"中性"区间的逻辑错误
 **Detail**: 添加正确的5区和3区逻辑，新增 `neutral_target_high` 配置项
+
+### 文档参数不一致 (2026-04-23)
+**Resolved**: 修正SKILL.md和strategy.md中的参数表格，与实际代码和backtest验证结论一致
+**Detail**: 
+- 修正 `buy_ratio` 表格：极度恐慌 50%→60%，恐慌 30%→35%，中性 20%→0%
+- 修正 `sell_ratio` 表格：贪婪低收益 20%→25%，中性高收益 30%→15%
+- 修正恐贪指数范围：极度恐慌 0-25→FGI<30，贪婪 75-100→FGI≥70
+- 修正commands.md示例输出：buy_ratio.extreme_fear = 50.0→60.0
+- 在mns-backtest/SKILL.md添加详细的预设配置参数说明表
+
+### 投资策略文档对齐问题 (2026-04-23)
+**Resolved**: 统一配置命名，修正卖出矩阵，精简SKILL内容
+**Detail**: 
+- 重命名"最优配置"为"历史激进配置"，添加免责声明：历史最优≠未来最优
+- 统一配置命名：默认配置→防御配置（全文档一致）
+- 修正DECISIONS.md卖出矩阵：≥22%/15-22%/<15% → ≥15%/10-15%/<10%（与代码一致）
+- 补充PROJECT-ESSENCE.md策略价值说明：纪律性而非收益最大化
+- 精简mns-backtest/SKILL.md：删除冗余的详细参数表格（50+行）
+- 精简.ai-context/SKILL.md：移除重复的CLI命令完整列表
+- 精简AGENTS.md：移除CLI完整列表，指向SKILL.md
+- 更新AGENTS.md Rust版本：2021→2024
 
 ---
 

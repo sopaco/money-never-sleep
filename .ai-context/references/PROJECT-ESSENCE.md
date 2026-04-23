@@ -49,10 +49,24 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 - **Buy/sell aware** — sell proceeds flow into buy suggestions
 - **Dual-criteria sell** — annualized + absolute return triggers
 - **Sentiment-aware risk** — different advice per market zone
-- **Optimized defaults** — conservative config: US 55%, CN 25%, Gold 20%
+- **Defensive defaults** — 防御配置: US 55%, CN 25%, Gold 20%
 - **Free data sources** — Yahoo Finance v8, CNN API, 天天基金; no API keys
 
-## New Features (v0.5.9)
+## Strategy Value (为什么用逆向策略)
+
+**核心价值是纪律性，而非收益最大化**
+
+回测显示逆向策略收益低于买入持有约2.1%年化，但策略价值在于：
+- 帮助用户克服"恐慌时不敢买、贪婪时不愿卖"的人性弱点
+- 在极端市场提供系统性信号（如2020年熔断、2022年熊市）
+- 强制执行买卖纪律，避免情绪化决策
+
+适合人群：
+- 容易受市场情绪影响的投资者
+- 需要外部信号辅助决策的投资者
+- 希望系统化管理仓位纪律的投资者
+
+## New Features (v0.5.10)
 
 ### Market Data Commands
 - `mns market` — Combined view: 9 global indices + Fear & Greed Index
@@ -65,18 +79,3 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 | US | S&P 500, Dow Jones, NASDAQ, VIX |
 | Europe | FTSE 100 (UK), DAX (Germany) |
 | Asia | Nikkei 225 (Japan), 上证指数, 恒生指数 |
-
-## Optimized Configuration (Default)
-
-Based on historical backtesting (2016-2025):
-- **年化收益**: 8-9% (逆向策略) vs 11% (买入持有)
-- **最大回撤**: 21-28% (逆向策略) vs 15% (买入持有)
-
-Key parameters (保守配置):
-- US stocks: 55%
-- CN stocks: 25%
-- Gold: 20%
-- Extreme fear buy: 60%
-- Annualized targets: 10% / 15%
-- Min holding days: 45
-- Expected: 7-8% annual, 13-18% drawdown

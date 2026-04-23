@@ -68,6 +68,8 @@ When you speak keywords (like "backtest"), AI automatically activates the corres
 ```bash
 # Install
 cargo build --release
+or
+cargo build --release --target x86_64-unknown-linux-musl
 
 # Initialize
 mns init
@@ -76,7 +78,7 @@ mns cash set 100000
 # Daily usage
 mns add QQQ "Nasdaq 100" us_stocks
 mns buy QQQ 50 380.00
-mns price QQQ 420.00
+mns update-prices
 mns report          # Generate today's action suggestions
 mns backtest        # Strategy backtest
 ```

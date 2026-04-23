@@ -1,33 +1,33 @@
 {
-  "name": "@never-sleeps/mns-cli",
-  "version": "0.5.9",
-  "description": "MNS (Money Never Sleep) CLI tool. Installs the correct prebuilt binary for the current platform via npm optional dependencies.",
-  "license": "MIT",
-  "author": "Sopaco",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sopaco/money-never-sleep.git",
-    "directory": "distribution/bin-mns-cli"
-  },
-  "keywords": [
-    "mns",
-    "investment",
-    "trading",
-    "cli",
-    "contrarian-investing"
-  ],
-  "optionalDependencies": {
-    "@never-sleeps/bin-darwin-arm64": "^0.5.7",
-    "@never-sleeps/bin-linux-x64": "^0.5.7",
-    "@never-sleeps/bin-win-x64": "^0.5.7"
-  },
-  "files": [
-    "README.md"
-  ],
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "publishConfig": {
-    "access": "public"
-  }
+	"name": "@never-sleeps/mns-cli",
+	"version": "0.5.10",
+	"description": "MNS (Money Never Sleep) CLI tool. Installs the correct prebuilt binary for the current platform via npm optional dependencies.",
+	"license": "MIT",
+	"author": "Sopaco",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/sopaco/money-never-sleep.git",
+		"directory": "distribution/bin-mns-cli"
+	},
+	"keywords": [
+		"mns",
+		"investment",
+		"trading",
+		"cli",
+		"contrarian-investing"
+	],
+	"optionalDependencies": {
+		"@never-sleeps/bin-darwin-arm64": "^0.5.7",
+		"@never-sleeps/bin-linux-x64": "^0.5.7",
+		"@never-sleeps/bin-win-x64": "^0.5.7"
+	},
+	"files": [
+		"README.md"
+	],
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
 }

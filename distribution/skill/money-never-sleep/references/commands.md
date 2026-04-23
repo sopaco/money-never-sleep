@@ -84,7 +84,7 @@ mns config sell_ratio.extreme_greed_target_high
 输出:
 ```
 thresholds.fear = 45
-buy_ratio.extreme_fear = 50.0
+buy_ratio.extreme_fear = 60.0
 sell_ratio.extreme_greed_target_high = 50.0
 ```
 
