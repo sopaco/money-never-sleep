@@ -68,6 +68,8 @@ When you speak keywords (like "backtest"), AI automatically activates the corres
 ```bash
 # Install
 cargo build --release
+or
+cargo build --release --target x86_64-unknown-linux-musl
 
 # Initialize
 mns init
