@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{Datelike, Local};
+use comfy_table::{Cell, Color, Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS};
 use std::fs;
 use std::path::Path;
 
@@ -38,7 +39,7 @@ pub fn generate_report(
     // Header
     report.push_str(&format!(
         "═══════════════════════════════════════════════════\n\
-         逆向投资助手 - 每日策略报告\n\
+         逆情绪投资助手 - 每日策略报告\n\
          {} ({})\n\
          ═════════════════════════════════════════════════\n\n",
         date_str, weekday
@@ -75,9 +76,20 @@ pub fn generate_report(
     // 持仓明细
     if !positions.is_empty() {
         report.push_str("  持仓明细:\n");
-        report.push_str("  ┌──────────┬──────────────┬──────────┬──────────┬──────────┬──────────┬──────────┐\n");
-        report.push_str("  │ 代码     │ 名称         │ 份额     │ 成本价   │ 现价     │ 年化收益 │ 绝对收益 │\n");
-        report.push_str("  ├──────────┼──────────────┼──────────┼──────────┼──────────┼──────────┤──────────┤\n");
+
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .apply_modifier(UTF8_ROUND_CORNERS);
+        table.set_header(vec![
+            Cell::new("代码"),
+            Cell::new("名称"),
+            Cell::new("份额"),
+            Cell::new("成本价"),
+            Cell::new("现价"),
+            Cell::new("年化收益"),
+            Cell::new("绝对收益"),
+        ]);
 
         for pos in positions {
             let ann_str = match pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days) {
@@ -92,12 +104,33 @@ pub fn generate_report(
                 Some(p) => format!("{:.2}", p),
                 None => "-".to_string(),
             };
-            report.push_str(&format!(
-                "  │ {:<8} │ {:<12} │ {:>8.2} │ {:>8.2} │ {:>8} │ {:>8} │ {:>8} │\n",
-                pos.asset_code, pos.asset_name, pos.shares, pos.cost_price, cur_str, ann_str, abs_str
-            ));
+
+            // 年化收益单元格着色
+            let mut ann_cell = Cell::new(&ann_str);
+            if let Some(r) = pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days) {
+                if r * 100.0 >= config.settings.annualized_target_high {
+                    ann_cell = ann_cell.fg(Color::Green);
+                } else if r < 0.0 {
+                    ann_cell = ann_cell.fg(Color::Red);
+                }
+            }
+
+            table.add_row(vec![
+                Cell::new(&pos.asset_code),
+                Cell::new(&pos.asset_name),
+                Cell::new(format!("{:.2}", pos.shares)),
+                Cell::new(format!("{:.2}", pos.cost_price)),
+                Cell::new(&cur_str),
+                ann_cell,
+                Cell::new(&abs_str),
+            ]);
         }
-        report.push_str("  └──────────┴──────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘\n\n");
+
+        // 将表格每行缩进两个空格
+        for line in table.to_string().lines() {
+            report.push_str(&format!("  {}\n", line));
+        }
+        report.push('\n');
     }
 
     // 卖出建议

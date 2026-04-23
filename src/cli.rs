@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mns",
     version,
-    about = "逆向投资助手 - Money Never Sleeps（Market Neutral Strategist）"
+    about = "逆情绪投资助手 - Money Never Sleeps（Market Neutral Strategist）"
 )]
 pub struct Cli {
     #[command(subcommand)]
