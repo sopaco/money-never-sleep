@@ -11,88 +11,80 @@ description: |
 
 # MNS 逆向投资策略回测 Skill
 
-## 概述
+## 操作步骤
 
-本 skill 提供 MNS 逆向投资策略的回测能力，**基于 MNS CLI 的真实策略引擎**，复用 `src/strategy.rs` 的完整逻辑，确保回测结果与实际使用效果一致。
-
-## 使用方式
+### 1. 构建
 
 ```bash
-# 基本回测（多配置对比）
+cargo build --release
+```
+
+### 2. 运行回测
+
+```bash
+# 多配置对比（默认行为）
 mns backtest
 
-# 使用自定义配置
-mns backtest run --config my_config.toml
+# 使用自定义配置文件
+mns backtest run --config path/to/config.toml
 
-# 多配置对比
+# 多配置文件对比
 mns backtest run --compare config1.toml,config2.toml
 
-# 查看可调参数
+# 查看可调参数说明
 mns backtest params
 ```
 
-## 关键回测结论（2016-2025）
+### 3. 参数调优
 
-### 预设配置对比
+查看当前配置：
+```bash
+mns config
+```
 
-| 配置 | 年化收益 | 总收益率 | 最大回撤 | 买入次数 | 卖出次数 |
-|------|---------|---------|---------|---------|---------|
-| 防御配置（默认） | 8.87% | 119.49% | 23.10% | 38 | 12 |
-| 激进配置 | 9.20% | 125.67% | 24.99% | 38 | 12 |
-| 超激进配置 | 9.42% | 130.08% | 26.50% | 38 | 13 |
-| 极致激进 | 9.58% | 133.19% | 27.56% | 38 | 12 |
-| 保守配置 | 8.41% | 111.06% | 21.09% | 38 | 12 |
-| 无中性配置 | 8.20% | 107.33% | 21.09% | 22 | 12 |
-| 买入持有 | 10.97% | 161.91% | 14.70% | 11 | 0 |
+修改单个参数：
+```bash
+mns config buy_ratio.extreme_fear 70
+mns config thresholds.fear 40
+```
 
-### 核心发现
+使用预设配置文件（位于 `.agents/skills/mns-backtest/data/`）：
 
-1. **逆向策略收益低于买入持有**：年化差距约 2.1%
-2. **防御性反而更差**：最大回撤比买入持有高约 8%
-3. **无中性配置降低交易频率**：买入从 38 次降到 22 次
+| 配置文件 | 特点 |
+|---------|------|
+| `config_defensive.toml` | 防御配置（低回撤，中性不买，**当前默认**） |
+| `config_balanced.toml` | 均衡配置 |
+| `config_circuit_breaker.toml` | 熔断机制 |
+| `config_swing.toml` | 波段操作 |
+| `config_extreme_contrarian.toml` | 极致逆向 |
+| `config_value.toml` | 价值导向 |
 
-### 策略价值说明
-
-**既然策略不如买入持有，为什么还要用？**
-
-逆向策略的核心价值是**纪律性**而非收益最大化：
-- 帮助用户克服"恐慌时不敢买、贪婪时不愿卖"的人性弱点
-- 在极端市场提供系统性信号（如 2020 年熔断、2022 年熊市）
-- 强制执行买卖纪律，避免情绪化决策
-
-适合人群：
-- 容易受市场情绪影响的投资者
-- 需要外部信号辅助决策的投资者
-- 希望系统化管理仓位纪律的投资者
-
-## 预设配置说明
-
-回测提供以下预设配置（位于 `.agents/skills/mns-backtest/data/`）：
-
-| 配置文件 | 特点 | 适用场景 |
-|---------|------|---------|
-| `config_defensive.toml` | 低回撤优先，中性不买入 | 稳健型投资者（默认） |
-| `config_circuit_breaker.toml` | 熔断机制，极端行情暂停 | 高波动市场 |
-| `config_balanced.toml` | 三资产均衡配置 | 分散风险 |
-| `config_swing.toml` | 波段操作，高抛低吸 | 短期交易 |
-| `config_extreme_contrarian.toml` | 极端逆向，恐慌重仓 | 风险承受能力强 |
-| `config_value.toml` | 价值导向，基本面筛选 | 长线投资者 |
-
-**注意**：历史表现最好的配置不代表未来最优，过度拟合风险需警惕。
+```bash
+mns backtest run --config .agents/skills/mns-backtest/data/config_defensive.toml
+```
 
 ## 数据说明
 
-- **2016-2020.09**：逐日恐贪指数（高置信度）
-- **2020.10-2025.04**：月度近似值（低置信度）
-- **S&P 500**：月度收盘价
+回测使用嵌入式数据（`include_str!` 编译进二进制）：
 
-回测假设：
-- 初始资金 ¥100,000
-- 每年 2 月追加 ¥50,000
-- 忽略手续费、滑点、税收
+- `fgi_2016_2020.csv` — 逐日 CNN 恐贪指数（高置信度）
+- `fgi_2020_2025.csv` — 月度近似恐贪指数（低置信度）
+- `monthly_real_final.csv` — 多资产月度价格（纳指/红利低波/人民币金价）
 
-## 相关文件
+**注意**：数据更新需要修改 CSV 文件并重新 `cargo build --release`。
 
-- `src/backtest.rs` - 回测引擎
-- `src/strategy.rs` - 策略核心逻辑
-- `data/*.toml` - 预设配置文件
+## 核心逻辑文件
+
+- `src/backtest.rs` — 回测引擎，`run_backtest()`、`run_multi_asset_backtest()`、`run_param_comparison()`
+- `src/strategy.rs` — 策略核心，回测复用实际策略逻辑，结果与实盘一致
+- `src/config.rs` — 参数结构定义，`AppConfig::default_config()` 为防御配置默认值
+
+## 解读结果
+
+运行后输出对比表（年化收益、总收益率、最大回撤、买卖次数），关注：
+
+1. **vs 买入持有**：策略年化是否接近基准
+2. **最大回撤**：回撤越低说明策略防御性越强
+3. **买入次数**：中性区间 buy_ratio 设为 0 会明显降低频率
+
+策略价值在于**纪律性**而非超额收益——帮助克服情绪化决策，在极端市场（恐慌/贪婪）时强制执行买卖信号。
