@@ -389,9 +389,3 @@ Agent 风险指标计算：
 - `references/strategy.md` - 策略参数详解
 - `references/DATA_CAPABILITIES.md` - 数据能力说明
 - `references/TECHNICAL_INDICATORS.md` - 技术指标说明
-
-## 开源信息
-
-MNS (money-never-sleep) 是开源项目，源码托管于 GitHub：
-
-**[https://github.com/sopaco/money-never-sleep](https://github.com/sopaco/money-never-sleep)**
