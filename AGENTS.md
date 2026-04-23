@@ -22,7 +22,7 @@ These files contain the project's architecture, design decisions, and active iss
 - **Type**: Personal CLI investment tool (Rust)
 - **Binary**: `target/release/mns.exe` (Windows) / `target/release/mns` (Linux/macOS)
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`
-- **Stack**: Rust edition 2021, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
+- **Stack**: Rust edition 2024, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
 
 ## Standard Workflow
 
@@ -33,13 +33,14 @@ cargo build --release
 
 ### Run
 ```bash
-# All commands go through the mns binary
-# ⚠️ init 命令会提示确认后再覆盖已有数据，使用 --force 跳过确认
-mns init
-mns cash set 100000
-mns portfolio
-mns report
+mns init [--force]    # 初始化，--force 跳过确认
+mns cash set 100000   # 设置现金
+mns portfolio         # 查看持仓
+mns report            # 生成报告
+mns market            # 市场概况
+mns backtest          # 策略回测
 ```
+更多命令见 `.ai-context/SKILL.md`。
 
 ### Test a change
 ```bash

@@ -76,7 +76,7 @@ mns cash set 100000
 # Daily usage
 mns add QQQ "Nasdaq 100" us_stocks
 mns buy QQQ 50 380.00
-mns price QQQ 420.00
+mns update-prices
 mns report          # Generate today's action suggestions
 mns backtest        # Strategy backtest
 ```

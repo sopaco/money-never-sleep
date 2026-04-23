@@ -133,7 +133,7 @@ Located at `~/.mns/mns.db`:
 
 Path: `~/.mns/config.toml`
 
-Default configuration (保守配置):
+Default configuration (防御配置):
 ```toml
 [settings]
 annualized_target_low = 10.0      # 年化10%开始减仓

@@ -73,13 +73,13 @@
 
 **Context**: Simple "sell when greedy" is too blunt. Need to consider both market sentiment AND whether the position has actually earned its target return.
 
-**Matrix**:
+**Matrix** (对应 `config.rs` 默认值):
 
 ```
-              ≥22% annual   15-22%      <15%
-Extreme Greed    60%          40%        30%
-Greed            45%          30%        hold
-Neutral          25%          hold       hold
+              ≥15% annual   10-15%      <10%
+Extreme Greed    50%          30%        20%
+Greed            40%          25%        hold
+Neutral          15%          hold       hold
 Fear/EFear       hold         hold       hold
 ```
 
@@ -155,14 +155,15 @@ Fear/EFear       hold         hold       hold
 
 ---
 
-## Decision 14: Optimized aggressive configuration as default
+## Decision 14: Defensive configuration as default
 
 **Context**: Original default config was too aggressive, leading to higher drawdowns. After backtesting, conservative config provides better risk-adjusted returns.
-**Choice**: Default to conservative config (US 55%, CN 25%, Gold 20%) based on backtesting.
+**Choice**: Default to defensive config (US 55%, CN 25%, Gold 20%) based on backtesting.
 **Rationale**:
 - Lower drawdown priority: 13-18% vs 23-28% for aggressive
 - Better risk-adjusted returns: similar 7-8% annual with lower volatility
 - Users who prefer higher returns can manually switch to aggressive config
+- 保守配置（中性小额买入）仍可手动启用
 - Longer holding periods (45 days) reduce short-term noise
 **Trade-off**: Lower absolute returns vs aggressive, but better sleep quality.
 

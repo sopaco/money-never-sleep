@@ -173,11 +173,11 @@ mns backtest run --compare config1.toml,config2.toml
 
 | 恐贪区间 | 指数范围 | 买入比例 | 逻辑 |
 |---------|---------|---------|------|
-| Extreme Fear | 0-25 | 50% (默认) | 极度恐慌，重仓买入 |
-| Fear | 25-45 | 30% (默认) | 恐慌，适度买入 |
-| Neutral | 45-55 | 20% (默认) | 中性，小额买入 |
-| Greed | 55-75 | 0% (默认) | 贪婪，不买入 |
-| Extreme Greed | 75-100 | 0% (默认) | 极度贪婪，不买入 |
+| 极度恐慌 | FGI < 30 | 60% (默认) | 极度恐慌，适度买入 |
+| 恐慌 | 30 ≤ FGI < 45 | 35% (默认) | 恐慌，保守买入 |
+| 中性 | 45 ≤ FGI < 55 | 0% (默认) | 中性，暂停买入 |
+| 贪婪 | 55 ≤ FGI < 70 | 0% (默认) | 贪婪，不买入 |
+| 极度贪婪 | FGI ≥ 70 | 0% (默认) | 极度贪婪，不买入 |
 
 ### 卖出决策（双准则）
 
@@ -189,10 +189,10 @@ mns backtest run --compare config1.toml,config2.toml
 
 | 情绪区间 | target_high | target_low | below_target |
 |---------|-------------|------------|--------------|
-| Extreme Greed | 50% | 30% | 20% |
-| Greed | 40% | 20% | 0% |
-| Neutral | 30% | 0% | 0% |
-| Fear/Extreme Fear | 0% | 0% | 0% |
+| 极度贪婪 | 50% | 30% | 20% |
+| 贪婪 | 40% | 25% | 0% |
+| 中性 | 15% | 0% | 0% |
+| 恐慌/极度恐慌 | 0% | 0% | 0% |
 
 > 注：target_high = 年化收益 ≥ annualized_target_high（默认15%），target_low = 年化收益 ≥ annualized_target_low（默认10%）
 
