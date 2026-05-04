@@ -17,6 +17,17 @@ cat .ai-context/DYNAMICS.md
 
 These files contain the project's architecture, design decisions, and active issues. They are **the primary source of truth** for understanding the project quickly.
 
+## Token Optimization
+
+This project uses **rtk** (Rust Token Killer) to reduce LLM token consumption by 60-90% on shell commands.
+
+**Always prefix commands with `rtk` when possible:**
+- `rtk git status` / `rtk git log` / `rtk git diff`
+- `rtk cargo test` / `rtk cargo build` / `rtk cargo clippy`
+- `rtk ls .` / `rtk read <file>`
+
+See `.agents/skills/rtk/SKILL.md` for full command reference.
+
 ## Project Overview
 
 - **Type**: Personal CLI investment tool (Rust)
