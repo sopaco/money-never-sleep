@@ -1,6 +1,6 @@
 # Dynamics — Active Issues & Constraints
 
-**Last updated**: 2026-04-23
+**Last updated**: 2026-07-24
 
 ---
 
@@ -37,6 +37,12 @@
 ---
 
 ## Recently Added Features
+
+### 国内基金价格获取修复 (v0.5.11) — 2026-07-24
+**Detail**: `mns update-prices` 国内基金数据源迁移：
+- 主接口：东方财富移动端 API (`fundmobapi.eastmoney.com`)
+- 降级：天天基金 JSONP API（部分环境已不可用）
+- 优先 `GSZ` 估算净值，回退 `NAV` 单位净值
 
 ### 市场数据功能 (v0.5.10) — 2026-04-23
 **Detail**: 新增市场数据获取模块和三个命令：

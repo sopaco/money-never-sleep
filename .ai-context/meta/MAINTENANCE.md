@@ -1,7 +1,8 @@
 # Maintenance Guide — MNS AI Context
 
-**Last updated**: 2026-04-23
+**Last updated**: 2026-07-24
 
+> **2026-07-24**: 国内基金价格获取修复 (v0.5.11)：quote.rs 切换至东方财富移动端 API，修复 update-prices 全部跳过问题
 > **2026-04-23**: 投资策略文档对齐修复：重命名"最优配置"为"历史激进配置"，统一配置命名为"防御配置"，修正卖出矩阵表格，精简SKILL内容
 > **2026-04-23**: 完成项目一致性review：修正SKILL.md和strategy.md中的参数表格，添加mns-backtest预设配置详细说明，更新.ai-context中的回测验证数据
 > **2026-04-23**: 新增市场数据功能 (v0.5.10)：market.rs 模块、market/analyze/market-indices 命令、Yahoo Finance v8 API；更新 DECISIONS.md 添加 Decision 17
