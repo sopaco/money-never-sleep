@@ -66,6 +66,12 @@ MNS (Money Never Sleeps, Market Neutral Strategist) is a personal CLI tool that 
 - 需要外部信号辅助决策的投资者
 - 希望系统化管理仓位纪律的投资者
 
+## New Features (v0.5.11)
+
+### 国内基金价格获取修复
+- `mns update-prices` 切换至东方财富移动端 API（旧 JSONP 接口已下线）
+- 优先取估算净值 `GSZ`，无估值时回退至单位净值 `NAV`
+
 ## New Features (v0.5.10)
 
 ### Market Data Commands
