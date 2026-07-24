@@ -17,9 +17,9 @@
 		"contrarian-investing"
 	],
 	"optionalDependencies": {
-		"@never-sleeps/bin-darwin-arm64": "^0.5.7",
-		"@never-sleeps/bin-linux-x64": "^0.5.7",
-		"@never-sleeps/bin-win-x64": "^0.5.7"
+		"@never-sleeps/bin-darwin-arm64": "^0.5.10",
+		"@never-sleeps/bin-linux-x64": "^0.5.10",
+		"@never-sleeps/bin-win-x64": "^0.5.10"
 	},
 	"files": [
 		"README.md"
