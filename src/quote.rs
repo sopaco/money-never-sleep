@@ -21,8 +21,63 @@ pub struct StockQuote {
     pub change_percent: f64,
 }
 
-/// 从天天基金获取基金估值价格
-async fn fetch_from_tiantian(code: &str) -> Result<Option<f64>> {
+fn parse_fund_price(value: Option<&serde_json::Value>) -> Option<f64> {
+    value
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&p| p > 0.0)
+}
+
+/// 从东方财富移动端 API 获取基金净值/估值
+async fn fetch_from_eastmoney_mobile(code: &str) -> Result<Option<f64>> {
+    let url = format!(
+        "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?pageIndex=1&pageSize=1&plat=Android&appType=ttjj&product=EFund&Version=1&deviceid=1&Fcodes={}",
+        code
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; MNS/1.0)")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("构建 HTTP 客户端失败")?;
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("Referer", "https://fund.eastmoney.com/")
+        .send()
+        .await
+        .context("请求东方财富基金 API 失败")?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let json: serde_json::Value = resp.json().await.context("解析东方财富响应失败")?;
+
+    if !json.get("Success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let fund = json
+        .get("Datas")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.first());
+
+    // 优先取估算净值，没有则取单位净值
+    if let Some(price) = parse_fund_price(fund.and_then(|f| f.get("GSZ"))) {
+        return Ok(Some(price));
+    }
+
+    if let Some(price) = parse_fund_price(fund.and_then(|f| f.get("NAV"))) {
+        return Ok(Some(price));
+    }
+
+    Ok(None)
+}
+
+/// 从天天基金 JSONP API 获取基金估值价格（旧接口，部分网络环境已不可用）
+async fn fetch_from_tiantian_jsonp(code: &str) -> Result<Option<f64>> {
     let url = format!("http://fundgz.1234567.com.cn/js/{}.js", code);
 
     let client = reqwest::Client::builder()
@@ -50,29 +105,27 @@ async fn fetch_from_tiantian(code: &str) -> Result<Option<f64>> {
         let end = text.rfind(')').unwrap_or(text.len());
         let json_str = &text[start..end];
 
-        // 使用 serde_json 解析
         let json: serde_json::Value =
             serde_json::from_str(json_str).context("解析天天基金响应失败")?;
 
-        // 优先取估算净值，没有则取单位净值
-        if let Some(gsz) = json.get("gsz").and_then(|v| v.as_str()) {
-            if let Ok(price) = gsz.parse::<f64>() {
-                if price > 0.0 {
-                    return Ok(Some(price));
-                }
-            }
+        if let Some(price) = parse_fund_price(json.get("gsz")) {
+            return Ok(Some(price));
         }
 
-        if let Some(dwjz) = json.get("dwjz").and_then(|v| v.as_str()) {
-            if let Ok(price) = dwjz.parse::<f64>() {
-                if price > 0.0 {
-                    return Ok(Some(price));
-                }
-            }
+        if let Some(price) = parse_fund_price(json.get("dwjz")) {
+            return Ok(Some(price));
         }
     }
 
     Ok(None)
+}
+
+/// 从天天基金获取基金估值价格
+async fn fetch_from_tiantian(code: &str) -> Result<Option<f64>> {
+    if let Some(price) = fetch_from_eastmoney_mobile(code).await? {
+        return Ok(Some(price));
+    }
+    fetch_from_tiantian_jsonp(code).await
 }
 
 /// 从 Yahoo Finance 获取美股/ETF 价格
