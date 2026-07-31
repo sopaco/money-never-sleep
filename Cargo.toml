@@ -2,6 +2,8 @@
 name = "mns"
 version = "0.6.0"
 edition = "2024"
+description = "AI-Powered Contrarian Investment Decision Assistant"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
