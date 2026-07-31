@@ -1,5 +1,11 @@
 # MNS CLI 命令参考
 
+> ⚠️ **本文件部分内容已过时（v0.6.0）**
+> `SKILL.md` 是命令语法与策略语义的**唯一权威来源**，两者冲突时以 SKILL.md 为准。
+> 已知过时点：`buy_ratio` / `sell_ratio` 驱动的买卖逻辑已被"目标仓位 + 偏离带"取代，
+> 现仅用于 `mns backtest` 中的旧框架对照，不再驱动 `mns report`。
+
+
 本文档详细描述 MNS CLI 的所有命令、参数和用法。
 
 ## 命令概览
@@ -434,12 +440,12 @@ mns report
 
 ## `history`
 
-**语法**: `mns history [--limit N]`
+**语法**: `mns history [LIMIT]`（位置参数，非 `--limit`）
 
 **功能**: 查看最近的交易历史。
 
 **参数**:
-- `--limit N`: 显示条数，默认 20
+- `LIMIT`: 显示条数，位置参数，默认 20
 
 **示例**:
 ```bash
@@ -447,7 +453,7 @@ mns report
 mns history
 
 # 查看最近 50 条
-mns history --limit 50
+mns history 50
 ```
 
 **输出**:

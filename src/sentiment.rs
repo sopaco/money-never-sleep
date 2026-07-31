@@ -167,7 +167,9 @@ mod tests {
 
     const CNN_API_URL: &str = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata";
 
+    // 需要真实网络，默认跳过：cargo test -- --ignored
     #[tokio::test]
+    #[ignore]
     async fn test_fetch_full_data() {
         let result = fetch_fear_greed_data(CNN_API_URL).await;
         assert!(result.is_ok());

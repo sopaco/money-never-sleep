@@ -18,7 +18,7 @@ Fear prevents buying when prices drop, greed prevents selling when prices rise�
 - 🎯 **Automatically suggest buying during extreme fear**, not panic selling
 - 💰 **Remind to take profit when annualized returns meet targets**, not chasing highs
 - ⚠️ **Smart alerts when positions are underwater**, not ignoring losses
-- 📊 **Backtest-validated strategy effectiveness**, 8-9% annualized return, 16-21% max drawdown
+- 📊 **Honest backtest reporting**: better risk-adjusted than buy-and-hold (Calmar 1.17 vs 0.98), but **lower returns**
 
 ---
 
@@ -28,7 +28,20 @@ Fear prevents buying when prices drop, greed prevents selling when prices rise�
 Integrated CNN Fear & Greed Index, real-time market sentiment sensing, automatically saves historical snapshots for retrospective analysis.
 
 ### 📈 Validated Strategy Parameters
-Optimized based on 2016-2025 historical backtesting, default conservative allocation (US stocks 55%, CN stocks 25%, Gold 20%), return/drawdown ratio 0.42+.
+Backtested on 2016-2025 **real total-return data** (CNY-denominated, dividends included), **net of transaction costs, tiered redemption fees and cash yield**.
+Default allocation: US 55%, CN 25%, Gold 20%; target risk-asset weight moves between 35% and 85% with sentiment.
+
+| Strategy | Annualized (XIRR) | Max Drawdown | Calmar | Trades/yr |
+|---|---|---|---|---|
+| Target-weight (trend anchor) | 12.75% | 10.91% | **1.17** | 8.0 |
+| Buy & hold | **14.60%** | 14.93% | 0.98 | 3.2 |
+
+⚠️ **Read this first**: buy-and-hold beats this strategy by ~1.9pp annualized. The tool's value
+holds only on a risk-adjusted basis (~4pp lower drawdown). The backtest also shows the Fear &
+Greed Index adds **near-zero marginal value** once a trend anchor is present, and prolonged bear
+markets (2000-2002, 2008) are not covered by the available data — yet "bear-market protection"
+is precisely this strategy's main selling point, so that claim remains untested.
+See `.ai-context/references/PROJECT-ESSENCE.md`.
 
 ### 🔄 Buy/Sell Awareness
 Cash recovered from selling automatically counts toward buying budget, calculate sell first then buy, maximizing capital utilization.
@@ -80,7 +93,8 @@ mns add QQQ "Nasdaq 100" us_stocks
 mns buy QQQ 50 380.00
 mns update-prices
 mns report          # Generate today's action suggestions
-mns backtest        # Strategy backtest
+mns backtest          # Compare 4 strategies (same data & cost model)
+mns backtest validate # Out-of-sample validation + bootstrap + holdout
 ```
 
 ---

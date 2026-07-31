@@ -1,31 +1,200 @@
-use crate::config::AppConfig;
-use crate::models::Position;
-use crate::strategy::{
-    BuySuggestion, calculate_buy_suggestions, calculate_sell_suggestions, check_risk_warnings,
-};
-use chrono::{Datelike, NaiveDate};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS};
-use std::collections::HashMap;
-use unicode_width::UnicodeWidthStr;
+//! 回测引擎。
+//!
+//! 设计要点（相对旧版的关键修正）：
+//!
+//! 1. **统一引擎**：目标仓位框架、旧比例框架、买入持有基准全部走同一份数据、
+//!    同一套成本模型。旧版三者实现各自独立，基准还硬编码了与被对比策略不同的
+//!    资产配置（70/15/15 vs 55/25/20），导致对比不公平。
+//! 2. **真实成本**：买入费、按持有天数的阶梯赎回费（FIFO 分批计费）、闲置现金
+//!    货币基金收益。旧版三者皆无，系统性高估了高频调仓策略。
+//! 3. **XIRR 口径**：存在分批注资时 `(期末/总投入)^(1/年数)` 会忽略资金到账时点，
+//!    改用现金流加权收益率。
+//! 4. **数据**：使用 `monthly_total_return.csv`（真实全收益序列，见 build_dataset.py）。
+//!    旧 `monthly_real_final.csv` 中两条腿为人工估填且存在拼接断点。
 
-/// Pad string to specified display width (handling CJK characters)
-fn pad_to_width(s: &str, width: usize) -> String {
-    let display_width = UnicodeWidthStr::width(s);
-    if display_width >= width {
-        s.to_string()
+use crate::config::AppConfig;
+use crate::metrics::{self, CashFlow, RiskMetrics};
+use crate::models::Position;
+use crate::strategy::{calculate_buy_suggestions, calculate_sell_suggestions, check_risk_warnings};
+use chrono::{Datelike, NaiveDate};
+use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
+use std::collections::HashMap;
+
+/// 真实全收益数据集（人民币计价，含分红，无拼接断点）
+const DATASET: &str =
+    include_str!("../.agents/skills/mns-backtest/data/monthly_total_return.csv");
+
+/// 样本外 holdout 区块（CNN 近端 FGI，与主序列不连续，单独回测）
+const DATASET_HOLDOUT: &str =
+    include_str!("../.agents/skills/mns-backtest/data/monthly_total_return_holdout.csv");
+
+pub const LEG_NAMES: [&str; 3] = ["美股(纳指QDII)", "A股(红利)", "黄金"];
+pub const LEG_CODES: [&str; 3] = ["US", "CN", "GOLD"];
+pub const LEG_CATEGORIES: [&str; 3] = ["us_stocks", "cn_stocks", "counter_cyclical"];
+
+// ───────────────────────── 数据 ─────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MonthRow {
+    pub date: NaiveDate,
+    pub fgi: f64,
+    pub prices: [f64; 3],
+}
+
+fn month_end(year: i32, month: u32) -> Option<NaiveDate> {
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
     } else {
-        let padding = width - display_width;
-        format!("{}{}", s, " ".repeat(padding))
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    };
+    next?.pred_opt()
+}
+
+pub fn parse_dataset(data: &str) -> Vec<MonthRow> {
+    let mut out = Vec::new();
+    for line in data.lines().skip(1) {
+        let p: Vec<&str> = line.split(',').collect();
+        if p.len() < 5 {
+            continue;
+        }
+        let ym: Vec<&str> = p[0].split('-').collect();
+        if ym.len() != 2 {
+            continue;
+        }
+        let (Ok(y), Ok(m)) = (ym[0].parse::<i32>(), ym[1].parse::<u32>()) else {
+            continue;
+        };
+        let Some(date) = month_end(y, m) else { continue };
+        let Ok(fgi) = p[1].parse::<f64>() else { continue };
+        let mut prices = [0.0; 3];
+        let mut ok = true;
+        for i in 0..3 {
+            match p[2 + i].parse::<f64>() {
+                Ok(v) if v > 0.0 => prices[i] = v,
+                _ => ok = false,
+            }
+        }
+        if ok {
+            out.push(MonthRow { date, fgi, prices });
+        }
+    }
+    out.sort_by_key(|r| r.date);
+    out
+}
+
+pub fn load_main() -> Vec<MonthRow> {
+    parse_dataset(DATASET)
+}
+
+pub fn load_holdout() -> Vec<MonthRow> {
+    parse_dataset(DATASET_HOLDOUT)
+}
+
+// ───────────────────────── 持仓（FIFO 分批） ─────────────────────────
+
+#[derive(Debug, Clone)]
+struct Lot {
+    shares: f64,
+    price: f64,
+    date: NaiveDate,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Leg {
+    lots: Vec<Lot>, // 按买入时间升序，FIFO
+}
+
+impl Leg {
+    fn shares(&self) -> f64 {
+        self.lots.iter().map(|l| l.shares).sum()
+    }
+
+    fn value(&self, price: f64) -> f64 {
+        self.shares() * price
+    }
+
+    fn cost_basis(&self) -> f64 {
+        self.lots.iter().map(|l| l.shares * l.price).sum()
+    }
+
+    fn avg_cost(&self) -> f64 {
+        let s = self.shares();
+        if s > 0.0 { self.cost_basis() / s } else { 0.0 }
+    }
+
+    fn first_buy(&self) -> Option<NaiveDate> {
+        self.lots.first().map(|l| l.date)
+    }
+
+    fn buy(&mut self, shares: f64, price: f64, date: NaiveDate) {
+        if shares <= 0.0 {
+            return;
+        }
+        self.lots.push(Lot { shares, price, date });
+    }
+
+    /// FIFO 卖出指定份额，按每个批次各自的持有天数计赎回费。
+    /// 返回 (净入账现金, 费用合计, 实际卖出份额)
+    fn sell_fifo(
+        &mut self,
+        want: f64,
+        price: f64,
+        today: NaiveDate,
+        costs: &crate::config::Costs,
+        min_days: i64,
+    ) -> (f64, f64, f64) {
+        let mut remaining = want;
+        let mut net = 0.0;
+        let mut fees = 0.0;
+        let mut sold = 0.0;
+        let mut keep: Vec<Lot> = Vec::with_capacity(self.lots.len());
+
+        for lot in std::mem::take(&mut self.lots) {
+            let days = (today - lot.date).num_days();
+            if remaining <= 1e-12 || days < min_days {
+                keep.push(lot); // 未到最短持有期，跳过（规避惩罚性赎回费）
+                continue;
+            }
+            let take = remaining.min(lot.shares);
+            let gross = take * price;
+            let fee = gross * costs.total_sell_rate(days);
+            net += gross - fee;
+            fees += fee;
+            sold += take;
+            remaining -= take;
+            let left = lot.shares - take;
+            if left > 1e-12 {
+                keep.push(Lot { shares: left, price: lot.price, date: lot.date });
+            }
+        }
+        self.lots = keep;
+        self.lots.sort_by_key(|l| l.date);
+        (net, fees, sold)
+    }
+
+    fn to_position(&self, idx: usize, price: f64) -> Option<Position> {
+        let shares = self.shares();
+        if shares <= 0.0 {
+            return None;
+        }
+        Some(Position {
+            id: idx as i64 + 1,
+            asset_code: LEG_CODES[idx].to_string(),
+            asset_name: LEG_NAMES[idx].to_string(),
+            category: LEG_CATEGORIES[idx].to_string(),
+            shares,
+            cost_price: self.avg_cost(),
+            current_price: Some(price),
+            first_buy_date: self
+                .first_buy()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+            updated_at: String::new(),
+        })
     }
 }
 
-const HISTORICAL_FGI_2016_2020: &str =
-    include_str!("../.agents/skills/mns-backtest/data/fgi_2016_2020.csv");
-
-const SUPPLEMENTARY_FGI: &str =
-    include_str!("../.agents/skills/mns-backtest/data/fgi_2020_2025.csv");
-
-const MONTHLY_REAL_DATA: &str = include_str!("../.agents/skills/mns-backtest/data/monthly_real_final.csv");
+// ───────────────────────── 回测配置 ─────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
@@ -40,1534 +209,1085 @@ impl Default for BacktestConfig {
         Self {
             initial_cash: 100_000.0,
             annual_inflow: 50_000.0,
-            start_date: NaiveDate::from_ymd_opt(2016, 1, 31).unwrap(),
+            start_date: NaiveDate::from_ymd_opt(2016, 1, 1).unwrap(),
             end_date: NaiveDate::from_ymd_opt(2025, 4, 30).unwrap(),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct BacktestState {
-    pub cash: f64,
-    pub total_inflow: f64,
-    pub position: BacktestPosition,
-    pub trades: Vec<Trade>,
-    pub monthly_values: Vec<MonthlyValue>,
-    last_inflow_year: i32,
-}
-
-impl BacktestState {
-    pub fn new(initial_cash: f64) -> Self {
+impl BacktestConfig {
+    /// 覆盖数据实际区间
+    pub fn spanning(rows: &[MonthRow], initial_cash: f64, annual_inflow: f64) -> Self {
         Self {
-            cash: initial_cash,
-            total_inflow: initial_cash,
-            position: BacktestPosition::default(),
-            trades: Vec::new(),
-            monthly_values: Vec::new(),
-            last_inflow_year: 0,
+            initial_cash,
+            annual_inflow,
+            start_date: rows.first().map(|r| r.date).unwrap_or_default(),
+            end_date: rows.last().map(|r| r.date).unwrap_or_default(),
         }
     }
+}
 
-    pub fn total_value(&self, price: f64) -> f64 {
-        self.cash + self.position.market_value(price)
+/// 策略引擎类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// 目标仓位 + 偏离带（新框架）
+    TargetWeight,
+    /// 旧框架：买入=现金的百分比，卖出=份额的百分比 + 逆向加权
+    Legacy,
+    /// 买入持有基准：按 allocation 固定权重，仅注资时买入，不再平衡
+    BuyHold,
+    /// 买入持有 + 年度再平衡（用于分离"再平衡贡献"与"择时贡献"）
+    BuyHoldRebalanced,
+}
+
+impl Engine {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Engine::TargetWeight => "目标仓位+偏离带",
+            Engine::Legacy => "旧框架(现金比例)",
+            Engine::BuyHold => "买入持有",
+            Engine::BuyHoldRebalanced => "买入持有+年度再平衡",
+        }
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BacktestPosition {
-    pub shares: f64,
-    pub cost_price: f64,
-    pub first_buy_date: NaiveDate,
+/// 主信号锚点。
+///
+/// FGI 的均值回归周期是数周，而中长线组合的决策周期是数月到数年——直接用它做
+/// 主驱动存在时间尺度错配。`TrendTilt` 把月级趋势作为主锚，FGI 降级为有限倾斜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// 仅用情绪决定目标仓位
+    SentimentOnly,
+    /// 趋势为主锚（价格 vs N月均线），情绪仅做 ±tilt_pp 倾斜
+    TrendTilt,
 }
 
-impl BacktestPosition {
-    pub fn market_value(&self, price: f64) -> f64 {
-        self.shares * price
+/// 情绪信号处理：把 FGI 平滑，避免用周级噪声驱动年级组合
+#[derive(Debug, Clone, Copy)]
+pub struct SignalConfig {
+    /// 移动平均窗口（月）。1 = 不平滑（旧行为）
+    pub smooth_months: usize,
+    pub anchor: Anchor,
+    /// 趋势均线窗口（月）
+    pub trend_months: usize,
+    /// 单腿处于上升趋势时的目标权重（占该腿满仓的比例，%）
+    pub trend_on_weight: f64,
+    /// 单腿处于下降趋势时的目标权重（%）
+    pub trend_off_weight: f64,
+    /// 情绪倾斜幅度（百分点）：极度恐慌 +tilt，极度贪婪 -tilt
+    pub tilt_pp: f64,
+}
+
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self {
+            smooth_months: 3,
+            anchor: Anchor::SentimentOnly,
+            trend_months: 12,
+            trend_on_weight: 95.0,
+            trend_off_weight: 55.0,
+            tilt_pp: 10.0,
+        }
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
+impl SignalConfig {
+    pub fn trend_tilt() -> Self {
+        Self { anchor: Anchor::TrendTilt, ..Self::default() }
+    }
+
+    /// 情绪倾斜量（百分点），随情绪升高单调递减
+    fn tilt_for(&self, config: &AppConfig, signal: f64) -> f64 {
+        let t = &config.thresholds;
+        let k = self.tilt_pp;
+        if signal < t.extreme_fear {
+            k
+        } else if signal < t.fear {
+            k / 2.0
+        } else if signal < t.neutral {
+            0.0
+        } else if signal < t.greed {
+            -k / 2.0
+        } else {
+            -k
+        }
+    }
+}
+
+/// 每月的风险资产目标总权重（小数）。
+///
+/// 抽出成独立函数便于单测与对照：`SentimentOnly` 复现旧的情绪→仓位映射，
+/// `TrendTilt` 用趋势做主锚。
+pub fn compute_target_risk_weights(
+    config: &AppConfig,
+    rows: &[MonthRow],
+    signals: &[f64],
+    cfg: &SignalConfig,
+) -> Vec<f64> {
+    match cfg.anchor {
+        Anchor::SentimentOnly => signals
+            .iter()
+            .map(|s| config.target_weight_for(*s) / 100.0)
+            .collect(),
+        Anchor::TrendTilt => {
+            let (a, b, c) = config.sleeve_split();
+            let sleeve = [a, b, c];
+            let w = cfg.trend_months.max(1);
+            rows.iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    // 各腿趋势状态加权成组合层面的基准仓位
+                    let mut base = 0.0;
+                    for leg in 0..3 {
+                        let lo = i.saturating_sub(w - 1);
+                        let ma: f64 = rows[lo..=i].iter().map(|r| r.prices[leg]).sum::<f64>()
+                            / (i - lo + 1) as f64;
+                        // 历史不足时按上升趋势处理，避免开局系统性空仓
+                        let up = i + 1 < w || row.prices[leg] >= ma;
+                        base += sleeve[leg]
+                            * if up { cfg.trend_on_weight } else { cfg.trend_off_weight };
+                    }
+                    let tilted = base + cfg.tilt_for(config, signals[i]);
+                    (tilted / 100.0).clamp(0.0, 1.0)
+                })
+                .collect()
+        }
+    }
+}
+
+/// 计算平滑后的情绪序列
+pub fn smooth_fgi(rows: &[MonthRow], window: usize) -> Vec<f64> {
+    let w = window.max(1);
+    rows.iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let lo = i.saturating_sub(w - 1);
+            let slice = &rows[lo..=i];
+            slice.iter().map(|r| r.fgi).sum::<f64>() / slice.len() as f64
+        })
+        .collect()
+}
+
+// ───────────────────────── 结果 ─────────────────────────
+
+#[derive(Debug, Clone)]
 pub struct Trade {
     pub date: NaiveDate,
-    pub action: String,
+    pub action: &'static str,
+    pub leg: usize,
     pub zone: String,
     pub fgi: f64,
     pub shares: f64,
     pub price: f64,
     pub amount: f64,
-    pub pct: String,
-    pub ann_ret: Option<f64>,
+    pub fee: f64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct MonthlyValue {
+#[derive(Debug, Clone)]
+pub struct Monthly {
     pub date: NaiveDate,
     pub fgi: f64,
+    pub signal: f64,
     pub zone: String,
-    pub sp500: f64,
     pub cash: f64,
-    pub position_value: f64,
+    pub leg_values: [f64; 3],
     pub total_value: f64,
+    /// 本月外部注资（用于剔除注资后计算真实收益率）
+    pub inflow: f64,
+    /// 剔除注资影响的当期收益率
+    pub period_return: f64,
+    /// 风险资产实际权重 vs 目标权重（百分比）
+    pub risk_weight: f64,
+    pub target_risk_weight: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BacktestResult {
     pub name: String,
+    /// 保留以便调用方按引擎类型区分结果
+    #[allow(dead_code)]
+    pub engine: Engine,
     pub total_inflow: f64,
     pub final_value: f64,
     pub total_return: f64,
-    pub annualized_return: f64,
+    /// 现金流加权年化（XIRR）
+    pub xirr: f64,
+    /// 简单年化，仅为与旧版口径对照
+    pub naive_annualized: f64,
     pub max_drawdown: f64,
+    pub risk: RiskMetrics,
+    pub total_fees: f64,
+    pub cash_interest: f64,
     pub trades: Vec<Trade>,
     pub buy_count: usize,
     pub sell_count: usize,
-    pub buy_by_zone: HashMap<String, (usize, f64)>,
-    pub sell_by_zone: HashMap<String, (usize, f64)>,
+    pub monthly: Vec<Monthly>,
+    pub trades_per_year: f64,
 }
 
 impl BacktestResult {
-    pub fn print_report(&self) {
-        println!();
-        println!("=================================================================");
-        println!("   {} 回测报告", self.name);
-        println!("=================================================================");
-        println!();
-
-        println!("  【收益概览】");
-        println!("    总投入资金:     ¥{:>12.2}", self.total_inflow);
-        println!("    期末总资产:     ¥{:>12.2}", self.final_value);
-        println!(
-            "    总收益:         ¥{:>12.2}",
-            self.final_value - self.total_inflow
-        );
-        println!(
-            "    总收益率:               {:>10.2}%",
-            self.total_return * 100.0
-        );
-        println!(
-            "    年化收益率:              {:>10.2}%",
-            self.annualized_return * 100.0
-        );
-        println!(
-            "    最大回撤:                {:>10.2}%",
-            self.max_drawdown * 100.0
-        );
-        println!();
-
-        println!("  【交易统计】");
-        println!(
-            "    买入次数: {:>4}  |  卖出次数: {:>4}",
-            self.buy_count, self.sell_count
-        );
-        println!();
-
-        println!("  【按情绪区间 - 买入】");
-        let mut buy_zones: Vec<_> = self.buy_by_zone.iter().collect();
-        buy_zones.sort_by_key(|(k, _)| k.as_str());
-        for (zone, (count, amount)) in buy_zones {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(zone, 8), count, amount);
-        }
-        println!();
-
-        println!("  【按情绪区间 - 卖出】");
-        let mut sell_zones: Vec<_> = self.sell_by_zone.iter().collect();
-        sell_zones.sort_by_key(|(k, _)| k.as_str());
-        for (zone, (count, amount)) in sell_zones {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(zone, 8), count, amount);
-        }
-        println!();
-
-        println!("  【关键交易】（每年 Top 3）");
-        let mut trades_by_year: HashMap<i32, Vec<&Trade>> = HashMap::new();
-        for trade in &self.trades {
-            let year = trade.date.year();
-            trades_by_year.entry(year).or_default().push(trade);
-        }
-
-        let mut years: Vec<_> = trades_by_year.keys().collect();
-        years.sort();
-
-        for year in years {
-            let mut year_trades = trades_by_year.get(year).unwrap().clone();
-            year_trades.sort_by(|a, b| {
-                b.amount
-                    .partial_cmp(&a.amount)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            for trade in year_trades.iter().take(3) {
-                println!(
-                    "    {} {:<4} {}({}), ¥{:>12.0} ({}%, 年化{})",
-                    trade.date,
-                    trade.action,
-                    trade.zone,
-                    trade.fgi as i32,
-                    trade.amount,
-                    trade.pct.replace("%", ""),
-                    match trade.ann_ret {
-                        Some(r) => format!("{:.1}%", r * 100.0),
-                        None => "-".to_string(),
-                    }
-                );
-            }
-        }
-        println!();
+    pub fn returns(&self) -> Vec<f64> {
+        self.monthly.iter().skip(1).map(|m| m.period_return).collect()
     }
 }
 
-/// 多资产月度数据
-#[derive(Debug)]
-#[allow(dead_code)]
-struct MonthlyData {
-    date: NaiveDate,
-    fgi: f64,
-    nasdaq: f64,
-    dividend_low_vol: f64,
-    gold_cny: f64,
-    india: f64,
-    japan: f64,
-}
+// ───────────────────────── 引擎实现 ─────────────────────────
 
-/// 多资产回测状态
-#[derive(Debug)]
-pub struct MultiAssetBacktestState {
-    pub cash: f64,
-    pub total_inflow: f64,
-    pub us_shares: f64,
-    pub us_cost: f64,
-    pub us_first_buy: NaiveDate,
-    pub cn_shares: f64,
-    pub cn_cost: f64,
-    pub cn_first_buy: NaiveDate,
-    pub gold_shares: f64,
-    pub gold_cost: f64,
-    pub gold_first_buy: NaiveDate,
-    pub trades: Vec<MultiAssetTrade>,
-    pub monthly_values: Vec<MultiAssetMonthly>,
+struct State {
+    cash: f64,
+    legs: [Leg; 3],
+    total_inflow: f64,
+    fees: f64,
+    interest: f64,
+    flows: Vec<CashFlow>,
+    trades: Vec<Trade>,
     last_inflow_year: i32,
 }
 
-impl MultiAssetBacktestState {
-    pub fn new(initial_cash: f64) -> Self {
+impl State {
+    fn new(initial: f64, start: NaiveDate) -> Self {
         Self {
-            cash: initial_cash,
-            total_inflow: initial_cash,
-            us_shares: 0.0,
-            us_cost: 0.0,
-            us_first_buy: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-            cn_shares: 0.0,
-            cn_cost: 0.0,
-            cn_first_buy: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-            gold_shares: 0.0,
-            gold_cost: 0.0,
-            gold_first_buy: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+            cash: initial,
+            legs: Default::default(),
+            total_inflow: initial,
+            fees: 0.0,
+            interest: 0.0,
+            flows: vec![CashFlow { date: start, amount: -initial }],
             trades: Vec::new(),
-            monthly_values: Vec::new(),
             last_inflow_year: 0,
         }
     }
 
-    pub fn total_value(&self, us_price: f64, cn_price: f64, gold_price: f64) -> f64 {
-        self.cash + self.us_shares * us_price + self.cn_shares * cn_price + self.gold_shares * gold_price
+    fn leg_values(&self, prices: &[f64; 3]) -> [f64; 3] {
+        [
+            self.legs[0].value(prices[0]),
+            self.legs[1].value(prices[1]),
+            self.legs[2].value(prices[2]),
+        ]
     }
 
-    pub fn us_position(&self, price: f64) -> Position {
-        if self.us_shares <= 0.0 {
-            return Position {
-                id: 0,
-                asset_code: "".to_string(),
-                asset_name: "".to_string(),
-                shares: 0.0,
-                cost_price: 0.0,
-                current_price: None,
-                category: "".to_string(),
-                first_buy_date: "".to_string(),
-                updated_at: "".to_string(),
-            };
-        }
-        Position {
-            id: 1,
-            asset_code: "NASDAQ".to_string(),
-            asset_name: "纳指ETF".to_string(),
-            shares: self.us_shares,
-            cost_price: self.us_cost,
-            current_price: Some(price),
-            category: "us_stocks".to_string(),
-            first_buy_date: self.us_first_buy.format("%Y-%m-%d").to_string(),
-            updated_at: "".to_string(),
-        }
+    fn total(&self, prices: &[f64; 3]) -> f64 {
+        self.cash + self.leg_values(prices).iter().sum::<f64>()
     }
 
-    pub fn cn_position(&self, price: f64) -> Position {
-        if self.cn_shares <= 0.0 {
-            return Position {
-                id: 0,
-                asset_code: "".to_string(),
-                asset_name: "".to_string(),
-                shares: 0.0,
-                cost_price: 0.0,
-                current_price: None,
-                category: "".to_string(),
-                first_buy_date: "".to_string(),
-                updated_at: "".to_string(),
-            };
-        }
-        Position {
-            id: 2,
-            asset_code: "DIVIDEND_LOW_VOL".to_string(),
-            asset_name: "红利低波".to_string(),
-            shares: self.cn_shares,
-            cost_price: self.cn_cost,
-            current_price: Some(price),
-            category: "cn_stocks".to_string(),
-            first_buy_date: self.cn_first_buy.format("%Y-%m-%d").to_string(),
-            updated_at: "".to_string(),
-        }
+    fn positions(&self, prices: &[f64; 3]) -> Vec<Position> {
+        (0..3)
+            .filter_map(|i| self.legs[i].to_position(i, prices[i]))
+            .collect()
     }
 
-    pub fn gold_position(&self, price: f64) -> Position {
-        if self.gold_shares <= 0.0 {
-            return Position {
-                id: 0,
-                asset_code: "".to_string(),
-                asset_name: "".to_string(),
-                shares: 0.0,
-                cost_price: 0.0,
-                current_price: None,
-                category: "".to_string(),
-                first_buy_date: "".to_string(),
-                updated_at: "".to_string(),
-            };
+    fn do_buy(
+        &mut self,
+        leg: usize,
+        amount: f64,
+        price: f64,
+        date: NaiveDate,
+        costs: &crate::config::Costs,
+        zone: &str,
+        fgi: f64,
+    ) {
+        if amount <= 0.0 || price <= 0.0 || amount > self.cash + 1e-9 {
+            let amount = amount.min(self.cash);
+            if amount <= 0.0 {
+                return;
+            }
         }
-        Position {
-            id: 3,
-            asset_code: "GOLD".to_string(),
-            asset_name: "人民币黄金".to_string(),
-            shares: self.gold_shares,
-            cost_price: self.gold_cost,
-            current_price: Some(price),
-            category: "counter_cyclical".to_string(),
-            first_buy_date: self.gold_first_buy.format("%Y-%m-%d").to_string(),
-            updated_at: "".to_string(),
-        }
-    }
-
-    pub fn all_positions(&self, us_price: f64, cn_price: f64, gold_price: f64) -> Vec<Position> {
-        let mut positions = Vec::new();
-        if self.us_shares > 0.0 {
-            positions.push(self.us_position(us_price));
-        }
-        if self.cn_shares > 0.0 {
-            positions.push(self.cn_position(cn_price));
-        }
-        if self.gold_shares > 0.0 {
-            positions.push(self.gold_position(gold_price));
-        }
-        positions
-    }
-
-    pub fn buy_us(&mut self, amount: f64, price: f64, date: NaiveDate) {
-        if amount <= 0.0 || price <= 0.0 {
+        let amount = amount.min(self.cash);
+        if amount <= 0.0 {
             return;
         }
-        let shares = amount / price;
-        if self.us_shares == 0.0 {
-            self.us_first_buy = date;
-            self.us_cost = price;
-        } else {
-            self.us_cost = (self.us_shares * self.us_cost + shares * price) / (self.us_shares + shares);
-        }
-        self.us_shares += shares;
-        self.cash -= amount;
-    }
-
-    pub fn buy_cn(&mut self, amount: f64, price: f64, date: NaiveDate) {
-        if amount <= 0.0 || price <= 0.0 {
+        let fee = amount * costs.buy_rate();
+        let shares = (amount - fee) / price;
+        if shares <= 0.0 {
             return;
         }
-        let shares = amount / price;
-        if self.cn_shares == 0.0 {
-            self.cn_first_buy = date;
-            self.cn_cost = price;
-        } else {
-            self.cn_cost = (self.cn_shares * self.cn_cost + shares * price) / (self.cn_shares + shares);
-        }
-        self.cn_shares += shares;
+        self.legs[leg].buy(shares, price, date);
         self.cash -= amount;
-    }
-
-    pub fn buy_gold(&mut self, amount: f64, price: f64, date: NaiveDate) {
-        if amount <= 0.0 || price <= 0.0 {
-            return;
-        }
-        let shares = amount / price;
-        if self.gold_shares == 0.0 {
-            self.gold_first_buy = date;
-            self.gold_cost = price;
-        } else {
-            self.gold_cost = (self.gold_shares * self.gold_cost + shares * price) / (self.gold_shares + shares);
-        }
-        self.gold_shares += shares;
-        self.cash -= amount;
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct MultiAssetTrade {
-    pub date: NaiveDate,
-    pub action: String,
-    pub asset: String,
-    pub zone: String,
-    pub fgi: f64,
-    pub shares: f64,
-    pub price: f64,
-    pub amount: f64,
-    pub pct: String,
-    pub ann_ret: Option<f64>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct MultiAssetMonthly {
-    pub date: NaiveDate,
-    pub fgi: f64,
-    pub zone: String,
-    pub nasdaq: f64,
-    pub dividend_low_vol: f64,
-    pub gold_cny: f64,
-    pub cash: f64,
-    pub total_value: f64,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct MultiAssetBacktestResult {
-    pub name: String,
-    pub total_inflow: f64,
-    pub final_value: f64,
-    pub total_return: f64,
-    pub annualized_return: f64,
-    pub max_drawdown: f64,
-    pub trades: Vec<MultiAssetTrade>,
-    pub buy_count: usize,
-    pub sell_count: usize,
-    pub buy_by_zone: HashMap<String, (usize, f64)>,
-    pub sell_by_zone: HashMap<String, (usize, f64)>,
-    pub buy_by_asset: HashMap<String, (usize, f64)>,
-    pub sell_by_asset: HashMap<String, (usize, f64)>,
-}
-
-impl MultiAssetBacktestResult {
-    pub fn print_report(&self) {
-        println!();
-        println!("=================================================================");
-        println!("   {} 回测报告", self.name);
-        println!("=================================================================");
-        println!();
-
-        println!("  【收益概览】");
-        println!("    总投入资金:     ¥{:>12.2}", self.total_inflow);
-        println!("    期末总资产:     ¥{:>12.2}", self.final_value);
-        println!(
-            "    总收益:         ¥{:>12.2}",
-            self.final_value - self.total_inflow
-        );
-        println!(
-            "    总收益率:               {:>10.2}%",
-            self.total_return * 100.0
-        );
-        println!(
-            "    年化收益率:              {:>10.2}%",
-            self.annualized_return * 100.0
-        );
-        println!(
-            "    最大回撤:                {:>10.2}%",
-            self.max_drawdown * 100.0
-        );
-        println!();
-
-        println!("  【交易统计】");
-        println!(
-            "    买入次数: {:>4}  |  卖出次数: {:>4}",
-            self.buy_count, self.sell_count
-        );
-        println!();
-
-        println!("  【按资产类别 - 买入】");
-        let mut buy_assets: Vec<_> = self.buy_by_asset.iter().collect();
-        buy_assets.sort_by_key(|(k, _)| k.as_str());
-        for (asset, (count, amount)) in buy_assets {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(asset, 8), count, amount);
-        }
-        println!();
-
-        println!("  【按资产类别 - 卖出】");
-        let mut sell_assets: Vec<_> = self.sell_by_asset.iter().collect();
-        sell_assets.sort_by_key(|(k, _)| k.as_str());
-        for (asset, (count, amount)) in sell_assets {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(asset, 8), count, amount);
-        }
-        println!();
-
-        println!("  【按情绪区间 - 买入】");
-        let mut buy_zones: Vec<_> = self.buy_by_zone.iter().collect();
-        buy_zones.sort_by_key(|(k, _)| k.as_str());
-        for (zone, (count, amount)) in buy_zones {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(zone, 8), count, amount);
-        }
-        println!();
-
-        println!("  【按情绪区间 - 卖出】");
-        let mut sell_zones: Vec<_> = self.sell_by_zone.iter().collect();
-        sell_zones.sort_by_key(|(k, _)| k.as_str());
-        for (zone, (count, amount)) in sell_zones {
-            println!("      {}:{:>5} 次, ¥{:>12.2}", pad_to_width(zone, 8), count, amount);
-        }
-        println!();
-    }
-}
-
-fn parse_multi_asset_data(data: &str) -> Vec<MonthlyData> {
-    data.lines()
-        .skip(1) // 跳过标题行
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 7 {
-                let year_month = parts[0];
-                let fgi: f64 = parts[1].parse().ok()?;
-                let nasdaq: f64 = parts[2].parse().ok()?;
-                let dividend_low_vol: f64 = parts[3].parse().ok()?;
-                let gold_cny: f64 = parts[4].parse().ok()?;
-                let india: f64 = parts[5].parse().ok()?;
-                let japan: f64 = parts[6].parse().ok()?;
-
-                // 解析年月为日期（取月末）
-                let ym: Vec<&str> = year_month.split('-').collect();
-                if ym.len() == 2 {
-                    let year: i32 = ym[0].parse().ok()?;
-                    let month: u32 = ym[1].parse().ok()?;
-
-                    // 计算月末日期
-                    let last_day = if month == 12 {
-                        NaiveDate::from_ymd_opt(year + 1, 1, 1)
-                    } else {
-                        NaiveDate::from_ymd_opt(year, month + 1, 1)
-                    }
-                    .and_then(|next_month| next_month.pred_opt());
-
-                    if let Some(date) = last_day {
-                        return Some(MonthlyData {
-                            date,
-                            fgi,
-                            nasdaq,
-                            dividend_low_vol,
-                            gold_cny,
-                            india,
-                            japan,
-                        });
-                    }
-                }
-            }
-            None
-        })
-        .collect()
-}
-
-fn get_zone_name(score: f64, config: &AppConfig) -> &'static str {
-    if score < config.thresholds.extreme_fear {
-        "极度恐慌"
-    } else if score < config.thresholds.fear {
-        "恐慌"
-    } else if score < config.thresholds.neutral {
-        "中性"
-    } else if score < config.thresholds.greed {
-        "贪婪"
-    } else {
-        "极度贪婪"
-    }
-}
-
-/// 执行多资产回测
-pub fn run_multi_asset_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> MultiAssetBacktestResult {
-    let monthly_data = parse_multi_asset_data(MONTHLY_REAL_DATA);
-
-    // 过滤日期范围
-    let filtered_data: Vec<_> = monthly_data
-        .into_iter()
-        .filter(|d| d.date >= bt_config.start_date && d.date <= bt_config.end_date)
-        .collect();
-
-    let mut state = MultiAssetBacktestState::new(bt_config.initial_cash);
-    let mut prev_zone: Option<&str> = None;
-    let mut last_trade_month: i32 = -100;
-
-    let mut buy_count = 0usize;
-    let mut sell_count = 0usize;
-    let mut buy_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
-    let mut sell_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
-    let mut buy_by_asset: HashMap<String, (usize, f64)> = HashMap::new();
-    let mut sell_by_asset: HashMap<String, (usize, f64)> = HashMap::new();
-
-    for data in &filtered_data {
-        let year = data.date.year();
-        let month_key = year * 12 + data.date.month() as i32;
-
-        // 年度注资（每年3月末）
-        if year > state.last_inflow_year && data.date.month() >= 3 {
-            state.cash += bt_config.annual_inflow;
-            state.total_inflow += bt_config.annual_inflow;
-            state.last_inflow_year = year;
-        }
-
-        let zone = get_zone_name(data.fgi, config);
-        let zone_changed = prev_zone != Some(zone);
-        prev_zone = Some(zone);
-
-        // 计算持仓信息
-        let positions = state.all_positions(data.nasdaq, data.dividend_low_vol, data.gold_cny);
-
-        // 交易触发条件
-        let months_since_trade = month_key - last_trade_month;
-        let should_trade = zone_changed
-            || (months_since_trade >= 3 && data.fgi < config.thresholds.neutral);
-
-        // 卖出逻辑：贪婪及以上区间
-        if zone_changed && data.fgi >= config.thresholds.neutral {
-            let sell_suggestions = calculate_sell_suggestions(config, data.fgi, &positions);
-
-            for sell in &sell_suggestions {
-                if sell.sell_shares >= 0.01 {
-                    let (shares, _cost, _first_buy) = if sell.asset_code == "NASDAQ" {
-                        (state.us_shares, state.us_cost, state.us_first_buy)
-                    } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
-                        (state.cn_shares, state.cn_cost, state.cn_first_buy)
-                    } else {
-                        (state.gold_shares, state.gold_cost, state.gold_first_buy)
-                    };
-
-                    if sell.sell_shares <= shares {
-                        // 执行卖出，按对应资产的实际价格计算金额
-                        let actual_shares = sell.sell_shares;
-                        let actual_price = if sell.asset_code == "NASDAQ" {
-                            data.nasdaq
-                        } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
-                            data.dividend_low_vol
-                        } else {
-                            data.gold_cny
-                        };
-                        let actual_amount = actual_shares * actual_price;
-
-                        if sell.asset_code == "NASDAQ" {
-                            state.us_shares -= actual_shares;
-                            state.cash += actual_amount;
-                        } else if sell.asset_code == "DIVIDEND_LOW_VOL" {
-                            state.cn_shares -= actual_shares;
-                            state.cash += actual_amount;
-                        } else {
-                            state.gold_shares -= actual_shares;
-                            state.cash += actual_amount;
-                        }
-
-                        last_trade_month = month_key;
-                        sell_count += 1;
-                        {
-                            let e = sell_by_zone.entry(zone.to_string()).or_insert((0, 0.0));
-                            e.0 += 1;
-                            e.1 += actual_amount;
-                        }
-                        {
-                            let e = sell_by_asset.entry(sell.asset_code.clone()).or_insert((0, 0.0));
-                            e.0 += 1;
-                            e.1 += actual_amount;
-                        }
-
-                        state.trades.push(MultiAssetTrade {
-                            date: data.date,
-                            action: "卖出".to_string(),
-                            asset: sell.asset_code.clone(),
-                            zone: zone.to_string(),
-                            fgi: data.fgi,
-                            shares: actual_shares,
-                            price: actual_price,
-                            amount: actual_amount,
-                            pct: format!("{:.0}%", sell.sell_ratio),
-                            ann_ret: sell.annualized_return,
-                        });
-                    }
-                }
-            }
-        }
-
-        // 买入逻辑：恐慌及以下区间
-        if should_trade && data.fgi < config.thresholds.neutral {
-            let risk_warnings = check_risk_warnings(config, data.fgi, &positions);
-            let sell_suggestions = Vec::new(); // 买入时卖出建议为空
-            let buy_suggestion = calculate_buy_suggestions(
-                config,
-                data.fgi,
-                state.cash,
-                &positions,
-                &sell_suggestions,
-                &risk_warnings,
-            );
-
-            // 按配置分配买入金额
-            let us_ratio = config.allocation.us_stocks / 100.0;
-            let cn_ratio = config.allocation.cn_stocks / 100.0;
-            let gold_ratio = config.allocation.counter_cyclical / 100.0;
-
-            let us_amount = buy_suggestion.total_amount * us_ratio;
-            let cn_amount = buy_suggestion.total_amount * cn_ratio;
-            let gold_amount = buy_suggestion.total_amount * gold_ratio;
-
-            // 执行买入
-            if us_amount > 0.0 && data.nasdaq > 0.0 {
-                let _cash_before = state.cash;
-                state.buy_us(us_amount, data.nasdaq, data.date);
-
-                buy_count += 1;
-                buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_asset.entry("NASDAQ".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(zone).unwrap().1 += us_amount;
-                buy_by_asset.get_mut("NASDAQ").unwrap().1 += us_amount;
-
-                state.trades.push(MultiAssetTrade {
-                    date: data.date,
-                    action: "买入".to_string(),
-                    asset: "NASDAQ".to_string(),
-                    zone: zone.to_string(),
-                    fgi: data.fgi,
-                    shares: us_amount / data.nasdaq,
-                    price: data.nasdaq,
-                    amount: us_amount,
-                    pct: format!("{:.0}%", (us_amount / (state.cash + us_amount) * 100.0)),
-                    ann_ret: None,
-                });
-            }
-
-            if cn_amount > 0.0 && data.dividend_low_vol > 0.0 {
-                state.buy_cn(cn_amount, data.dividend_low_vol, data.date);
-
-                buy_count += 1;
-                buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_asset.entry("DIVIDEND_LOW_VOL".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(zone).unwrap().1 += cn_amount;
-                buy_by_asset.get_mut("DIVIDEND_LOW_VOL").unwrap().1 += cn_amount;
-
-                state.trades.push(MultiAssetTrade {
-                    date: data.date,
-                    action: "买入".to_string(),
-                    asset: "DIVIDEND_LOW_VOL".to_string(),
-                    zone: zone.to_string(),
-                    fgi: data.fgi,
-                    shares: cn_amount / data.dividend_low_vol,
-                    price: data.dividend_low_vol,
-                    amount: cn_amount,
-                    pct: format!("{:.0}%", (cn_amount / (state.cash + cn_amount) * 100.0)),
-                    ann_ret: None,
-                });
-            }
-
-            if gold_amount > 0.0 && data.gold_cny > 0.0 {
-                state.buy_gold(gold_amount, data.gold_cny, data.date);
-
-                buy_count += 1;
-                buy_by_zone.entry(zone.to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_asset.entry("GOLD".to_string()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(zone).unwrap().1 += gold_amount;
-                buy_by_asset.get_mut("GOLD").unwrap().1 += gold_amount;
-
-                state.trades.push(MultiAssetTrade {
-                    date: data.date,
-                    action: "买入".to_string(),
-                    asset: "GOLD".to_string(),
-                    zone: zone.to_string(),
-                    fgi: data.fgi,
-                    shares: gold_amount / data.gold_cny,
-                    price: data.gold_cny,
-                    amount: gold_amount,
-                    pct: format!("{:.0}%", (gold_amount / (state.cash + gold_amount) * 100.0)),
-                    ann_ret: None,
-                });
-            }
-
-            if buy_suggestion.total_amount > 0.0 {
-                last_trade_month = month_key;
-            }
-        }
-
-        // 记录月度数据
-        state.monthly_values.push(MultiAssetMonthly {
-            date: data.date,
-            fgi: data.fgi,
+        self.fees += fee;
+        self.trades.push(Trade {
+            date,
+            action: "买入",
+            leg,
             zone: zone.to_string(),
-            nasdaq: data.nasdaq,
-            dividend_low_vol: data.dividend_low_vol,
-            gold_cny: data.gold_cny,
-            cash: state.cash,
-            total_value: state.total_value(data.nasdaq, data.dividend_low_vol, data.gold_cny),
+            fgi,
+            shares,
+            price,
+            amount,
+            fee,
         });
     }
 
-    // 计算最终结果
-    let last_data = filtered_data.last().expect("No data");
-    let final_value = state.total_value(last_data.nasdaq, last_data.dividend_low_vol, last_data.gold_cny);
-    let total_return = (final_value / state.total_inflow) - 1.0;
-
-    let days = (bt_config.end_date - bt_config.start_date).num_days() as f64;
-    let years = days / 365.0;
-    let annualized_return = (final_value / state.total_inflow).powf(1.0 / years) - 1.0;
-
-    // 计算最大回撤
-    let mut max_value: f64 = 0.0;
-    let mut max_drawdown: f64 = 0.0;
-    for mv in &state.monthly_values {
-        max_value = max_value.max(mv.total_value);
-        let drawdown = (max_value - mv.total_value) / max_value;
-        max_drawdown = max_drawdown.max(drawdown);
-    }
-
-    MultiAssetBacktestResult {
-        name: "多资产逆向策略".to_string(),
-        total_inflow: state.total_inflow,
-        final_value,
-        total_return,
-        annualized_return,
-        max_drawdown,
-        trades: state.trades,
-        buy_count,
-        sell_count,
-        buy_by_zone,
-        sell_by_zone,
-        buy_by_asset,
-        sell_by_asset,
-    }
-}
-
-fn parse_fgi_data(data: &str) -> Vec<(NaiveDate, f64)> {
-    data.lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 2 {
-                NaiveDate::parse_from_str(parts[0], "%Y-%m-%d")
-                    .ok()
-                    .map(|d| (d, parts[1].parse().unwrap_or(0.0)))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn aggregate_fgi_to_monthly(fgi_data: &[(NaiveDate, f64)]) -> Vec<(NaiveDate, f64)> {
-    if fgi_data.is_empty() {
-        return Vec::new();
-    }
-
-    // 先按日期排序
-    let mut sorted_data: Vec<_> = fgi_data.to_vec();
-    sorted_data.sort_by_key(|(d, _)| *d);
-
-    // 取每月最后一条数据
-    let mut monthly_data: HashMap<(i32, u32), (NaiveDate, f64)> = HashMap::new();
-    for (date, score) in sorted_data {
-        let key = (date.year(), date.month());
-        // 直接覆盖，因为已排序，最后的就是月末
-        monthly_data.insert(key, (date, score));
-    }
-
-    let mut result: Vec<_> = monthly_data.into_values().collect();
-    result.sort_by_key(|(d, _)| *d);
-    result
-}
-
-fn parse_nasdaq_data(data: &str) -> Vec<(NaiveDate, f64)> {
-    data.lines()
-        .skip(1) // 跳过表头
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 3 {
-                let year_month = parts[0];
-                let price: f64 = parts[2].parse().ok()?; // nasdaq 列
-
-                let ym: Vec<&str> = year_month.split('-').collect();
-                if ym.len() == 2 {
-                    let year: i32 = ym[0].parse().ok()?;
-                    let month: u32 = ym[1].parse().ok()?;
-
-                    let last_day = if month == 12 {
-                        NaiveDate::from_ymd_opt(year + 1, 1, 1)
-                    } else {
-                        NaiveDate::from_ymd_opt(year, month + 1, 1)
-                    }
-                    .and_then(|next_month| next_month.pred_opt());
-
-                    if let Some(date) = last_day {
-                        return Some((date, price));
-                    }
-                }
-            }
-            None
-        })
-        .collect()
-}
-
-fn create_position(state: &BacktestState, price: f64, date: NaiveDate) -> Option<Position> {
-    if state.position.shares <= 0.0 {
-        return None;
-    }
-
-    Some(Position {
-        id: 1,
-        asset_code: "NASDAQ".to_string(),
-        asset_name: "纳指ETF".to_string(),
-        shares: state.position.shares,
-        cost_price: state.position.cost_price,
-        current_price: Some(price),
-        category: "us_stocks".to_string(),
-        first_buy_date: state.position.first_buy_date.format("%Y-%m-%d").to_string(),
-        updated_at: date.format("%Y-%m-%d").to_string(),
-    })
-}
-
-pub fn run_backtest(config: &AppConfig, bt_config: &BacktestConfig) -> BacktestResult {
-    let mut fgi_data = parse_fgi_data(HISTORICAL_FGI_2016_2020);
-    fgi_data.extend(parse_fgi_data(SUPPLEMENTARY_FGI));
-    fgi_data.sort_by_key(|(d, _)| *d);
-
-    let monthly_fgi = aggregate_fgi_to_monthly(&fgi_data);
-    let sp500_data = parse_nasdaq_data(MONTHLY_REAL_DATA);
-
-    let mut combined_data: Vec<(NaiveDate, f64, f64)> = Vec::new();
-    for (fgi_date, fgi_score) in &monthly_fgi {
-        for (sp_date, sp_price) in &sp500_data {
-            if fgi_date.year() == sp_date.year() && fgi_date.month() == sp_date.month() {
-                combined_data.push((*fgi_date, *fgi_score, *sp_price));
-                break;
-            }
+    #[allow(clippy::too_many_arguments)]
+    fn do_sell(
+        &mut self,
+        leg: usize,
+        target_value: f64,
+        price: f64,
+        date: NaiveDate,
+        costs: &crate::config::Costs,
+        min_days: i64,
+        zone: &str,
+        fgi: f64,
+    ) {
+        if target_value <= 0.0 || price <= 0.0 {
+            return;
         }
-    }
-
-    let combined_data: Vec<_> = combined_data
-        .into_iter()
-        .filter(|(d, _, _)| *d >= bt_config.start_date && *d <= bt_config.end_date)
-        .collect();
-
-    let mut state = BacktestState::new(bt_config.initial_cash);
-    let mut prev_zone: Option<&str> = None;
-    let mut last_trade_month: i32 = -100;
-    let mut buy_count = 0usize;
-    let mut sell_count = 0usize;
-    let mut buy_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
-    let mut sell_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
-
-    for (date, score, price) in &combined_data {
-        let year = date.year();
-        let month_key = year * 12 + date.month() as i32;
-
-        // 年度注资（每年3月末）
-        let new_capital = if year > state.last_inflow_year && date.month() >= 3 {
-            state.cash += bt_config.annual_inflow;
-            state.total_inflow += bt_config.annual_inflow;
-            state.last_inflow_year = year;
-            true
-        } else {
-            false
-        };
-
-        let zone = get_zone_name(*score, config);
-        let zone_changed = prev_zone != Some(zone);
-        prev_zone = Some(zone);
-
-        let positions: Vec<Position> = create_position(&state, *price, *date)
-            .map(|p| vec![p])
-            .unwrap_or_default();
-
-        // 交易触发条件：
-        // 1. 区间变化时（常规触发）
-        // 2. 有新资金注入且处于可买入区间（恐慌及以下）
-        // 3. 距离上次交易超过3个月（冷却期后重新评估）
-        let months_since_trade = month_key - last_trade_month;
-        let should_trade = zone_changed
-            || (new_capital && *score < config.thresholds.neutral)
-            || (months_since_trade >= 3 && *score < config.thresholds.neutral);
-
-        // 卖出：仅在贪婪及以上区间且区间变化时
-        let sell_suggestions = if zone_changed && *score >= config.thresholds.neutral {
-            calculate_sell_suggestions(config, *score, &positions)
-        } else {
-            Vec::new()
-        };
-
-        // 买入：在恐慌及以下区间，满足交易条件时
-        let buy_suggestion = if should_trade && *score < config.thresholds.neutral {
-            let risk_warnings = check_risk_warnings(config, *score, &positions);
-            calculate_buy_suggestions(
-                config,
-                *score,
-                state.cash,
-                &positions,
-                &sell_suggestions,
-                &risk_warnings,
-            )
-        } else {
-            BuySuggestion {
-                total_amount: 0.0,
-                us_amount: 0.0,
-                cn_amount: 0.0,
-                counter_amount: 0.0,
-                details: Vec::new(),
-                excluded: Vec::new(),
-            }
-        };
-
-        for sell in &sell_suggestions {
-            if sell.sell_shares >= 0.01 {
-                state.position.shares -= sell.sell_shares;
-                state.cash += sell.sell_amount;
-                last_trade_month = month_key;
-
-                sell_count += 1;
-                let zone_key = zone.to_string();
-                sell_by_zone.entry(zone_key.clone()).or_insert((0, 0.0)).0 += 1;
-                sell_by_zone.get_mut(&zone_key).unwrap().1 += sell.sell_amount;
-
-                state.trades.push(Trade {
-                    date: *date,
-                    action: "卖出".to_string(),
-                    zone: zone.to_string(),
-                    fgi: *score,
-                    shares: sell.sell_shares,
-                    price: *price,
-                    amount: sell.sell_amount,
-                    pct: format!("{:.0}%", sell.sell_ratio),
-                    ann_ret: sell.annualized_return,
-                });
-
-                if state.position.shares < 0.01 {
-                    state.position.shares = 0.0;
-                    state.position.cost_price = 0.0;
-                }
-            }
+        let want = target_value / price;
+        let (net, fee, sold) = self.legs[leg].sell_fifo(want, price, date, costs, min_days);
+        if sold <= 0.0 {
+            return;
         }
-
-        let buy_amount = buy_suggestion.total_amount;
-        if buy_amount > 0.0 && *price > 0.0 {
-            let buy_shares = buy_amount / price;
-            if buy_shares >= 0.01 {
-                let total_shares = state.position.shares + buy_shares;
-                if state.position.shares == 0.0 {
-                    state.position.first_buy_date = *date;
-                    state.position.cost_price = *price;
-                } else {
-                    state.position.cost_price = (state.position.shares * state.position.cost_price
-                        + buy_shares * price)
-                        / total_shares;
-                }
-                state.position.shares = total_shares;
-                state.cash -= buy_amount;
-                last_trade_month = month_key;
-
-                buy_count += 1;
-                let zone_key = zone.to_string();
-                buy_by_zone.entry(zone_key.clone()).or_insert((0, 0.0)).0 += 1;
-                buy_by_zone.get_mut(&zone_key).unwrap().1 += buy_amount;
-
-                // 计算买入金额占买入前可用现金的比例
-                let cash_before_buy = state.cash + buy_amount;
-                let pct = (buy_amount / cash_before_buy * 100.0) as i32;
-                state.trades.push(Trade {
-                    date: *date,
-                    action: "买入".to_string(),
-                    zone: zone.to_string(),
-                    fgi: *score,
-                    shares: buy_shares,
-                    price: *price,
-                    amount: buy_amount,
-                    pct: format!("{}%", pct),
-                    ann_ret: None,
-                });
-            }
-        }
-
-        state.monthly_values.push(MonthlyValue {
-            date: *date,
-            fgi: *score,
+        self.cash += net;
+        self.fees += fee;
+        self.trades.push(Trade {
+            date,
+            action: "卖出",
+            leg,
             zone: zone.to_string(),
-            sp500: *price,
-            cash: state.cash,
-            position_value: state.position.market_value(*price),
-            total_value: state.total_value(*price),
+            fgi,
+            shares: sold,
+            price,
+            amount: sold * price,
+            fee,
         });
     }
-
-    let final_value = state
-        .monthly_values
-        .last()
-        .map(|d| d.total_value)
-        .unwrap_or(bt_config.initial_cash);
-
-    let total_return = (final_value / state.total_inflow) - 1.0;
-
-    let days = (bt_config.end_date - bt_config.start_date).num_days() as f64;
-    let years = days / 365.0;
-    let annualized_return = (final_value / state.total_inflow).powf(1.0 / years) - 1.0;
-
-    let mut max_value: f64 = 0.0;
-    let mut max_drawdown: f64 = 0.0;
-    for mv in &state.monthly_values {
-        max_value = max_value.max(mv.total_value);
-        let drawdown = (max_value - mv.total_value) / max_value;
-        max_drawdown = max_drawdown.max(drawdown);
-    }
-
-    BacktestResult {
-        name: "纳指逆向策略".to_string(),
-        total_inflow: state.total_inflow,
-        final_value,
-        total_return,
-        annualized_return,
-        max_drawdown,
-        trades: state.trades,
-        buy_count,
-        sell_count,
-        buy_by_zone,
-        sell_by_zone,
-    }
 }
 
-pub fn run_buy_and_hold(bt_config: &BacktestConfig) -> BacktestResult {
-    let sp500_data = parse_nasdaq_data(MONTHLY_REAL_DATA);
-
-    let end_price = sp500_data
+pub fn run(
+    config: &AppConfig,
+    bt: &BacktestConfig,
+    signal_cfg: &SignalConfig,
+    engine: Engine,
+    rows: &[MonthRow],
+) -> BacktestResult {
+    let data: Vec<&MonthRow> = rows
         .iter()
-        .rfind(|(d, _)| *d <= bt_config.end_date)
-        .map(|(_, p)| *p)
-        .unwrap_or(6049.06);
+        .filter(|r| r.date >= bt.start_date && r.date <= bt.end_date)
+        .collect();
+    if data.is_empty() {
+        panic!("回测区间内无数据");
+    }
+    let owned: Vec<MonthRow> = data.iter().map(|r| (*r).clone()).collect();
+    let signals = smooth_fgi(&owned, signal_cfg.smooth_months);
+    let target_ws = compute_target_risk_weights(config, &owned, &signals, signal_cfg);
 
-    let mut total_inflow = bt_config.initial_cash;
-    let mut total_shares = 0.0;
-    let mut trades: Vec<Trade> = Vec::new();
+    let costs = &config.costs;
+    let band = config.rebalance.band_pp;
+    let min_trade = config.rebalance.min_trade_amount;
+    let min_hold = config.rebalance.min_holding_days_for_sell;
 
-    let mut cash = bt_config.initial_cash;
-    let mut last_inflow_year = 0;
+    let mut st = State::new(bt.initial_cash, owned[0].date);
+    let mut monthly: Vec<Monthly> = Vec::new();
+    let mut prev_date: Option<NaiveDate> = None;
+    let mut prev_total: f64 = bt.initial_cash;
 
-    for (date, price) in &sp500_data {
-        if *date < bt_config.start_date || *date > bt_config.end_date {
+    for (i, row) in owned.iter().enumerate() {
+        // 1) 现金按货币基金收益增长
+        if let Some(pd) = prev_date {
+            let days = (row.date - pd).num_days();
+            let grown = st.cash * costs.cash_growth(days);
+            st.interest += grown - st.cash;
+            st.cash = grown;
+        }
+
+        // 2) 年度注资（每年3月末之后的首个月）
+        let mut inflow = 0.0;
+        if row.date.year() > st.last_inflow_year && row.date.month() >= 3 && i > 0 {
+            st.cash += bt.annual_inflow;
+            st.total_inflow += bt.annual_inflow;
+            st.last_inflow_year = row.date.year();
+            inflow = bt.annual_inflow;
+            st.flows.push(CashFlow { date: row.date, amount: -bt.annual_inflow });
+        } else if i == 0 {
+            st.last_inflow_year = row.date.year();
+        }
+
+        let signal = signals[i];
+        let zone = config.sentiment_zone(signal).to_string();
+
+        // 3) 调仓
+        match engine {
+            Engine::TargetWeight => rebalance_to_weights(
+                &mut st,
+                config,
+                row,
+                config.sleeve_split(),
+                target_ws[i],
+                &zone,
+                band,
+                min_trade,
+                min_hold,
+            ),
+            Engine::Legacy => step_legacy(&mut st, config, row, signal, &zone),
+            Engine::BuyHold => {
+                // 只在有可投现金时按固定权重建仓，之后不动
+                if st.cash > min_trade {
+                    let (a, b, c) = config.sleeve_split();
+                    let cash = st.cash;
+                    for (leg, w) in [(0, a), (1, b), (2, c)] {
+                        st.do_buy(leg, cash * w, row.prices[leg], row.date, costs, &zone, row.fgi);
+                    }
+                }
+            }
+            Engine::BuyHoldRebalanced => {
+                // 满仓固定权重 + 每年3月再平衡一次
+                let yearly = inflow > 0.0 || i == 0;
+                if st.cash > min_trade {
+                    let (a, b, c) = config.sleeve_split();
+                    let cash = st.cash;
+                    for (leg, w) in [(0, a), (1, b), (2, c)] {
+                        st.do_buy(leg, cash * w, row.prices[leg], row.date, costs, &zone, row.fgi);
+                    }
+                }
+                if yearly && i > 0 {
+                    rebalance_to_weights(
+                        &mut st, config, row, config.sleeve_split(), 1.0, &zone, 0.0, min_trade,
+                        min_hold,
+                    );
+                }
+            }
+        }
+
+        // 4) 记账
+        let leg_values = st.leg_values(&row.prices);
+        let total = st.cash + leg_values.iter().sum::<f64>();
+        let risk_value: f64 = leg_values.iter().sum();
+        let period_return = if i == 0 {
+            0.0
+        } else {
+            let base = prev_total + inflow;
+            if base > 0.0 { total / base - 1.0 } else { 0.0 }
+        };
+        monthly.push(Monthly {
+            date: row.date,
+            fgi: row.fgi,
+            signal,
+            zone: zone.clone(),
+            cash: st.cash,
+            leg_values,
+            total_value: total,
+            inflow,
+            period_return,
+            risk_weight: if total > 0.0 { risk_value / total * 100.0 } else { 0.0 },
+            target_risk_weight: match engine {
+                Engine::TargetWeight => target_ws[i] * 100.0,
+                _ => 100.0,
+            },
+        });
+        prev_total = total;
+        prev_date = Some(row.date);
+    }
+
+    finalize(config, bt, engine, st, monthly)
+}
+
+/// 把组合调向 `sleeve` 比例 × `risk_w` 总风险权重；偏离在带宽内则不动作。
+#[allow(clippy::too_many_arguments)]
+fn rebalance_to_weights(
+    st: &mut State,
+    config: &AppConfig,
+    row: &MonthRow,
+    sleeve: (f64, f64, f64),
+    risk_w: f64,
+    zone: &str,
+    band: f64,
+    min_trade: f64,
+    min_hold: i64,
+) {
+    let costs = &config.costs;
+    let total = st.total(&row.prices);
+    if total <= 0.0 {
+        return;
+    }
+    let targets = [
+        total * risk_w * sleeve.0,
+        total * risk_w * sleeve.1,
+        total * risk_w * sleeve.2,
+    ];
+    let current = st.leg_values(&row.prices);
+
+    // 先卖出超配腿（回收现金供买入使用）
+    for leg in 0..3 {
+        let excess = current[leg] - targets[leg];
+        let drift_pp = excess / total * 100.0;
+        if drift_pp > band && excess >= min_trade {
+            st.do_sell(
+                leg, excess, row.prices[leg], row.date, costs, min_hold, zone, row.fgi,
+            );
+        }
+    }
+
+    // 再买入低配腿；现金不足时按缺口比例分配
+    let current = st.leg_values(&row.prices);
+    let mut needs = [0.0_f64; 3];
+    let mut need_sum = 0.0;
+    for leg in 0..3 {
+        let short = targets[leg] - current[leg];
+        let drift_pp = short / total * 100.0;
+        if drift_pp > band && short >= min_trade {
+            needs[leg] = short;
+            need_sum += short;
+        }
+    }
+    if need_sum <= 0.0 {
+        return;
+    }
+    let budget = st.cash.min(need_sum);
+    if budget < min_trade {
+        return;
+    }
+    for leg in 0..3 {
+        if needs[leg] <= 0.0 {
             continue;
         }
-
-        let year = date.year();
-
-        // 每年3月末注资
-        if year > last_inflow_year && date.month() >= 3 {
-            cash += bt_config.annual_inflow;
-            total_inflow += bt_config.annual_inflow;
-            last_inflow_year = year;
+        let amount = budget * (needs[leg] / need_sum);
+        if amount >= min_trade.min(budget) {
+            st.do_buy(leg, amount, row.prices[leg], row.date, costs, zone, row.fgi);
         }
+    }
+}
 
-        // 如果有现金，立即买入
-        if cash > 0.0 {
-            let shares = cash / price;
-            total_shares += shares;
+/// 旧框架：买入=可用现金的百分比（逆向加权分配），卖出=份额的百分比。
+/// 保留以便在同一成本模型下与新框架做公平对照。
+fn step_legacy(
+    st: &mut State,
+    config: &AppConfig,
+    row: &MonthRow,
+    signal: f64,
+    zone: &str,
+) {
+    let costs = &config.costs;
+    let min_hold = config.rebalance.min_holding_days_for_sell;
+    let positions = st.positions(&row.prices);
 
-            trades.push(Trade {
-                date: *date,
-                action: "买入".to_string(),
-                zone: "持有".to_string(),
-                fgi: 50.0,
-                shares,
-                price: *price,
-                amount: cash,
-                pct: "100%".to_string(),
-                ann_ret: None,
-            });
-
-            cash = 0.0;
+    // 卖出
+    let sells = calculate_sell_suggestions(config, signal, &positions);
+    for s in &sells {
+        if let Some(leg) = LEG_CODES.iter().position(|c| *c == s.asset_code) {
+            st.do_sell(
+                leg,
+                s.sell_amount,
+                row.prices[leg],
+                row.date,
+                costs,
+                min_hold,
+                zone,
+                row.fgi,
+            );
         }
     }
 
-    let final_value = total_shares * end_price;
+    // 买入
+    let positions = st.positions(&row.prices);
+    let warns = check_risk_warnings(config, signal, &positions);
+    let buy = calculate_buy_suggestions(config, signal, st.cash, &positions, &[], &warns);
+    if buy.total_amount <= 0.0 {
+        return;
+    }
+    let (a, b, c) = config.sleeve_split();
+    let amounts = [
+        buy.total_amount * a,
+        buy.total_amount * b,
+        buy.total_amount * c,
+    ];
+    for leg in 0..3 {
+        st.do_buy(leg, amounts[leg], row.prices[leg], row.date, costs, zone, row.fgi);
+    }
+}
 
-    let days = (bt_config.end_date - bt_config.start_date).num_days() as f64;
-    let years = days / 365.0;
+fn finalize(
+    config: &AppConfig,
+    bt: &BacktestConfig,
+    engine: Engine,
+    mut st: State,
+    monthly: Vec<Monthly>,
+) -> BacktestResult {
+    let final_value = monthly.last().map(|m| m.total_value).unwrap_or(0.0);
+    let end = monthly.last().map(|m| m.date).unwrap_or(bt.end_date);
+    st.flows.push(CashFlow { date: end, amount: final_value });
 
-    let total_return = (final_value / total_inflow) - 1.0;
-    let annualized_return = (final_value / total_inflow).powf(1.0 / years) - 1.0;
+    let total_return = if st.total_inflow > 0.0 {
+        final_value / st.total_inflow - 1.0
+    } else {
+        0.0
+    };
+    let years = (end - monthly.first().map(|m| m.date).unwrap_or(end)).num_days() as f64 / 365.0;
+    let naive = if years > 0.0 && st.total_inflow > 0.0 {
+        (final_value / st.total_inflow).powf(1.0 / years) - 1.0
+    } else {
+        0.0
+    };
+    let xirr = metrics::xirr(&st.flows).unwrap_or(naive);
 
-    let buy_count = trades.len();
+    let values: Vec<f64> = monthly.iter().map(|m| m.total_value).collect();
+    let max_dd = metrics::max_drawdown(&values);
+    let returns: Vec<f64> = monthly.iter().skip(1).map(|m| m.period_return).collect();
+    let risk = metrics::risk_metrics(
+        &returns,
+        12.0,
+        config.costs.cash_annual_yield / 100.0,
+        xirr,
+        max_dd,
+    );
+
+    let buy_count = st.trades.iter().filter(|t| t.action == "买入").count();
+    let sell_count = st.trades.len() - buy_count;
+    let trades_per_year = if years > 0.0 {
+        st.trades.len() as f64 / years
+    } else {
+        0.0
+    };
 
     BacktestResult {
-        name: "纳指买入持有".to_string(),
-        total_inflow,
+        name: engine.label().to_string(),
+        engine,
+        total_inflow: st.total_inflow,
         final_value,
         total_return,
-        annualized_return,
-        max_drawdown: 0.147,
-        trades,
+        xirr,
+        naive_annualized: naive,
+        max_drawdown: max_dd,
+        risk,
+        total_fees: st.fees,
+        cash_interest: st.interest,
+        trades: st.trades,
         buy_count,
-        sell_count: 0,
-        buy_by_zone: HashMap::new(),
-        sell_by_zone: HashMap::new(),
+        sell_count,
+        monthly,
+        trades_per_year,
+    }
+}
+
+// ───────────────────────── 输出 ─────────────────────────
+
+pub fn print_report(r: &BacktestResult) {
+    println!();
+    println!("=================================================================");
+    println!("   {} 回测报告", r.name);
+    println!("=================================================================");
+    println!();
+    println!("  【收益概览】");
+    println!("    总投入资金:       ¥{:>12.2}", r.total_inflow);
+    println!("    期末总资产:       ¥{:>12.2}", r.final_value);
+    println!("    总收益:           ¥{:>12.2}", r.final_value - r.total_inflow);
+    println!("    总收益率:                 {:>10.2}%", r.total_return * 100.0);
+    println!("    年化(XIRR):               {:>10.2}%", r.xirr * 100.0);
+    println!("    年化(简单口径):           {:>10.2}%", r.naive_annualized * 100.0);
+    println!();
+    println!("  【风险】");
+    println!("    最大回撤:                 {:>10.2}%", r.max_drawdown * 100.0);
+    println!("    年化波动:                 {:>10.2}%", r.risk.volatility * 100.0);
+    println!("    Sharpe:                   {:>10.2}", r.risk.sharpe);
+    println!("    Sortino:                  {:>10.2}", r.risk.sortino);
+    println!("    Calmar:                   {:>10.2}", r.risk.calmar);
+    println!();
+    println!("  【成本】");
+    println!("    交易与赎回费合计: ¥{:>12.2}", r.total_fees);
+    println!("    现金利息收入:     ¥{:>12.2}", r.cash_interest);
+    println!(
+        "    费用占期末资产:           {:>10.2}%",
+        if r.final_value > 0.0 { r.total_fees / r.final_value * 100.0 } else { 0.0 }
+    );
+    println!();
+    println!("  【交易】");
+    println!(
+        "    买入 {:>3} 次 | 卖出 {:>3} 次 | 合计 {:>3} 次 | 年均 {:.1} 次",
+        r.buy_count, r.sell_count, r.trades.len(), r.trades_per_year
+    );
+
+    let mut by_leg: HashMap<usize, (usize, f64)> = HashMap::new();
+    for t in &r.trades {
+        let e = by_leg.entry(t.leg).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += t.amount;
+    }
+    let mut legs: Vec<_> = by_leg.into_iter().collect();
+    legs.sort_by_key(|(k, _)| *k);
+    for (leg, (n, amt)) in legs {
+        println!("      {} {:>4} 次, ¥{:>12.2}", pad_to_width(LEG_NAMES[leg], 16), n, amt);
+    }
+    println!();
+
+    print_yearly(r);
+    print_key_trades(r);
+}
+
+/// 按年分解：中长线投资者更关心逐年表现而非单一总数
+fn print_yearly(r: &BacktestResult) {
+    println!("  【逐年表现】");
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table.set_header(vec![
+        Cell::new("年份"),
+        Cell::new("收益"),
+        Cell::new("年末总资产"),
+        Cell::new("年内注资"),
+        Cell::new("均仓位"),
+        Cell::new("目标仓位"),
+        Cell::new("情绪原始→平滑"),
+        Cell::new("年末构成 美/A/金/现金"),
+    ]);
+    let mut years: Vec<i32> = r.monthly.iter().map(|m| m.date.year()).collect();
+    years.dedup();
+    for year in years {
+        let ms: Vec<&Monthly> = r.monthly.iter().filter(|m| m.date.year() == year).collect();
+        if ms.is_empty() {
+            continue;
+        }
+        let ret = ms.iter().fold(1.0, |acc, m| acc * (1.0 + m.period_return)) - 1.0;
+        let inflow: f64 = ms.iter().map(|m| m.inflow).sum();
+        let avg_w = ms.iter().map(|m| m.risk_weight).sum::<f64>() / ms.len() as f64;
+        let avg_target = ms.iter().map(|m| m.target_risk_weight).sum::<f64>() / ms.len() as f64;
+        let avg_raw = ms.iter().map(|m| m.fgi).sum::<f64>() / ms.len() as f64;
+        let avg_fgi = ms.iter().map(|m| m.signal).sum::<f64>() / ms.len() as f64;
+        let last = ms[ms.len() - 1];
+        let pct = |v: f64| {
+            if last.total_value > 0.0 { v / last.total_value * 100.0 } else { 0.0 }
+        };
+        let composition = format!(
+            "{:.0}/{:.0}/{:.0}/{:.0}%",
+            pct(last.leg_values[0]),
+            pct(last.leg_values[1]),
+            pct(last.leg_values[2]),
+            pct(last.cash)
+        );
+        let color = if ret >= 0.0 { Color::Green } else { Color::Red };
+        table.add_row(vec![
+            Cell::new(year.to_string()),
+            Cell::new(format!("{:+.2}%", ret * 100.0)).fg(color),
+            Cell::new(format!("¥{:.0}", last.total_value)),
+            Cell::new(format!("¥{:.0}", inflow)),
+            Cell::new(format!("{:.0}%", avg_w)),
+            Cell::new(format!("{:.0}%", avg_target)),
+            Cell::new(format!("{:.0}→{:.0} {}", avg_raw, avg_fgi, last.zone)),
+            Cell::new(composition),
+        ]);
+    }
+    println!("{}", table);
+    println!();
+}
+
+/// 每年金额最大的一笔交易，便于人工核对策略在关键时点做了什么
+fn print_key_trades(r: &BacktestResult) {
+    if r.trades.is_empty() {
+        return;
+    }
+    println!("  【关键交易】（每年金额最大一笔）");
+    let mut by_year: HashMap<i32, &Trade> = HashMap::new();
+    for t in &r.trades {
+        by_year
+            .entry(t.date.year())
+            .and_modify(|cur| {
+                if t.amount > cur.amount {
+                    *cur = t;
+                }
+            })
+            .or_insert(t);
+    }
+    let mut years: Vec<i32> = by_year.keys().copied().collect();
+    years.sort();
+    for y in years {
+        let t = by_year[&y];
+        println!(
+            "    {} {} {} {}(FGI {:.0})  {:.2}份 @ {:.4}  ¥{:.0}  费用¥{:.2}",
+            t.date,
+            t.action,
+            pad_to_width(LEG_NAMES[t.leg], 16),
+            pad_to_width(&t.zone, 10),
+            t.fgi,
+            t.shares,
+            t.price,
+            t.amount,
+            t.fee
+        );
+    }
+    println!();
+}
+
+/// 按终端显示宽度补齐（中文占 2 列）
+fn pad_to_width(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - w))
     }
 }
 
 pub fn print_comparison(results: &[BacktestResult]) {
     println!();
     println!("=================================================================");
-    println!("   策略对比");
+    println!("   策略对比（同一数据、同一成本模型）");
     println!("=================================================================");
     println!();
-
     let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
+    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("策略"),
-        Cell::new("年化收益"),
-        Cell::new("总收益率"),
+        Cell::new("年化XIRR"),
         Cell::new("最大回撤"),
-        Cell::new("买入"),
-        Cell::new("卖出"),
+        Cell::new("波动"),
+        Cell::new("Sharpe"),
+        Cell::new("Calmar"),
+        Cell::new("费用"),
+        Cell::new("年均交易"),
     ]);
-
-    for result in results {
-        let ann_color = if result.annualized_return >= 0.0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
-        let total_color = if result.total_return >= 0.0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
+    for r in results {
+        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
         table.add_row(vec![
-            Cell::new(&result.name),
-            Cell::new(format!("{:.2}%", result.annualized_return * 100.0)).fg(ann_color),
-            Cell::new(format!("{:.2}%", result.total_return * 100.0)).fg(total_color),
-            Cell::new(format!("{:.2}%", result.max_drawdown * 100.0)),
-            Cell::new(result.buy_count.to_string()),
-            Cell::new(result.sell_count.to_string()),
+            Cell::new(&r.name),
+            Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
+            Cell::new(format!("{:.2}%", r.max_drawdown * 100.0)),
+            Cell::new(format!("{:.1}%", r.risk.volatility * 100.0)),
+            Cell::new(format!("{:.2}", r.risk.sharpe)),
+            Cell::new(format!("{:.2}", r.risk.calmar)),
+            Cell::new(format!("¥{:.0}", r.total_fees)),
+            Cell::new(format!("{:.1}", r.trades_per_year)),
         ]);
     }
     println!("{}", table);
     println!();
 }
 
-pub fn run_param_comparison(
-    base_config: &AppConfig,
-    bt_config: &BacktestConfig,
-) -> Vec<BacktestResult> {
-    let mut results = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let result_default = run_backtest(base_config, bt_config);
-    results.push(result_default);
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
-    let mut config_aggressive = base_config.clone();
-    config_aggressive.buy_ratio.extreme_fear = 70.0;
-    config_aggressive.buy_ratio.fear = 40.0;
-    config_aggressive.sell_ratio.extreme_greed_target_high = 60.0;
-    config_aggressive.sell_ratio.greed_target_high = 50.0;
-    let mut result = run_backtest(&config_aggressive, bt_config);
-    result.name = "激进配置".to_string();
-    results.push(result);
-
-    let mut config_ultra = base_config.clone();
-    config_ultra.buy_ratio.extreme_fear = 80.0;
-    config_ultra.buy_ratio.fear = 50.0;
-    config_ultra.buy_ratio.neutral = 25.0;
-    config_ultra.sell_ratio.extreme_greed_target_high = 70.0;
-    config_ultra.sell_ratio.greed_target_high = 55.0;
-    let mut result = run_backtest(&config_ultra, bt_config);
-    result.name = "超激进配置".to_string();
-    results.push(result);
-
-    let mut config_max = base_config.clone();
-    config_max.buy_ratio.extreme_fear = 90.0;
-    config_max.buy_ratio.fear = 60.0;
-    config_max.buy_ratio.neutral = 30.0;
-    config_max.sell_ratio.extreme_greed_target_high = 80.0;
-    config_max.sell_ratio.greed_target_high = 60.0;
-    config_max.sell_ratio.extreme_greed_below_target = 40.0;
-    let mut result = run_backtest(&config_max, bt_config);
-    result.name = "极致激进".to_string();
-    results.push(result);
-
-    let mut config_conservative = base_config.clone();
-    config_conservative.buy_ratio.neutral = 10.0;
-    config_conservative.buy_ratio.fear = 25.0;
-    let mut result = run_backtest(&config_conservative, bt_config);
-    result.name = "保守配置".to_string();
-    results.push(result);
-
-    let mut config_no_neutral = base_config.clone();
-    config_no_neutral.buy_ratio.neutral = 0.0;
-    let mut result = run_backtest(&config_no_neutral, bt_config);
-    result.name = "无中性配置".to_string();
-    results.push(result);
-
-    let result_bnh = run_buy_and_hold(bt_config);
-    results.push(result_bnh);
-
-    results
-}
-
-pub fn run_custom_comparison(
-    _base_config: &AppConfig,
-    bt_config: &BacktestConfig,
-    config_paths: &[&str],
-) -> Vec<BacktestResult> {
-    let mut results = Vec::new();
-
-    for path in config_paths {
-        if let Ok(content) = std::fs::read_to_string(path)
-            && let Ok(custom_config) = toml::from_str::<AppConfig>(&content)
-        {
-            let mut result = run_backtest(&custom_config, bt_config);
-            let name = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("自定义")
-                .to_string();
-            result.name = name;
-            results.push(result);
+    #[test]
+    fn 内置数据集应可解析且无拼接断点() {
+        let rows = load_main();
+        assert!(rows.len() > 100, "月数 {}", rows.len());
+        // 旧数据集在 2019-01 有 -97% 的拼接断点，这里逐月校验单月跳变
+        for w in rows.windows(2) {
+            for leg in 0..3 {
+                let ch = w[1].prices[leg] / w[0].prices[leg] - 1.0;
+                assert!(
+                    ch.abs() < 0.35,
+                    "{} 第{}腿单月跳变 {:.1}% 疑似数据断点",
+                    w[1].date, leg, ch * 100.0
+                );
+            }
         }
     }
 
-    let result_bnh = run_buy_and_hold(bt_config);
-    results.push(result_bnh);
+    #[test]
+    fn 数据集应为真实值而非人工估填的整数() {
+        let rows = load_main();
+        // 旧数据集 112/112 为整数；真实序列几乎不应出现整数
+        let ints = rows
+            .iter()
+            .filter(|r| r.prices.iter().all(|p| (p - p.round()).abs() < 1e-9))
+            .count();
+        assert!(ints <= 1, "疑似人工估填，整数行数={}", ints);
+    }
 
-    results
-}
+    #[test]
+    fn 情绪平滑窗口为一时等于原值() {
+        let rows = load_main();
+        let s = smooth_fgi(&rows, 1);
+        assert_eq!(s[10], rows[10].fgi);
+    }
 
-/// 多资产买入持有基准
-pub fn run_multi_asset_buy_and_hold(bt_config: &BacktestConfig) -> MultiAssetBacktestResult {
-    let monthly_data = parse_multi_asset_data(MONTHLY_REAL_DATA);
+    #[test]
+    fn 情绪平滑应降低波动() {
+        let rows = load_main();
+        let raw: Vec<f64> = rows.iter().map(|r| r.fgi).collect();
+        let sm = smooth_fgi(&rows, 3);
+        assert!(
+            metrics::stddev(&sm) < metrics::stddev(&raw),
+            "平滑后波动应更小: {} vs {}",
+            metrics::stddev(&sm),
+            metrics::stddev(&raw)
+        );
+    }
 
-    // 过滤日期范围
-    let filtered_data: Vec<_> = monthly_data
-        .into_iter()
-        .filter(|d| d.date >= bt_config.start_date && d.date <= bt_config.end_date)
-        .collect();
+    #[test]
+    fn 阶梯赎回费应按批次持有天数分别计算() {
+        let costs = crate::config::Costs::default();
+        let mut leg = Leg::default();
+        leg.buy(100.0, 1.0, d(2020, 1, 1)); // 持有 1827 天 → 免赎回费
+        leg.buy(100.0, 1.0, d(2024, 12, 29)); // 持有 3 天 → 落入 <7 天惩罚档 1.5%
+        // 全部卖出（min_days=0 以便同时卖到新批次）
+        let (net, fee, sold) = leg.sell_fifo(200.0, 1.0, d(2025, 1, 1), &costs, 0);
+        assert!((sold - 200.0).abs() < 1e-9);
+        // 老批次仅 0.05% 卖出费，新批次 0.05%+1.5%
+        let expect = 100.0 * 0.0005 + 100.0 * (0.0005 + 0.015);
+        assert!((fee - expect).abs() < 1e-6, "fee={} expect={}", fee, expect);
+        assert!((net - (200.0 - expect)).abs() < 1e-6);
+        // 边界：恰好持有 7 天不属于 <7 档，应落到 0.75%
+        let mut leg2 = Leg::default();
+        leg2.buy(100.0, 1.0, d(2024, 12, 25));
+        let (_, fee2, _) = leg2.sell_fifo(100.0, 1.0, d(2025, 1, 1), &costs, 0);
+        let expect2 = 100.0 * (0.0005 + 0.0075);
+        assert!((fee2 - expect2).abs() < 1e-6, "7天边界 fee={}", fee2);
+    }
 
-    let first_data = filtered_data.first().expect("No data");
-    let last_data = filtered_data.last().expect("No data");
+    #[test]
+    fn 最短持有天数应阻止卖出新批次() {
+        let costs = crate::config::Costs::default();
+        let mut leg = Leg::default();
+        leg.buy(100.0, 1.0, d(2024, 12, 25)); // 7天
+        let (_, _, sold) = leg.sell_fifo(100.0, 1.0, d(2025, 1, 1), &costs, 30);
+        assert_eq!(sold, 0.0, "未满最短持有期不应卖出");
+        assert!((leg.shares() - 100.0).abs() < 1e-9);
+    }
 
-    // 配置比例 - 使用优化后的激进配置
-    let us_ratio = 0.70;
-    let cn_ratio = 0.15;
-    let gold_ratio = 0.15;
+    #[test]
+    fn fifo_应先卖最早批次() {
+        let costs = crate::config::Costs { buy_fee_pct: 0.0, sell_fee_pct: 0.0, cash_annual_yield: 0.0, redemption_tiers: vec![] };
+        let mut leg = Leg::default();
+        leg.buy(10.0, 1.0, d(2020, 1, 1));
+        leg.buy(10.0, 5.0, d(2021, 1, 1));
+        leg.sell_fifo(10.0, 3.0, d(2023, 1, 1), &costs, 0);
+        // 卖掉最早的低成本批次后，剩余成本应为第二批的 5.0
+        assert!((leg.avg_cost() - 5.0).abs() < 1e-9, "avg={}", leg.avg_cost());
+    }
 
-    let mut total_inflow = bt_config.initial_cash;
-    let mut trades: Vec<MultiAssetTrade> = Vec::new();
-    let mut monthly_values: Vec<MultiAssetMonthly> = Vec::new();
-    let mut last_inflow_year = 0;
+    #[test]
+    fn 目标仓位框架的实际权重应贴近目标() {
+        let cfg = AppConfig::default_config();
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        // 跳过建仓初期，检查权重跟踪误差
+        let late: Vec<&Monthly> = r.monthly.iter().skip(12).collect();
+        let bad = late
+            .iter()
+            .filter(|m| (m.risk_weight - m.target_risk_weight).abs() > 15.0)
+            .count();
+        assert!(
+            bad * 10 < late.len(),
+            "偏离目标超15pp的月份过多: {}/{}",
+            bad,
+            late.len()
+        );
+    }
 
-    // 初始买入
-    let us_amount = bt_config.initial_cash * us_ratio;
-    let cn_amount = bt_config.initial_cash * cn_ratio;
-    let gold_amount = bt_config.initial_cash * gold_ratio;
-
-    let mut us_shares = us_amount / first_data.nasdaq;
-    let mut cn_shares = cn_amount / first_data.dividend_low_vol;
-    let mut gold_shares = gold_amount / first_data.gold_cny;
-
-    trades.push(MultiAssetTrade {
-        date: first_data.date,
-        action: "买入".to_string(),
-        asset: "NASDAQ".to_string(),
-        zone: "持有".to_string(),
-        fgi: first_data.fgi,
-        shares: us_shares,
-        price: first_data.nasdaq,
-        amount: us_amount,
-        pct: format!("{:.0}%", us_ratio * 100.0),
-        ann_ret: None,
-    });
-
-    trades.push(MultiAssetTrade {
-        date: first_data.date,
-        action: "买入".to_string(),
-        asset: "DIVIDEND_LOW_VOL".to_string(),
-        zone: "持有".to_string(),
-        fgi: first_data.fgi,
-        shares: cn_shares,
-        price: first_data.dividend_low_vol,
-        amount: cn_amount,
-        pct: format!("{:.0}%", cn_ratio * 100.0),
-        ann_ret: None,
-    });
-
-    trades.push(MultiAssetTrade {
-        date: first_data.date,
-        action: "买入".to_string(),
-        asset: "GOLD".to_string(),
-        zone: "持有".to_string(),
-        fgi: first_data.fgi,
-        shares: gold_shares,
-        price: first_data.gold_cny,
-        amount: gold_amount,
-        pct: format!("{:.0}%", gold_ratio * 100.0),
-        ann_ret: None,
-    });
-
-    for data in &filtered_data {
-        let year = data.date.year();
-
-        // 每年3月末注资
-        if year > last_inflow_year && data.date.month() >= 3 {
-            let us_amount = bt_config.annual_inflow * us_ratio;
-            let cn_amount = bt_config.annual_inflow * cn_ratio;
-            let gold_amount = bt_config.annual_inflow * gold_ratio;
-
-            us_shares += us_amount / data.nasdaq;
-            cn_shares += cn_amount / data.dividend_low_vol;
-            gold_shares += gold_amount / data.gold_cny;
-            total_inflow += bt_config.annual_inflow;
-            last_inflow_year = year;
-
-            trades.push(MultiAssetTrade {
-                date: data.date,
-                action: "买入".to_string(),
-                asset: "NASDAQ".to_string(),
-                zone: "持有".to_string(),
-                fgi: data.fgi,
-                shares: us_amount / data.nasdaq,
-                price: data.nasdaq,
-                amount: us_amount,
-                pct: format!("{:.0}%", us_ratio * 100.0),
-                ann_ret: None,
-            });
-
-            trades.push(MultiAssetTrade {
-                date: data.date,
-                action: "买入".to_string(),
-                asset: "DIVIDEND_LOW_VOL".to_string(),
-                zone: "持有".to_string(),
-                fgi: data.fgi,
-                shares: cn_amount / data.dividend_low_vol,
-                price: data.dividend_low_vol,
-                amount: cn_amount,
-                pct: format!("{:.0}%", cn_ratio * 100.0),
-                ann_ret: None,
-            });
-
-            trades.push(MultiAssetTrade {
-                date: data.date,
-                action: "买入".to_string(),
-                asset: "GOLD".to_string(),
-                zone: "持有".to_string(),
-                fgi: data.fgi,
-                shares: gold_amount / data.gold_cny,
-                price: data.gold_cny,
-                amount: gold_amount,
-                pct: format!("{:.0}%", gold_ratio * 100.0),
-                ann_ret: None,
-            });
+    #[test]
+    fn 目标仓位框架不应出现弹药几何衰减() {
+        // 旧框架在连续恐慌期会越买越少（每次只花现金的固定比例）。
+        // 新框架应能把仓位推到目标附近，因此极度恐慌期末现金占比应显著低于目标留存。
+        let cfg = AppConfig::default_config();
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let fear_months: Vec<&Monthly> = r
+            .monthly
+            .iter()
+            .skip(12)
+            .filter(|m| m.signal < cfg.thresholds.extreme_fear)
+            .collect();
+        if !fear_months.is_empty() {
+            let avg_risk = fear_months.iter().map(|m| m.risk_weight).sum::<f64>()
+                / fear_months.len() as f64;
+            assert!(
+                avg_risk > 60.0,
+                "极度恐慌期平均风险仓位仅 {:.1}%，疑似弹药衰减",
+                avg_risk
+            );
         }
-
-        let total_value = us_shares * data.nasdaq + cn_shares * data.dividend_low_vol + gold_shares * data.gold_cny;
-
-        monthly_values.push(MultiAssetMonthly {
-            date: data.date,
-            fgi: data.fgi,
-            zone: "持有".to_string(),
-            nasdaq: data.nasdaq,
-            dividend_low_vol: data.dividend_low_vol,
-            gold_cny: data.gold_cny,
-            cash: 0.0,
-            total_value,
-        });
     }
 
-    let final_value = us_shares * last_data.nasdaq + cn_shares * last_data.dividend_low_vol + gold_shares * last_data.gold_cny;
-    let total_return = (final_value / total_inflow) - 1.0;
-
-    let days = (bt_config.end_date - bt_config.start_date).num_days() as f64;
-    let years = days / 365.0;
-    let annualized_return = (final_value / total_inflow).powf(1.0 / years) - 1.0;
-
-    // 计算最大回撤
-    let mut max_value: f64 = 0.0;
-    let mut max_drawdown: f64 = 0.0;
-    for mv in &monthly_values {
-        max_value = max_value.max(mv.total_value);
-        let drawdown = (max_value - mv.total_value) / max_value;
-        max_drawdown = max_drawdown.max(drawdown);
-    }
-
-    let buy_count = trades.len();
-    let mut buy_by_zone: HashMap<String, (usize, f64)> = HashMap::new();
-    buy_by_zone.insert("持有".to_string(), (buy_count, total_inflow));
-
-    let mut buy_by_asset: HashMap<String, (usize, f64)> = HashMap::new();
-    buy_by_asset.insert("NASDAQ".to_string(), (buy_count / 3, us_shares * last_data.nasdaq));
-    buy_by_asset.insert("DIVIDEND_LOW_VOL".to_string(), (buy_count / 3, cn_shares * last_data.dividend_low_vol));
-    buy_by_asset.insert("GOLD".to_string(), (buy_count / 3, gold_shares * last_data.gold_cny));
-
-    MultiAssetBacktestResult {
-        name: "多资产买入持有".to_string(),
-        total_inflow,
-        final_value,
-        total_return,
-        annualized_return,
-        max_drawdown,
-        trades,
-        buy_count,
-        sell_count: 0,
-        buy_by_zone,
-        sell_by_zone: HashMap::new(),
-        buy_by_asset,
-        sell_by_asset: HashMap::new(),
-    }
-}
-
-/// 打印多资产对比结果
-pub fn print_multi_asset_comparison(results: &[MultiAssetBacktestResult]) {
-    println!();
-    println!("=================================================================");
-    println!("   多资产策略对比");
-    println!("=================================================================");
-    println!();
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
-    table.set_header(vec![
-        Cell::new("策略"),
-        Cell::new("年化收益"),
-        Cell::new("总收益率"),
-        Cell::new("最大回撤"),
-        Cell::new("买入"),
-        Cell::new("卖出"),
-    ]);
-
-    for result in results {
-        let ann_color = if result.annualized_return >= 0.0 {
-            Color::Green
-        } else {
-            Color::Red
+    #[test]
+    fn 成本模型应确实扣减收益() {
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let mut free = AppConfig::default_config();
+        free.costs = crate::config::Costs {
+            buy_fee_pct: 0.0,
+            sell_fee_pct: 0.0,
+            cash_annual_yield: 0.0,
+            redemption_tiers: vec![],
         };
-        let total_color = if result.total_return >= 0.0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
-        table.add_row(vec![
-            Cell::new(&result.name),
-            Cell::new(format!("{:.2}%", result.annualized_return * 100.0)).fg(ann_color),
-            Cell::new(format!("{:.2}%", result.total_return * 100.0)).fg(total_color),
-            Cell::new(format!("{:.2}%", result.max_drawdown * 100.0)),
-            Cell::new(result.buy_count.to_string()),
-            Cell::new(result.sell_count.to_string()),
-        ]);
+        let with_cost = AppConfig::default_config();
+        let a = run(&free, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let b = run(&with_cost, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        assert_eq!(a.total_fees, 0.0);
+        assert!(b.total_fees > 0.0, "应产生费用");
     }
-    println!("{}", table);
-    println!();
+
+    #[test]
+    fn 买入持有基准应使用配置的资产配置() {
+        // 旧版基准硬编码 70/15/15，与被对比策略的 55/25/20 不一致。
+        let mut cfg = AppConfig::default_config();
+        cfg.allocation.us_stocks = 100.0;
+        cfg.allocation.cn_stocks = 0.0;
+        cfg.allocation.counter_cyclical = 0.0;
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::BuyHold, &rows);
+        let last = r.monthly.last().unwrap();
+        assert!(last.leg_values[1] < 1e-6, "A股腿应为空");
+        assert!(last.leg_values[2] < 1e-6, "黄金腿应为空");
+        assert!(last.leg_values[0] > 0.0);
+    }
+
+    #[test]
+    fn 带宽越大交易越少() {
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let mut narrow = AppConfig::default_config();
+        narrow.rebalance.band_pp = 1.0;
+        let mut wide = AppConfig::default_config();
+        wide.rebalance.band_pp = 12.0;
+        let a = run(&narrow, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let b = run(&wide, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        assert!(
+            a.trades.len() > b.trades.len(),
+            "窄带 {} 应多于宽带 {}",
+            a.trades.len(),
+            b.trades.len()
+        );
+    }
+
+    #[test]
+    fn 现金应产生利息() {
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let cfg = AppConfig::default_config();
+        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        assert!(r.cash_interest > 0.0, "闲置现金应有货币基金收益");
+    }
+
+    #[test]
+    fn 交易频率应符合中长线约束() {
+        // 用户可接受每月2-3次，即年均约36次以内
+        let rows = load_main();
+        let bt = BacktestConfig::default();
+        let cfg = AppConfig::default_config();
+        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        assert!(
+            r.trades_per_year <= 36.0,
+            "年均交易 {:.1} 次超出中长线约束",
+            r.trades_per_year
+        );
+    }
+    #[test]
+    fn 对照_趋势锚点与情绪锚点() {
+        let cfg = AppConfig::default_config();
+        let rows = load_main();
+        let bt = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
+        println!("\n{:<22} {:>9} {:>9} {:>8} {:>8} {:>9}", "信号模式", "XIRR", "回撤", "Sharpe", "Calmar", "年均交易");
+        for (name, sc) in [
+            ("情绪锚(平滑1月)", SignalConfig { smooth_months: 1, ..SignalConfig::default() }),
+            ("情绪锚(平滑3月)", SignalConfig::default()),
+            ("情绪锚(平滑6月)", SignalConfig { smooth_months: 6, ..SignalConfig::default() }),
+            ("趋势锚+情绪倾斜", SignalConfig::trend_tilt()),
+            ("趋势锚(倾斜0)", SignalConfig { tilt_pp: 0.0, ..SignalConfig::trend_tilt() }),
+        ] {
+            let r = run(&cfg, &bt, &sc, Engine::TargetWeight, &rows);
+            println!("{:<22} {:>8.2}% {:>8.2}% {:>8.2} {:>8.2} {:>9.1}",
+                name, r.xirr*100.0, r.max_drawdown*100.0, r.risk.sharpe, r.risk.calmar, r.trades_per_year);
+        }
+        for (name, e) in [("买入持有+年度再平衡", Engine::BuyHoldRebalanced), ("买入持有", Engine::BuyHold)] {
+            let r = run(&cfg, &bt, &SignalConfig::default(), e, &rows);
+            println!("{:<22} {:>8.2}% {:>8.2}% {:>8.2} {:>8.2} {:>9.1}",
+                name, r.xirr*100.0, r.max_drawdown*100.0, r.risk.sharpe, r.risk.calmar, r.trades_per_year);
+        }
+    }
 }

@@ -4,9 +4,21 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_
 use std::fs;
 use std::path::Path;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::config::AppConfig;
+
+/// 按终端显示宽度补齐（中文占 2 列），避免 {:<n} 按字符数补齐导致的错位
+fn pad_display(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - w))
+    }
+}
 use crate::models::Position;
-use crate::strategy::{BuySuggestion, RiskAdvice, RiskWarning, SellReason, SellSuggestion};
+use crate::strategy::{RebalancePlan, RiskAdvice, RiskWarning};
 
 pub fn generate_report(
     config: &AppConfig,
@@ -18,8 +30,7 @@ pub fn generate_report(
     previous_1_year: Option<f64>,
     cash_balance: f64,
     positions: &[Position],
-    buy_suggestion: &BuySuggestion,
-    sell_suggestions: &[SellSuggestion],
+    plan: &RebalancePlan,
     risk_warnings: &[RiskWarning],
 ) -> Result<String> {
     let today = Local::now();
@@ -133,98 +144,97 @@ pub fn generate_report(
         report.push('\n');
     }
 
-    // 卖出建议
-    if !sell_suggestions.is_empty() {
-        report.push_str("【卖出建议】\n");
-        for s in sell_suggestions {
-            let reason_str = match &s.reason {
-                SellReason::AnnualizedHigh => {
-                    if let Some(ann) = s.annualized_return {
-                        if ann * 100.0 >= config.settings.annualized_target_high {
-                            format!("年化 {:.1}% ≥ {}% 高线", ann * 100.0, config.settings.annualized_target_high)
-                        } else if ann * 100.0 >= config.settings.annualized_target_low {
-                            format!("年化 {:.1}% ≥ {}% 低线", ann * 100.0, config.settings.annualized_target_low)
-                        } else {
-                            "情绪驱动减仓".to_string()
-                        }
-                    } else {
-                        "情绪驱动减仓".to_string()
-                    }
-                }
-                SellReason::AbsoluteProfit => {
-                    format!("绝对收益 {:.0}%（长期持有获利了结）", s.absolute_return * 100.0)
-                }
-            };
-            report.push_str(&format!(
-                "  ▸ {} ({}) — {}\n",
-                s.asset_code, s.asset_name, reason_str
-            ));
-            report.push_str(&format!(
-                "    建议: 减仓 {:.0}%，卖出 {:.2} 份，预计回收 ¥{:.2}\n",
-                s.sell_ratio, s.sell_shares, s.sell_amount
-            ));
-        }
-        report.push('\n');
-    }
+    // ── 调仓计划（目标仓位 + 偏离带） ──
+    report.push_str("【调仓计划】\n");
+    report.push_str(&format!(
+        "  风险资产目标 {:.1}%  当前 {:.1}%  偏离 {:+.1}pp  (带宽 ±{:.1}pp)\n",
+        plan.target_risk_weight,
+        plan.current_risk_weight,
+        plan.current_risk_weight - plan.target_risk_weight,
+        plan.band_pp
+    ));
+    report.push_str(&format!(
+        "  总资产 ¥{:.2}（现金 ¥{:.2}）\n\n",
+        plan.total_assets, plan.cash_balance
+    ));
 
-    // 买入建议
-    report.push_str("【买入建议】\n");
-    if buy_suggestion.total_amount > 0.0 {
-        let zone = config.sentiment_zone(score);
-        let sell_proceeds: f64 = sell_suggestions.iter().map(|s| s.sell_amount).sum();
-        let effective_cash = cash_balance + sell_proceeds;
-        report.push_str(&format!(
-            "  当前市场\"{}\"，建议投入 ¥{:.2}（可用资金 ¥{:.2} 的 {:.0}%）\n",
-            zone, buy_suggestion.total_amount, effective_cash, config.buy_ratio_for(score)
-        ));
-        if sell_proceeds > 0.0 {
+    let mut plan_table = Table::new();
+    plan_table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
+    plan_table.set_header(vec![
+        Cell::new("类别"),
+        Cell::new("目标"),
+        Cell::new("当前"),
+        Cell::new("偏离"),
+        Cell::new("建议"),
+    ]);
+    for leg in &plan.legs {
+        let action = if leg.amount > 0.0 {
+            format!("买入 ¥{:.0}", leg.amount)
+        } else if leg.amount < 0.0 {
+            format!("卖出 ¥{:.0}", -leg.amount)
+        } else {
+            "不动作".to_string()
+        };
+        let mut drift_cell = Cell::new(format!("{:+.1}pp", leg.drift_pp));
+        if leg.drift_pp.abs() > plan.band_pp {
+            drift_cell = drift_cell.fg(if leg.drift_pp > 0.0 { Color::Red } else { Color::Green });
+        }
+        plan_table.add_row(vec![
+            Cell::new(&leg.category_cn),
+            Cell::new(format!("{:.1}%", leg.target_weight)),
+            Cell::new(format!("{:.1}%", leg.current_weight)),
+            drift_cell,
+            Cell::new(action),
+        ]);
+    }
+    for line in plan_table.to_string().lines() {
+        report.push_str(&format!("  {}\n", line));
+    }
+    report.push('\n');
+
+    for leg in &plan.legs {
+        if leg.items.is_empty() && leg.hold_reason.is_none() {
+            continue;
+        }
+        report.push_str(&format!("  ▸ {}\n", leg.category_cn));
+        if let Some(reason) = &leg.hold_reason {
+            report.push_str(&format!("    · {}\n", reason));
+        }
+        for item in &leg.items {
+            let verb = if item.amount >= 0.0 { "买入" } else { "卖出" };
             report.push_str(&format!(
-                "  注: 可用资金含卖出回收 ¥{:.2}\n",
-                sell_proceeds
+                "    · {} ({}): {} ¥{:.2}{}\n",
+                item.asset_code,
+                item.asset_name,
+                verb,
+                item.amount.abs(),
+                item.note
+                    .as_ref()
+                    .map(|n| format!("  [{}]", n))
+                    .unwrap_or_default()
             ));
         }
-        report.push_str(&format!(
-            "    - 美股 ¥{:.2} | A股 ¥{:.2} | 逆周期 ¥{:.2}\n",
-            buy_suggestion.us_amount, buy_suggestion.cn_amount, buy_suggestion.counter_amount
-        ));
-        if !buy_suggestion.details.is_empty() {
-            report.push_str("  分配明细（逆向加权：浮亏标的获得更多资金）:\n");
-            for d in &buy_suggestion.details {
-                report.push_str(&format!("    · {} ({}): ¥{:.2}\n", d.asset_code, d.asset_name, d.amount));
-            }
-        }
-        if !buy_suggestion.excluded.is_empty() {
-            report.push_str("  以下标的因高浮亏暂停加仓:\n");
-            for e in &buy_suggestion.excluded {
-                report.push_str(&format!("    ✗ {} ({}) — 浮亏 {:.0}%: {}\n", e.asset_code, e.asset_name, e.loss_ratio, e.reason));
-            }
-        }
-    } else {
-        report.push_str("  当前市场情绪偏高，建议暂停买入。\n");
-        report.push_str("  可用资金继续持有，等待市场回调。\n");
     }
     report.push('\n');
 
     // 净操作指引
-    let total_sell: f64 = sell_suggestions.iter().map(|s| s.sell_amount).sum();
-    let net_flow = buy_suggestion.total_amount - total_sell;
     report.push_str("【净操作指引】\n");
-    if net_flow > 0.0 {
+    if plan.has_action() {
         report.push_str(&format!(
-            "  今日净买入 ¥{:.2}（买入 ¥{:.2} - 卖出 ¥{:.2}）\n",
-            net_flow, buy_suggestion.total_amount, total_sell
+            "  {} ¥{:.2}（买入 ¥{:.2} - 卖出 ¥{:.2}）\n",
+            plan.net_direction(),
+            (plan.total_buy - plan.total_sell).abs(),
+            plan.total_buy,
+            plan.total_sell
         ));
-        report.push_str("  操作方向: 加仓，整体偏逆向买入\n");
-    } else if net_flow < 0.0 {
-        report.push_str(&format!(
-            "  今日净卖出 ¥{:.2}（买入 ¥{:.2} - 卖出 ¥{:.2}）\n",
-            -net_flow, buy_suggestion.total_amount, total_sell
-        ));
-        report.push_str("  操作方向: 减仓，获利了结为主\n");
-    } else if buy_suggestion.total_amount > 0.0 {
-        report.push_str("  买入与卖出金额基本持平，维持当前仓位\n");
+        if plan.cash_constrained {
+            report.push_str("  注: 可用资金不足以补足全部缺口，已按缺口比例分配\n");
+        }
     } else {
-        report.push_str("  今日无操作建议，持有观望\n");
+        report.push_str("  今日无需调仓 —— 各类别偏离均在带宽内，持有即可。\n");
+        report.push_str("  这是正常状态：中长线框架下多数月份都不应有动作。\n");
     }
     report.push('\n');
 
@@ -246,52 +256,39 @@ pub fn generate_report(
         report.push('\n');
     }
 
-    // 资金分配预案
-    let sell_proceeds_for_plan: f64 = sell_suggestions.iter().map(|s| s.sell_amount).sum();
-    let effective_cash_for_plan = cash_balance + sell_proceeds_for_plan;
-
-    report.push_str("【资金分配预案】\n");
-    report.push_str("  若市场回调至不同区间的投入预案:\n");
-    if sell_proceeds_for_plan > 0.0 {
+    // 不同情绪区间下的目标仓位预案
+    report.push_str("【目标仓位预案】\n");
+    report.push_str("  情绪进入各区间时的风险资产目标权重:\n");
+    let zones = [
+        ("极度恐慌", format!("指数 < {:.0}", config.thresholds.extreme_fear), config.target_weight.extreme_fear),
+        ("恐慌", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.extreme_fear, config.thresholds.fear), config.target_weight.fear),
+        ("中性", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.fear, config.thresholds.neutral), config.target_weight.neutral),
+        ("贪婪", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.neutral, config.thresholds.greed), config.target_weight.greed),
+        ("极度贪婪", format!("指数 ≥ {:.0}", config.thresholds.greed), config.target_weight.extreme_greed),
+    ];
+    for (name, desc, weight) in &zones {
+        let value = plan.total_assets * weight / 100.0;
         report.push_str(&format!(
-            "  注: 预案基于可用资金 ¥{:.2}（现金 ¥{:.2} + 卖出回收 ¥{:.2}）\n",
-            effective_cash_for_plan, cash_balance, sell_proceeds_for_plan
+            "  · {} ({}): 目标 {:.0}% ≈ ¥{:.0}\n",
+            pad_display(name, 10),
+            desc,
+            weight,
+            value
         ));
     }
+    report.push('\n');
 
-    let zones = [
-        ("极度恐慌", config.thresholds.extreme_fear, config.buy_ratio.extreme_fear),
-        ("恐慌", config.thresholds.fear, config.buy_ratio.fear),
-        ("中性", config.thresholds.neutral, config.buy_ratio.neutral),
-        ("贪婪", config.thresholds.greed, config.buy_ratio.greed),
-    ];
-
-    for (i, (name, threshold, ratio)) in zones.iter().enumerate() {
-        let amount = effective_cash_for_plan * (ratio / 100.0);
-        // 极度恐慌: 指数 < threshold; 其他: 指数 < threshold 的该区间
-        let threshold_desc = if i == 0 {
-            format!("指数 < {:.0}", threshold)
-        } else {
-            format!("{:.0} ≤ 指数 < {:.0}", zones[i - 1].1, threshold)
-        };
-        if *ratio > 0.0 {
-            report.push_str(&format!(
-                "  · {}   ({}): 投入 ¥{:.2} ({:.0}%)\n",
-                name, threshold_desc, amount, ratio
-            ));
-            report.push_str(&format!(
-                "    - 美股 ¥{:.2} | A股 ¥{:.2} | 逆周期 ¥{:.2}\n",
-                amount * config.allocation.us_stocks / 100.0,
-                amount * config.allocation.cn_stocks / 100.0,
-                amount * config.allocation.counter_cyclical / 100.0,
-            ));
-        } else {
-            report.push_str(&format!(
-                "  · {}   ({}): 暂停买入，持有观望\n",
-                name, threshold_desc
-            ));
-        }
-    }
+    // 口径说明：让用户知道当前建议由什么信号驱动，以及其经检验的效果
+    report.push_str("【信号口径】\n");
+    report.push_str("  当前建议由「情绪锚（恐贪指数→目标仓位）」驱动。\n");
+    report.push_str(&format!(
+        "  回测显示改用「趋势锚（价格 vs {}月均线）+情绪倾斜」表现更好，\n",
+        12
+    ));
+    report.push_str("  但趋势锚需要至少 12 个月的本地价格历史；每次 `mns update-prices`\n");
+    report.push_str("  会累积一条快照，历史足够后可切换。运行 `mns backtest` 查看两者对比。\n");
+    report.push_str("  另需注意：回测中「情绪」信号在加入趋势锚后贡献接近于零。\n");
+    report.push('\n');
 
     report.push_str("\n═══════════════════════════════════════════════════\n");
 

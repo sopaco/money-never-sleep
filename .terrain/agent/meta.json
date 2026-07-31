@@ -1,0 +1,95 @@
+{
+  "project": "money-never-sleep",
+  "repo_path": ".",
+  "generator": "repomix-core",
+  "pack_strategy": "architecture-context",
+  "output_file": "repomix.md",
+  "total_files": 39,
+  "total_tokens": 101995,
+  "total_characters": 337519,
+  "top_files_by_tokens": [
+    {
+      "path": "litho.docs/策略回测引擎.md",
+      "tokens": 7122
+    },
+    {
+      "path": "src/config.rs",
+      "tokens": 6281
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/references/commands.md",
+      "tokens": 6252
+    },
+    {
+      "path": "litho.docs/4、深入探索/命令行接口.md",
+      "tokens": 5443
+    },
+    {
+      "path": "litho.docs/4、深入探索/核心策略引擎.md",
+      "tokens": 5247
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/references/strategy.md",
+      "tokens": 4978
+    },
+    {
+      "path": "litho.docs/4、深入探索/系统入口.md",
+      "tokens": 4921
+    },
+    {
+      "path": "litho.docs/4、深入探索/报告生成服务.md",
+      "tokens": 4879
+    },
+    {
+      "path": "litho.docs/4、深入探索/数据模型与持久化.md",
+      "tokens": 4785
+    },
+    {
+      "path": "src/backtest.rs",
+      "tokens": 4701
+    },
+    {
+      "path": "litho.docs/5、边界调用.md",
+      "tokens": 4304
+    },
+    {
+      "path": "src/db.rs",
+      "tokens": 4222
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/SKILL.md",
+      "tokens": 4119
+    },
+    {
+      "path": "litho.docs/自动价格获取模块.md",
+      "tokens": 4086
+    },
+    {
+      "path": "litho.docs/2、架构概览.md",
+      "tokens": 3873
+    },
+    {
+      "path": "litho.docs/1、项目概述.md",
+      "tokens": 3779
+    },
+    {
+      "path": "litho.docs/4、深入探索/外部数据获取.md",
+      "tokens": 3648
+    },
+    {
+      "path": "litho.docs/4、深入探索/配置管理.md",
+      "tokens": 3246
+    },
+    {
+      "path": "litho.docs/3、工作流程.md",
+      "tokens": 3244
+    },
+    {
+      "path": "README_zh.md",
+      "tokens": 1765
+    }
+  ],
+  "directory_structure": "distribution/\n  bin-darwin-arm64/\n    package.json\n  bin-linux-x64/\n    package.json\n  bin-mns-cli/\n    README.md\n    package.json\n  bin-win-x64/\n    package.json\n  skill/\n    money-never-sleep/\n      references/\n        commands.md\n        strategy.md\n      SKILL.md\nlitho.docs/\n  4、深入探索/\n    命令行接口.md\n    外部数据获取.md\n    报告生成服务.md\n    数据模型与持久化.md\n    核心策略引擎.md\n    系统入口.md\n    配置管理.md\n  1、项目概述.md\n  2、架构概览.md\n  3、工作流程.md\n  5、边界调用.md\n  6、数据库概览.md\n  策略回测引擎.md\n  自动价格获取模块.md\nsrc/\n  backtest.rs\n  cli.rs\n  config.rs\n  db.rs\n  main.rs\n  market.rs\n  metrics.rs\n  models.rs\n  quote.rs\n  report.rs\n  sentiment.rs\n  strategy.rs\nAGENTS.md\nCargo.toml\nLICENSE\nREADME.md\nREADME_zh.md",
+  "synced_at": "2026-07-31T14:31:58.553406+00:00",
+  "baseline_git_head": "393855ae14f9b33f7b9c98a5c57550eb4f8b8b58"
+}
