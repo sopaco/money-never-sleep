@@ -4,7 +4,7 @@
 > 克服人性弱点，系统化执行"在恐慌中贪婪，在贪婪中恐慌"
 
 <p align="center">
-    <a href="https://github.com/sopaco/money-never-sleep/tree/main/litho.docs"><img alt="Litho Docs" src="https://img.shields.io/badge/Litho-Docs-green?logo=Gitbook&color=%23008a60"/></a>
+    <a href="https://github.com/sopaco/money-never-sleep/tree/main/.terrain/human"><img alt="Litho Docs" src="https://img.shields.io/badge/Litho-Docs-green?logo=Gitbook&color=%23008a60"/></a>
     <a href="http://clawhub.ai/sopaco/money-never-sleep"><img alt="ClawHub" src="https://img.shields.io/badge/ClawHub-Certified-blue"/></a>
     <a href="https://github.com/openclaw/openclaw"><img alt="OpenClaw Compatible" src="https://img.shields.io/badge/OpenClaw-Compatible-brightgreen"/></a>
 </p>
