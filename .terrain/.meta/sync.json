@@ -1,0 +1,9 @@
+{
+  "project": "money-never-sleep",
+  "repo_path": ".",
+  "synced_at": "2026-07-31T14:31:58.554047+00:00",
+  "collectors": [
+    "git",
+    "repomix"
+  ]
+}

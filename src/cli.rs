@@ -142,6 +142,15 @@ pub enum BacktestAction {
         #[arg(short, long)]
         compare: Option<String>,
     },
+    /// 样本外验证：walk-forward 调参 + 分块 bootstrap 分布 + holdout 区块
+    Validate {
+        /// bootstrap 重采样次数
+        #[arg(long, default_value = "2000")]
+        iterations: usize,
+        /// 分块长度（月），保留短期自相关
+        #[arg(long, default_value = "6")]
+        block: usize,
+    },
     /// 查看可调参数列表
     Params,
 }

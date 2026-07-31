@@ -1,0 +1,160 @@
+{
+  "files": [
+    {
+      "path": "src/main.rs",
+      "header_line": 83
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/SKILL.md",
+      "header_line": 175
+    },
+    {
+      "path": "Cargo.toml",
+      "header_line": 412
+    },
+    {
+      "path": "distribution/bin-mns-cli/package.json",
+      "header_line": 435
+    },
+    {
+      "path": "distribution/bin-darwin-arm64/package.json",
+      "header_line": 473
+    },
+    {
+      "path": "distribution/bin-linux-x64/package.json",
+      "header_line": 505
+    },
+    {
+      "path": "distribution/bin-win-x64/package.json",
+      "header_line": 537
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/references/strategy.md",
+      "header_line": 569
+    },
+    {
+      "path": "README.md",
+      "header_line": 973
+    },
+    {
+      "path": "distribution/skill/money-never-sleep/references/commands.md",
+      "header_line": 1103
+    },
+    {
+      "path": "src/backtest.rs",
+      "header_line": 1706
+    },
+    {
+      "path": "src/cli.rs",
+      "header_line": 2298
+    },
+    {
+      "path": "src/config.rs",
+      "header_line": 2456
+    },
+    {
+      "path": "AGENTS.md",
+      "header_line": 3069
+    },
+    {
+      "path": "src/quote.rs",
+      "header_line": 3112
+    },
+    {
+      "path": "src/report.rs",
+      "header_line": 3168
+    },
+    {
+      "path": "src/sentiment.rs",
+      "header_line": 3196
+    },
+    {
+      "path": "src/models.rs",
+      "header_line": 3255
+    },
+    {
+      "path": "src/db.rs",
+      "header_line": 3362
+    },
+    {
+      "path": "src/strategy.rs",
+      "header_line": 3786
+    },
+    {
+      "path": "README_zh.md",
+      "header_line": 4030
+    },
+    {
+      "path": "LICENSE",
+      "header_line": 4156
+    },
+    {
+      "path": "distribution/bin-mns-cli/README.md",
+      "header_line": 4182
+    },
+    {
+      "path": "src/market.rs",
+      "header_line": 4219
+    },
+    {
+      "path": "litho.docs/1、项目概述.md",
+      "header_line": 4263
+    },
+    {
+      "path": "litho.docs/2、架构概览.md",
+      "header_line": 4489
+    },
+    {
+      "path": "litho.docs/3、工作流程.md",
+      "header_line": 4732
+    },
+    {
+      "path": "litho.docs/4、深入探索/命令行接口.md",
+      "header_line": 5032
+    },
+    {
+      "path": "litho.docs/4、深入探索/外部数据获取.md",
+      "header_line": 5447
+    },
+    {
+      "path": "litho.docs/4、深入探索/报告生成服务.md",
+      "header_line": 5773
+    },
+    {
+      "path": "litho.docs/4、深入探索/数据模型与持久化.md",
+      "header_line": 6081
+    },
+    {
+      "path": "litho.docs/4、深入探索/核心策略引擎.md",
+      "header_line": 6331
+    },
+    {
+      "path": "litho.docs/4、深入探索/系统入口.md",
+      "header_line": 6668
+    },
+    {
+      "path": "litho.docs/4、深入探索/配置管理.md",
+      "header_line": 6990
+    },
+    {
+      "path": "litho.docs/5、边界调用.md",
+      "header_line": 7279
+    },
+    {
+      "path": "litho.docs/6、数据库概览.md",
+      "header_line": 7803
+    },
+    {
+      "path": "litho.docs/策略回测引擎.md",
+      "header_line": 7986
+    },
+    {
+      "path": "litho.docs/自动价格获取模块.md",
+      "header_line": 8656
+    },
+    {
+      "path": "src/metrics.rs",
+      "header_line": 9067
+    }
+  ]
+}

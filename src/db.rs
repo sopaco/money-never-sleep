@@ -49,6 +49,13 @@ impl Database {
                 tx_date TEXT NOT NULL,
                 note TEXT
             );
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_code TEXT NOT NULL,
+                price REAL NOT NULL,
+                price_date TEXT NOT NULL,
+                UNIQUE(asset_code, price_date)
+            );
             CREATE TABLE IF NOT EXISTS fear_greed_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 score REAL NOT NULL,
@@ -286,7 +293,42 @@ impl Database {
         if rows == 0 {
             anyhow::bail!("未找到资产: {}", code);
         }
+        self.record_price(code, price)?;
         Ok(())
+    }
+
+    /// 记录当日价格快照。趋势锚点（价格 vs N月均线）需要历史序列，
+    /// 而旧表结构只存 current_price，无法回溯，故单独累积。
+    /// 同一天重复调用只保留最新值。
+    pub fn record_price(&self, code: &str, price: f64) -> Result<()> {
+        if price <= 0.0 {
+            return Ok(());
+        }
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        self.conn.execute(
+            "INSERT INTO price_history (asset_code, price, price_date) VALUES (?, ?, ?)
+             ON CONFLICT(asset_code, price_date) DO UPDATE SET price = excluded.price",
+            params![code, price, today],
+        )?;
+        Ok(())
+    }
+
+    /// 取某标的的月末价格序列（升序），用于趋势判断。
+    /// 目前仅在本地历史累积满 12 个月后才会被实时报告启用。
+    #[allow(dead_code)]
+    pub fn monthly_price_history(&self, code: &str) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT substr(price_date, 1, 7) AS ym, price FROM price_history
+             WHERE asset_code = ?
+             GROUP BY ym HAVING price_date = MAX(price_date)
+             ORDER BY ym",
+        )?;
+        let rows = stmt.query_map([code], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn remove_position(&self, code: &str) -> Result<()> {
