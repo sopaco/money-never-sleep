@@ -90,6 +90,6 @@
     }
   ],
   "directory_structure": "distribution/\n  bin-darwin-arm64/\n    package.json\n  bin-linux-x64/\n    package.json\n  bin-mns-cli/\n    README.md\n    package.json\n  bin-win-x64/\n    package.json\n  skill/\n    money-never-sleep/\n      SKILL.md\nsrc/\n  backtest.rs\n  cli.rs\n  config.rs\n  db.rs\n  main.rs\n  market.rs\n  metrics.rs\n  models.rs\n  quote.rs\n  report.rs\n  sentiment.rs\n  strategy.rs\nAGENTS.md\nCLAUDE.md\nCargo.toml\nLICENSE\nREADME.md\nREADME_zh.md",
-  "synced_at": "2026-08-01T00:02:10.585078+00:00",
-  "baseline_git_head": "64ba3448480d32441bf8bb3434e959ce5ae698d8"
+  "synced_at": "2026-08-01T00:08:32.338580+00:00",
+  "baseline_git_head": "de04626709e7918a258d071cabe257b1a52f2ecd"
 }
