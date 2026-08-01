@@ -4,9 +4,9 @@
   "generator": "repomix-core",
   "pack_strategy": "architecture-context",
   "output_file": "repomix.md",
-  "total_files": 23,
-  "total_tokens": 33078,
-  "total_characters": 108914,
+  "total_files": 24,
+  "total_tokens": 33105,
+  "total_characters": 109019,
   "top_files_by_tokens": [
     {
       "path": "src/config.rs",
@@ -89,7 +89,7 @@
       "tokens": 242
     }
   ],
-  "directory_structure": "distribution/\n  bin-darwin-arm64/\n    package.json\n  bin-linux-x64/\n    package.json\n  bin-mns-cli/\n    README.md\n    package.json\n  bin-win-x64/\n    package.json\n  skill/\n    money-never-sleep/\n      SKILL.md\nsrc/\n  backtest.rs\n  cli.rs\n  config.rs\n  db.rs\n  main.rs\n  market.rs\n  metrics.rs\n  models.rs\n  quote.rs\n  report.rs\n  sentiment.rs\n  strategy.rs\nAGENTS.md\nCargo.toml\nLICENSE\nREADME.md\nREADME_zh.md",
-  "synced_at": "2026-07-31T15:55:58.116071+00:00",
-  "baseline_git_head": "cd65da5b0236e52fc51020ec63a3b25918026bf8"
+  "directory_structure": "distribution/\n  bin-darwin-arm64/\n    package.json\n  bin-linux-x64/\n    package.json\n  bin-mns-cli/\n    README.md\n    package.json\n  bin-win-x64/\n    package.json\n  skill/\n    money-never-sleep/\n      SKILL.md\nsrc/\n  backtest.rs\n  cli.rs\n  config.rs\n  db.rs\n  main.rs\n  market.rs\n  metrics.rs\n  models.rs\n  quote.rs\n  report.rs\n  sentiment.rs\n  strategy.rs\nAGENTS.md\nCLAUDE.md\nCargo.toml\nLICENSE\nREADME.md\nREADME_zh.md",
+  "synced_at": "2026-08-01T00:02:10.585078+00:00",
+  "baseline_git_head": "64ba3448480d32441bf8bb3434e959ce5ae698d8"
 }

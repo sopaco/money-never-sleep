@@ -5,112 +5,101 @@ title: Agent Architecture Context
 source: .
 ---
 
-## 项目概览
-
-MNS（Money Never Sleeps）是面向个人投资者的**逆向投资决策助手**：本地单文件 CLI（Rust 静态二进制 v0.6.0）。不连接券商、不执行交易，只做「恐慌时提醒贪婪，贪婪时提醒恐慌」——拉取 CNN 恐贪指数 → 对照「目标仓位+偏离带」再平衡纪律 → 输出每日调仓建议（`mns report`），并用 2016–2025 真实全收益数据离线回测验证策略。
-
-**消费方**：CLI 用户、Coding/Ask Agents。Agent 操作手册唯一权威：`distribution/skill/money-never-sleep/SKILL.md`。
-**关键约束**：`mns buy/sell` 是登记已成交交易（记账非下单，无撤销）；报告是规则引擎机械输出、非投资建议；数字只能来自命令输出，不可编造。数据本地化 `~/.mns/`，无远程服务端。
-
 ## 架构设计
 
-**四层分层架构**（单入口多出口，依赖倒置 + 适配器 + 策略模式）：
+单二进制、单进程、无服务端。命令进入 → 处理函数直接调用各模块（无独立服务层、无 trait 抽象，函数式组织）。
 
-| 层 | 容器 | 职责 |
+| 层 | 容器/职责 | 关键依赖 |
 |---|---|---|
-| 工具支持层 | `src/main.rs`、`src/cli.rs` | 启动、tokio 异步调度、clap 命令路由（17 顶级命令）、Fail-fast 初始化、anyhow 错误封装 |
-| 基础设施层 | `config.rs`、`db.rs`、`models.rs`、`sentiment.rs`、`quote.rs`、`market.rs` | 配置加载/校验/读写、SQLite 事务持久化（5 表）、领域实体、外部行情 API 适配 |
-| 核心业务层 | `strategy.rs`、`report.rs`、`backtest.rs`、`metrics.rs` | 调仓计划计算、日报编排渲染、离线回测引擎、金融绩效指标 |
-| 外部系统 | CNN FGI、天天基金、Yahoo Finance、东方财富 | 情绪与价格数据源（仅出站只读） |
+| CLI 入口层 | `cli.rs` 定义 clap 命令树；`main.rs` 分发 17 个命令到处理函数 | clap 4 (derive) |
+| 决策引擎层 | `strategy.rs` 计算买卖/风控/再平衡；`config.rs` 情绪区间→目标权重映射 | 纯函数 |
+| 数据层 | `db.rs` SQLite 账本（现金/持仓/交易/价格历史/恐贪快照）；`models.rs` 领域模型 | rusqlite (bundled) |
+| 数据采集层 | `sentiment.rs` 拉取 CNN 恐贪指数；`quote.rs` 拉价格（国内基金/美股分源）；`market.rs` 指数与个股报价 | reqwest (rustls), serde_json |
+| 分析层 | `backtest.rs` 四引擎回测（内嵌 2016-2025 真实全收益月度数据）；`metrics.rs` XIRR/回撤/风险指标/自助抽样 | 离线 |
+| 报告层 | `report.rs` 渲染文本报告并存盘 | comfy-table |
 
-**关键模式**：依赖倒置（业务层依赖数据模型/函数签名，不碰 DB/HTTP）；外观（`main.rs` 统一调度）；适配器（`sentiment/quote` 封装外部 API 返回统一结构）；策略模式（`Engine` 枚举 + 配置驱动决策）；FIFO 批次 + 阶梯赎回费成本模型；嵌入式历史数据集（编译期内置 CSV，回测离线可跑）；事务性（`db.rs` 单事务保证账实一致）。
-
-**数据流**：`main.rs` → 基础设施层取数 → `strategy.rs` 计算建议 → `report.rs` 渲染落盘；`backtest.rs` 独立闭环，不碰账本、不发网络。
+数据流方向：**采集层 → 决策引擎层（依赖 config + db）→ 报告层 → 落盘**；回测引擎**独立于账本**，复用 `config.rs` 的成本模型与策略规则。UI 全部为终端文本表。
 
 ## 模块地图
 
 | 模块 | 职责 | 主要路径 |
 |---|---|---|
-| 系统入口 | init/config/init 化、异步调度、21 个 `cmd_*` 处理器 | `src/main.rs` |
-| CLI 接口 | clap v4 derive 命令树（17 顶级命令）与参数解析 | `src/cli.rs` |
-| 配置管理 | `AppConfig` 加载/校验/点路径读写（`mns config`）、目标权重曲线、再平衡/成本参数 | `src/config.rs` |
-| 数据持久化 | SQLite 连接、原子事务、5 表 CRUD（cash/positions/transactions/price_history/fear_greed_snapshots）、按日去重 | `src/db.rs` |
-| 数据模型 | `Position`/`Transaction`/`FearGreedSnapshot` 实体与收益率计算 | `src/models.rs` |
-| 策略引擎 | 五区间情绪 → 目标权重、三腿调仓计划、买/卖建议、风险预警、亏损标的接飞刀过滤 | `src/strategy.rs` |
-| 报告生成 | 中文日报渲染（comfy-table）、`save_report` 落盘 `reports/YYYY-MM-DD.txt` | `src/report.rs` |
-| 回测引擎 | 4 引擎对比（目标仓位/旧框架/买入持有/买入持有+年度再平衡）、FIFO+阶梯赎回费、样本外验证+bootstrap | `src/backtest.rs` |
-| 指标计算 | XIRR、最大回撤、均值/方差/下行偏差、Sharpe/Sortino/Calmar | `src/metrics.rs` |
-| 情绪获取 | CNN FGI API 适配、历史值解析、快照入库 | `src/sentiment.rs` |
-| 价格获取 | 天天基金 JSONP / Yahoo v8 / 东财 mobile 多源路由与全持仓自动更新 | `src/quote.rs` |
-| 市场行情 | 全球指数、个股/ETF 报价、附加分析 | `src/market.rs` |
+| cli | clap 命令树：init/config/cash/portfolio/add/buy/sell/price/remove/sentiment/report/history/backtest/update-prices/market/market-indices/analyze | src/cli.rs |
+| main | 命令处理函数、各命令编排（init/cash/portfolio/buy/sell/report/backtest 等） | src/main.rs |
+| config | AppConfig 全量配置、TOML 载入/保存、校验（单调性/配置和=100%）、dot-path get/set、情绪区间/目标权重/三腿拆分/费用曲线 | src/config.rs |
+| db | SQLite 账本：现金、持仓（加权平均成本、事务化买卖）、交易、price_history、fear_greed_snapshots | src/db.rs |
+| models | Position（市值/年化/绝对收益）、Transaction、FearGreedSnapshot | src/models.rs |
+| sentiment | CNN 恐贪指数拉取（重试/反爬 418）、JSON 解析、历史对照值、快照入库 | src/sentiment.rs |
+| quote | 价格采集：国内基金（东方财富移动/天天基金）、美股（Yahoo）、按类别路由、update_all_prices | src/quote.rs |
+| market | 全球指数/个股报价（Yahoo），供 market/market-indices/analyze | src/market.rs |
+| strategy | 买入/卖出建议（逆向权重上限、卖出回款计入买入预算）、风险预警、目标仓位+偏离带再平衡计划、宽基识别 | src/strategy.rs |
+| report | 渲染含【市场情绪/账户概览/调仓计划/净操作指引/目标仓位预案/信号口径】的报告并写入 reports/ | src/report.rs |
+| backtest | 内嵌数据集解析、四引擎（目标仓位/旧框架/买入持有/买入持有+再平衡）、FIFO 批次卖出、阶梯赎回费、按月流入、回测 validate（block bootstrap+holdout） | src/backtest.rs |
+| metrics | XIRR、最大回撤、Sharpe/Sortino/Calmar、下行偏差、block bootstrap + 分位数 | src/metrics.rs |
+| distribution | Agent 操作手册 SKILL、各平台 npm 预编译包（darwin/linux/win x64） | distribution/ |
 
 ## 核心流程
 
-**1. 每日报告（`mns report`）** — 需网络
-1. 加载配置 + DB 现金/持仓
-2. `sentiment::fetch_fear_greed_data()` 拉取恐贪指数（0–100），按日去重存快照
-3. 情绪落五区间（极度恐慌<30/恐慌/中性/贪婪/极度贪婪≥70）→ `target_weight` 曲线得风险资产目标总权重（默认 85/75/60/45/35%）
-4. 按 `allocation` 拆三条腿（us_stocks/cn_stocks/counter_cyclical），实际 vs 目标，偏离超带（默认 4pp）才建议且只补到目标
-5. 风险预警 + 卖出建议（年化/绝对收益达阈值，最短持有 30 天）→ `generate_report` 渲染 → 写盘
+**① 每日报告 `mns report`（决策闭环）**
+1. 拉取 CNN 恐贪指数（失败内置重试），评分快照写入 `fear_greed_snapshots`
+2. 情绪评分 → `config.sentiment_zone`/`target_weight_for` 得风险资产目标总权重，按 `sleeve_split` 拆三腿（美股/A股/逆周期）
+3. 先算卖出建议（年化收益达标/绝对收益≥30% 双止盈，受最短持有天数与阶梯赎回费约束），卖出回款并入买入预算
+4. 再算买入建议（按权重上限逆向加仓，深度浮亏个股排除、宽基指数例外）、风险预警
+5. 生成 `RebalancePlan`：每腿实际 vs 目标权重，偏离超 `band_pp`（默认 4pp）才动作，现金不足按比例缩减
+6. `generate_report` 渲染六章节并保存 `reports/YYYY-MM-DD.txt`；**"不动作"是正常健康输出**
 
-**2. 交易记账（`mns add/buy/sell/cash`）** — 本地原子事务
-1. `add` 建持仓池条目（份额 0），`buy/sell` 校验现金充足/份额足够，`cash add` 注资
-2. 单事务内：更新 positions 成本 → 更新 cash → 追加 transactions → commit
-3. 语义：登记用户已在券商完成的交易，不是下单；无撤销命令，错误记账须人工纠正
+**② 记账 `mns buy/sell`（用户已成交后登记）**
+1. 校验：标的已 add、份额/价格为正、现金足够（买）或份额不超持有（卖）
+2. 单一 SQLite 事务内：更新持仓（买入加权平均成本价；卖出减份额）→ 更新现金 → 插入 transactions
+3. `mns buy/sell` 严禁依据 report 建议调用——会静默污染现金、成本价、持有天数与后续所有建议
 
-**3. 自动价格更新（`mns update-prices`）** — 需网络
-1. `list_positions()` 取全部持仓
-2. 按代码格式路由：6 位数字 → 天天基金（东财 mobile 回退）；字母 → Yahoo v8
-3. 逐个 `fetch_price()` → `update_position_price()`（含 price_history 记录），单资产失败跳过继续
+**③ 价格刷新 `mns update-prices`**
+1. 遍历全部持仓，按类别路由：国内基金 → 东方财富/天天基金净值，美股 → Yahoo
+2. 更新 `current_price` 并写入 `price_history`（按 asset_code+date 去重 upsert）；单标的失败跳过不中断
 
-**4. 策略回测（`mns backtest` / `backtest validate`）** — 纯离线
-1. 加载嵌入式月度数据（恐贪指数 + 纳指/红利低波/黄金，2016-01–2025-04，默认本金 10 万 + 年流入 5 万）
-2. 4 引擎同数据同成本模型对比（目标仓位+偏离带 / 旧现金比例框架 / 买入持有 / 买入持有+年度再平衡）
-3. `backtest validate` 样本外 holdout + bootstrap 收益分布（`--iterations/--block`），`backtest params` 列可调参数
+**④ 回测 `mns backtest`（离线，不动账本）**
+1. 解析内嵌月度数据集（2016-2025 真实全收益，三腿价格+FGI）为主集+holdout
+2. 依次跑四引擎，均复用同一成本模型（买/卖费、阶梯赎回费、现金年化收益）与 `SignalConfig`（情绪锚/趋势锚）
+3. `finalize` 出 XIRR/最大回撤/Calmar/交易频率，`print_comparison` 横向对比
+4. `backtest validate` 用 block bootstrap 给收益分布 + holdout 样本外验证
+5. 转述结论必须带限定：收益不敌买入持有、优势在风险调整、FGI 边际贡献近零、长期熊市未覆盖
 
 ## 技术选型
 
-- **语言/构建**：Rust edition 2024，单一静态二进制（无运行时依赖），跨 darwin/linux/win，`.cargo/config.toml`
-- **CLI**：clap v4（derive）+ tokio 全特性异步运行时
-- **HTTP**：reqwest 0.12（rustls-tls，无 OpenSSL），浏览器 UA + Referer 反爬规避
-- **配置**：TOML + serde → `AppConfig`，写入前校验（如权重曲线单调性、分配和=100%）
-- **持久化**：rusqlite 0.39（bundled），SQLite ACID 事务，加权平均成本 + FIFO
-- **时间**：chrono（serde feature）；**输出**：comfy-table + unicode-width
-- **错误处理**：anyhow + Context，用户可读中文错误；**路径**：dirs 定位 `~/.mns/`
-- **打包分发**：npm 分平台预编译包（`distribution/bin-*`），Agent 手册独立 skill（`distribution/skill/`）
+- **语言/工具链**：Rust edition 2024；`cargo build --release` 产单静态二进制（无运行时依赖）
+- **CLI**：clap 4（derive）17 子命令
+- **异步/网络**：tokio 1 + reqwest 0.12（default-features off，rustls-tls，无 openssl）
+- **数据**：rusqlite 0.39 bundled（零编译期系统依赖）、toml 1.1、chrono 0.4（serde）
+- **序列化**：serde / serde_json
+- **输出**：comfy-table 7、unicode-width（中文对齐）
+- **错误**：anyhow + 非零退出码 + `Error: 中文原因`；配置校验在写入前拒绝
+- **分发**：cargo 交叉编译 + npm 包装（`@never-sleeps/mns-cli`），darwin-arm64/linux-x64/win-x64 预编译包
+- **测试**：模块内 `#[cfg(test)]` 单元测试（配置校验、FIFO、成本模型、指标、数据集完整性），无集成测试框架
+- **回测**：内嵌数据集（离线可用），block bootstrap 用自实现 xorshift RNG
 
 ## 系统边界
 
-**外部 API（仅出站只读，无认证）**
-- CNN Fear & Greed：`production.dataviz.cnn.io/index/fearandgreed/graphdata` — 恐贪指数；需浏览器 UA + Referer 规避 418
-- 天天基金：`fundgz.1234567.com.cn/js/{code}.js` — 6 位国内基金净值（JSONP）
-- Yahoo Finance v8：`query1.finance.yahoo.com/v8/finance/chart/{symbol}` — 美股/ETF/指数（部分网络环境不可用）
-- 东方财富 mobile — 国内基金回退源
-
-**本地存储（信任边界）**
-- `~/.mns/config.toml` — 策略参数/API 端点/路径；加载与写入双校验，非法值拒绝写入
-- `~/.mns/mns.db` — SQLite 5 表；`price_history` 按 (asset_code, price_date) 唯一，`fear_greed_snapshots` 按日去重
-- `reports/YYYY-MM-DD.txt` — 每日中文报告存档
-
-**信任与安全约束**：零券商连接、零交易执行；外部价格直接采信（仅解析校验）；配置即策略（改配置不改码）；回测局限诚实披露——买入持有年化（14.60%）优于策略（12.75%），策略价值仅在风险调整后（回撤 10.9% vs 14.9%，Calmar 1.17 vs 0.98），且 2000–2002/2008 熊市未覆盖。
+- **外部 API（拉取，只读）**：CNN 恐贪指数 `production.dataviz.cnn.io/fearandgreed/graphdata`（可能 418 反爬，有重试）；Yahoo Finance（美股报价/全球指数/analyze，部分网络 403 被拦截，属环境限制）；东方财富/天天基金（国内基金净值）。**无任何写向外部**的调用
+- **本地持久化**：`~/.mns/config.toml`、`~/.mns/mns.db`（SQLite 单文件，多进程并发写会锁库，命令须串行）、`./reports/`
+- **信任边界**：不连券商、不下单、无多用户；外部价格/指数视为账本记价依据；恐贪指数是策略唯一情绪输入
+- **故障模式**：网络失败不得用旧指数伪装当日数据；个别标的抓价失败可手工 `mns price`；金额/份额错误靠 `portfolio`/`history` 核对（无撤销命令）
 
 ## 代码映射索引
 
 | 概念 | 位置 | 备注 |
 |---|---|---|
-| 入口与命令路由 | `src/main.rs` | 21 个 `cmd_*`，init/config/调度 |
-| 命令树定义 | `src/cli.rs` | clap derive，17 顶级命令 |
-| 配置模型与校验 | `src/config.rs` | `TargetWeight`/`Rebalance`/`Costs`/`Thresholds` 等 |
-| SQLite 连接与 CRUD | `src/db.rs` | 5 表 init_tables、事务、去重快照 |
-| 领域实体 | `src/models.rs` | Position/Transaction 与年化/绝对收益计算 |
-| 调仓计划与建议 | `src/strategy.rs` | `RebalancePlan`/`BuySuggestion`/`SellSuggestion`/`RiskWarning` |
-| 报告渲染与存盘 | `src/report.rs` | `generate_report`/`save_report` |
-| 回测引擎 | `src/backtest.rs` | `Engine` 枚举、`SignalConfig`、嵌入式月度数据 |
-| 金融指标 | `src/metrics.rs` | `xirr`/`max_drawdown`/`risk_metrics` |
-| 恐贪指数适配 | `src/sentiment.rs` | CNN 拉取/解析/历史值提取 |
-| 价格多源适配 | `src/quote.rs` | `fetch_price` 按代码路由、`update_all_prices` |
-| 市场行情 | `src/market.rs` | `fetch_market_indices`/`fetch_stock_quote` |
-| Agent 操作手册（权威） | `distribution/skill/money-never-sleep/SKILL.md` | 命令语法与策略语义唯一权威 |
-| 打包与分发 | `distribution/bin-*/` | npm 分平台预编译包 |
-| 人类可读文档 | `litho.docs/`、`.terrain/human/` | 架构/流程/边界/数据库/回测详解 |
-| Agent 参考材料 | `.ai-context/SKILL.md`、`.ai-context/DYNAMICS.md` | 历史工程上下文与动力学文档 |
+| 命令树定义 | src/cli.rs | clap derive；backtest 子命令 Run/Validate/Params |
+| 命令分发/编排 | src/main.rs | cmd_* 处理函数 |
+| 配置模型/默认曲线/校验/dot-path | src/config.rs | `target_weight_for`/`asset_target_weights`/`validate`/`get_value`/`set_value` |
+| 账本存取 | src/db.rs | `Database`；买卖为事务化；`init_tables` 建 5 张表 |
+| 领域模型 | src/models.rs | Position/Transaction/FearGreedSnapshot |
+| 恐贪指数采集 | src/sentiment.rs | `fetch_fear_greed_data`/`parse_cnn_response` |
+| 价格采集（多源路由） | src/quote.rs | eastmoney/tiantian/yahoo；`fetch_price(code, category)` |
+| 指数/个股报价 | src/market.rs | 依赖 Yahoo，环境受限 |
+| 建议与再平衡引擎 | src/strategy.rs | buy/sell/risk/rebalance 计算 + 测试用例 |
+| 报告渲染/落盘 | src/report.rs | `generate_report`/`save_report` |
+| 回测引擎与数据集 | src/backtest.rs | `Engine`/`SignalConfig`/`State`/FIFO 批次卖出/validate |
+| 风险指标/自助抽样 | src/metrics.rs | xirr/max_drawdown/risk_metrics/block_bootstrap |
+| Agent 操作手册 | distribution/skill/money-never-sleep/SKILL.md | 硬约束、命令速查、故障模式 |
+| npm 分发 | distribution/bin-{darwin-arm64,linux-x64,win-x64}/ | 平台预编译包 |
+| 依赖清单 | Cargo.toml | 版本 0.6.0，edition 2024 |

@@ -1,96 +1,100 @@
 {
   "files": [
     {
-      "path": "src/main.rs",
-      "header_line": 64
+      "path": "distribution/skill/money-never-sleep/SKILL.md",
+      "header_line": 65
     },
     {
-      "path": "distribution/skill/money-never-sleep/SKILL.md",
-      "header_line": 156
+      "path": "src/main.rs",
+      "header_line": 323
     },
     {
       "path": "Cargo.toml",
-      "header_line": 414
+      "header_line": 415
     },
     {
       "path": "distribution/bin-mns-cli/package.json",
-      "header_line": 437
+      "header_line": 440
     },
     {
       "path": "README.md",
-      "header_line": 475
+      "header_line": 478
     },
     {
       "path": "distribution/bin-darwin-arm64/package.json",
-      "header_line": 605
+      "header_line": 608
     },
     {
       "path": "distribution/bin-linux-x64/package.json",
-      "header_line": 637
+      "header_line": 640
     },
     {
       "path": "distribution/bin-win-x64/package.json",
-      "header_line": 669
+      "header_line": 672
     },
     {
       "path": "src/backtest.rs",
-      "header_line": 701
+      "header_line": 704
     },
     {
       "path": "src/cli.rs",
-      "header_line": 1293
+      "header_line": 1296
     },
     {
       "path": "src/config.rs",
-      "header_line": 1451
+      "header_line": 1454
     },
     {
       "path": "AGENTS.md",
-      "header_line": 2064
+      "header_line": 2067
     },
     {
       "path": "src/quote.rs",
-      "header_line": 2199
+      "header_line": 2202
     },
     {
       "path": "src/report.rs",
-      "header_line": 2255
+      "header_line": 2258
     },
     {
       "path": "src/sentiment.rs",
-      "header_line": 2283
+      "header_line": 2286
     },
     {
       "path": "README_zh.md",
-      "header_line": 2342
+      "header_line": 2345
     },
     {
       "path": "src/db.rs",
-      "header_line": 2468
+      "header_line": 2471
     },
     {
       "path": "src/models.rs",
-      "header_line": 2892
+      "header_line": 2895
     },
     {
       "path": "src/strategy.rs",
-      "header_line": 2999
+      "header_line": 3002
     },
     {
       "path": "src/market.rs",
-      "header_line": 3243
+      "header_line": 3246
+    },
+    {
+      "path": "CLAUDE.md",
+      "header_line": 3290
     },
     {
       "path": "LICENSE",
-      "header_line": 3287
+      "header_line": 3296
     },
     {
       "path": "distribution/bin-mns-cli/README.md",
-      "header_line": 3313
+      "header_line": 3322
     },
     {
       "path": "src/metrics.rs",
-      "header_line": 3350
+      "header_line": 3359
     }
   ]
 }
