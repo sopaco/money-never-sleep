@@ -37,6 +37,8 @@ source: .
     - config.toml
   - .gitignore
   - README_zh.md
+  - .github/
+    - workflows/
   - AGENTS.md
   - CLAUDE.md
   - .codegraph/
