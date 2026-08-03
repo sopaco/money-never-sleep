@@ -30,7 +30,6 @@ source: .
     - bin-mns-cli/
     - bin-darwin-arm64/
   - .claude/
-    - scheduled_tasks.lock
     - skills/
   - Cargo.lock
   - README.md
