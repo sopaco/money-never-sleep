@@ -111,3 +111,4 @@ MNS 是一套运行在本机的**个人投资决策 CLI 工具**（Rust 单二�
 | 内嵌数据集 | `src/backtest.rs` | 2016–2025 真实全收益 |
 | Agent 操作手册 | `distribution/skill/money-never-sleep/SKILL.md` | 硬约束/工作流/故障表 |
 | 知识资产 | `.terrain/human/`、`.ai-context/`、`AGENTS.md` | 人类文档与 Agent 指南 |
+```
