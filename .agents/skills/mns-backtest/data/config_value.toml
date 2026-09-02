@@ -18,6 +18,21 @@ fear = 40.0
 neutral = 55.0
 greed = 75.0
 
+# "等待极端机会" → 更宽的偏离带([rebalance] band_pp)让中间区间几乎不动仓，
+# 只在真正的极端行情触发调仓。驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+[target_weight]
+extreme_fear = 88.0
+fear = 72.0
+neutral = 62.0
+greed = 48.0
+extreme_greed = 28.0
+
+[rebalance]
+band_pp = 6.0                 # 更宽的偏离带：非极端行情下按兵不动
+min_trade_amount = 500.0
+min_holding_days_for_sell = 60
+
+# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
 [buy_ratio]
 extreme_fear = 70.0           # 极度恐慌大仓买入
 fear = 40.0

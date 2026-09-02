@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{Datelike, Local};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS};
+use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use std::fs;
 use std::path::Path;
 
@@ -75,7 +75,14 @@ pub fn generate_report(
     report.push_str("\n\n");
 
     // 账户概览
-    let total_mv: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum();
+    // `.sum()` 在空迭代器（无持仓）上返回 -0.0（IEEE 754 加法恒等元的符号），
+    // 数值上等于 0.0 不影响后续计算，但 "{:.2}" 会原样打印成 "¥-0.00" 误导用户，
+    // 因此用 "+ 0.0" 归一化符号（-0.0 + 0.0 == 0.0，对非零值无影响）。
+    let total_mv: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     let total_assets = cash_balance + total_mv;
     let today_date = today.date_naive();
 
@@ -103,7 +110,9 @@ pub fn generate_report(
         ]);
 
         for pos in positions {
-            let ann_str = match pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days) {
+            let ann_str = match pos
+                .annualized_return_with_min_days(&today_date, config.settings.min_holding_days)
+            {
                 Some(r) => format!("{:+.1}%", r * 100.0),
                 None => "N/A".to_string(),
             };
@@ -118,7 +127,9 @@ pub fn generate_report(
 
             // 年化收益单元格着色
             let mut ann_cell = Cell::new(&ann_str);
-            if let Some(r) = pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days) {
+            if let Some(r) =
+                pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days)
+            {
                 if r * 100.0 >= config.settings.annualized_target_high {
                     ann_cell = ann_cell.fg(Color::Green);
                 } else if r < 0.0 {
@@ -179,7 +190,11 @@ pub fn generate_report(
         };
         let mut drift_cell = Cell::new(format!("{:+.1}pp", leg.drift_pp));
         if leg.drift_pp.abs() > plan.band_pp {
-            drift_cell = drift_cell.fg(if leg.drift_pp > 0.0 { Color::Red } else { Color::Green });
+            drift_cell = drift_cell.fg(if leg.drift_pp > 0.0 {
+                Color::Red
+            } else {
+                Color::Green
+            });
         }
         plan_table.add_row(vec![
             Cell::new(&leg.category_cn),
@@ -203,7 +218,11 @@ pub fn generate_report(
             report.push_str(&format!("    · {}\n", reason));
         }
         for item in &leg.items {
-            let verb = if item.amount >= 0.0 { "买入" } else { "卖出" };
+            let verb = if item.amount >= 0.0 {
+                "买入"
+            } else {
+                "卖出"
+            };
             report.push_str(&format!(
                 "    · {} ({}): {} ¥{:.2}{}\n",
                 item.asset_code,
@@ -243,9 +262,13 @@ pub fn generate_report(
         report.push_str("【风险警告】\n");
         for w in risk_warnings {
             let advice_str = match &w.advice {
-                RiskAdvice::ConsiderBuyMore => "恐慌环境下浮亏，可能是加仓机会——若基本面未恶化，可考虑逆向加仓",
+                RiskAdvice::ConsiderBuyMore => {
+                    "恐慌环境下浮亏，可能是加仓机会——若基本面未恶化，可考虑逆向加仓"
+                }
                 RiskAdvice::ReviewFundamentals => "中性环境下浮亏，建议审视基本面是否恶化",
-                RiskAdvice::UrgentReview => "贪婪环境下仍浮亏，需紧急审视——市场普涨时该标的逆势下跌，可能存在结构性问题",
+                RiskAdvice::UrgentReview => {
+                    "贪婪环境下仍浮亏，需紧急审视——市场普涨时该标的逆势下跌，可能存在结构性问题"
+                }
             };
             report.push_str(&format!(
                 "  ▸ {} ({}) — 浮亏 {:.1}%\n",
@@ -258,37 +281,63 @@ pub fn generate_report(
 
     // 不同情绪区间下的目标仓位预案
     report.push_str("【目标仓位预案】\n");
-    report.push_str("  情绪进入各区间时的风险资产目标权重:\n");
-    let zones = [
-        ("极度恐慌", format!("指数 < {:.0}", config.thresholds.extreme_fear), config.target_weight.extreme_fear),
-        ("恐慌", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.extreme_fear, config.thresholds.fear), config.target_weight.fear),
-        ("中性", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.fear, config.thresholds.neutral), config.target_weight.neutral),
-        ("贪婪", format!("{:.0} ≤ 指数 < {:.0}", config.thresholds.neutral, config.thresholds.greed), config.target_weight.greed),
-        ("极度贪婪", format!("指数 ≥ {:.0}", config.thresholds.greed), config.target_weight.extreme_greed),
-    ];
-    for (name, desc, weight) in &zones {
-        let value = plan.total_assets * weight / 100.0;
-        report.push_str(&format!(
-            "  · {} ({}): 目标 {:.0}% ≈ ¥{:.0}\n",
-            pad_display(name, 10),
-            desc,
-            weight,
-            value
-        ));
+    if plan.total_assets <= 0.0 {
+        // 账户尚未注资（刚 init、还没 `mns cash set`）：total_assets 为 0 会让每个区间都
+        // 显示 "≈ ¥0"，看起来像计算出了结果，实际只是"没有钱"——先提示注资，不展示误导性的 ¥0 列表。
+        report.push_str(
+            "  账户暂无资金（现金 + 持仓市值 = ¥0），请先 `mns cash set <金额>` 注资，\n",
+        );
+        report.push_str("  注资后再运行 `mns report` 即可看到各情绪区间对应的目标仓位金额。\n\n");
+    } else {
+        report.push_str("  情绪进入各区间时的风险资产目标权重:\n");
+        let zones = [
+            (
+                "极度恐慌",
+                format!("指数 < {:.0}", config.thresholds.extreme_fear),
+                config.target_weight.extreme_fear,
+            ),
+            (
+                "恐慌",
+                format!(
+                    "{:.0} ≤ 指数 < {:.0}",
+                    config.thresholds.extreme_fear, config.thresholds.fear
+                ),
+                config.target_weight.fear,
+            ),
+            (
+                "中性",
+                format!(
+                    "{:.0} ≤ 指数 < {:.0}",
+                    config.thresholds.fear, config.thresholds.neutral
+                ),
+                config.target_weight.neutral,
+            ),
+            (
+                "贪婪",
+                format!(
+                    "{:.0} ≤ 指数 < {:.0}",
+                    config.thresholds.neutral, config.thresholds.greed
+                ),
+                config.target_weight.greed,
+            ),
+            (
+                "极度贪婪",
+                format!("指数 ≥ {:.0}", config.thresholds.greed),
+                config.target_weight.extreme_greed,
+            ),
+        ];
+        for (name, desc, weight) in &zones {
+            let value = plan.total_assets * weight / 100.0;
+            report.push_str(&format!(
+                "  · {} ({}): 目标 {:.0}% ≈ ¥{:.0}\n",
+                pad_display(name, 10),
+                desc,
+                weight,
+                value
+            ));
+        }
+        report.push('\n');
     }
-    report.push('\n');
-
-    // 口径说明：让用户知道当前建议由什么信号驱动，以及其经检验的效果
-    report.push_str("【信号口径】\n");
-    report.push_str("  当前建议由「情绪锚（恐贪指数→目标仓位）」驱动。\n");
-    report.push_str(&format!(
-        "  回测显示改用「趋势锚（价格 vs {}月均线）+情绪倾斜」表现更好，\n",
-        12
-    ));
-    report.push_str("  但趋势锚需要至少 12 个月的本地价格历史；每次 `mns update-prices`\n");
-    report.push_str("  会累积一条快照，历史足够后可切换。运行 `mns backtest` 查看两者对比。\n");
-    report.push_str("  另需注意：回测中「情绪」信号在加入趋势锚后贡献接近于零。\n");
-    report.push('\n');
 
     report.push_str("\n═══════════════════════════════════════════════════\n");
 

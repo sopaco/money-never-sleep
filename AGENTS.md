@@ -27,7 +27,7 @@ mns report            # 生成报告
 mns market            # 市场概况
 mns backtest          # 策略回测
 ```
-更多命令见 `.ai-context/SKILL.md`。
+更多命令见 [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md)。
 
 ### Test a change
 ```bash

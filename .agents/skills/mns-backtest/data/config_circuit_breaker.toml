@@ -18,6 +18,21 @@ fear = 48.0
 neutral = 52.0
 greed = 68.0
 
+# 极度恐慌时几乎全仓、贪婪时快速减到低仓位 → 目标权重曲线 spread 拉到 70pp（默认 50pp）。
+# 驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+[target_weight]
+extreme_fear = 95.0
+fear = 80.0
+neutral = 60.0
+greed = 40.0
+extreme_greed = 25.0
+
+[rebalance]
+band_pp = 6.0                 # 更宽的偏离带：少交易、等到熔断点才动大仓
+min_trade_amount = 500.0
+min_holding_days_for_sell = 14
+
+# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
 [buy_ratio]
 extreme_fear = 90.0           # 极度恐慌时几乎全仓
 fear = 60.0

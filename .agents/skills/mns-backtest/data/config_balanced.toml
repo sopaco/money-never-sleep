@@ -18,6 +18,21 @@ fear = 45.0
 neutral = 55.0
 greed = 70.0
 
+# 三资产均衡 → 目标权重曲线也更平缓(spread 30pp，默认曲线 spread 50pp)，
+# 不追求极端仓位切换。驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+[target_weight]
+extreme_fear = 75.0
+fear = 68.0
+neutral = 60.0
+greed = 52.0
+extreme_greed = 45.0
+
+[rebalance]
+band_pp = 4.0
+min_trade_amount = 500.0
+min_holding_days_for_sell = 30
+
+# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
 [buy_ratio]
 extreme_fear = 70.0
 fear = 45.0

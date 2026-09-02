@@ -20,6 +20,23 @@ fear = 45.0
 neutral = 55.0
 greed = 70.0                 # 更早卖出
 
+# 风险资产目标权重曲线——驱动 mns report 与默认回测引擎(Engine::TargetWeight)的真正参数。
+# 与 AppConfig::default_config() 的 TargetWeight::default_curve() 完全一致：本文件就是当前默认值。
+[target_weight]
+extreme_fear = 85.0
+fear = 75.0
+neutral = 60.0
+greed = 45.0
+extreme_greed = 35.0
+
+[rebalance]
+band_pp = 4.0                 # 偏离带：与默认一致
+min_trade_amount = 500.0
+min_holding_days_for_sell = 30
+
+# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy，回测对比表里的
+# "旧框架(现金比例)"一行)及 calculate_buy_suggestions/calculate_sell_suggestions 使用。
+# mns report 与默认回测引擎完全不读这两段——改这里对实盘建议没有任何影响。
 [buy_ratio]
 extreme_fear = 60.0
 fear = 35.0

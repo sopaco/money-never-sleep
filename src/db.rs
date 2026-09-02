@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use rusqlite::{Connection, params};
 
-use crate::models::{FearGreedSnapshot, Position, Transaction};
+use crate::models::{Position, Transaction};
 
 pub struct Database {
     conn: Connection,
@@ -48,13 +48,6 @@ impl Database {
                 amount REAL NOT NULL,
                 tx_date TEXT NOT NULL,
                 note TEXT
-            );
-            CREATE TABLE IF NOT EXISTS price_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asset_code TEXT NOT NULL,
-                price REAL NOT NULL,
-                price_date TEXT NOT NULL,
-                UNIQUE(asset_code, price_date)
             );
             CREATE TABLE IF NOT EXISTS fear_greed_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,42 +286,7 @@ impl Database {
         if rows == 0 {
             anyhow::bail!("未找到资产: {}", code);
         }
-        self.record_price(code, price)?;
         Ok(())
-    }
-
-    /// 记录当日价格快照。趋势锚点（价格 vs N月均线）需要历史序列，
-    /// 而旧表结构只存 current_price，无法回溯，故单独累积。
-    /// 同一天重复调用只保留最新值。
-    pub fn record_price(&self, code: &str, price: f64) -> Result<()> {
-        if price <= 0.0 {
-            return Ok(());
-        }
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        self.conn.execute(
-            "INSERT INTO price_history (asset_code, price, price_date) VALUES (?, ?, ?)
-             ON CONFLICT(asset_code, price_date) DO UPDATE SET price = excluded.price",
-            params![code, price, today],
-        )?;
-        Ok(())
-    }
-
-    /// 取某标的的月末价格序列（升序），用于趋势判断。
-    /// 目前仅在本地历史累积满 12 个月后才会被实时报告启用。
-    #[allow(dead_code)]
-    pub fn monthly_price_history(&self, code: &str) -> Result<Vec<(String, f64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT substr(price_date, 1, 7) AS ym, price FROM price_history
-             WHERE asset_code = ?
-             GROUP BY ym HAVING price_date = MAX(price_date)
-             ORDER BY ym",
-        )?;
-        let rows = stmt.query_map([code], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
     }
 
     pub fn remove_position(&self, code: &str) -> Result<()> {
@@ -392,30 +350,5 @@ impl Database {
             params![score, rating, today, previous_close, previous_1_week, previous_1_month, previous_1_year, now],
         )?;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn get_latest_snapshot(&self) -> Result<Option<FearGreedSnapshot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, score, rating, snapshot_date, previous_close, previous_1_week, previous_1_month, previous_1_year, fetched_at
-             FROM fear_greed_snapshots ORDER BY id DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map([], |row| {
-            Ok(FearGreedSnapshot {
-                id: row.get(0)?,
-                score: row.get(1)?,
-                rating: row.get(2)?,
-                snapshot_date: row.get(3)?,
-                previous_close: row.get(4)?,
-                previous_1_week: row.get(5)?,
-                previous_1_month: row.get(6)?,
-                previous_1_year: row.get(7)?,
-                fetched_at: row.get(8)?,
-            })
-        })?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
     }
 }

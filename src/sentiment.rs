@@ -90,17 +90,25 @@ async fn try_fetch(client: &Client, url: &str) -> Result<FearGreedData> {
 
     let status = response.status();
     if !status.is_success() {
-        // 特殊处理反爬虫错误
-        if status.as_u16() == 418 {
-            anyhow::bail!("CNN API 拒绝请求（反爬虫拦截），请稍后重试或使用代理");
-        }
-        anyhow::bail!("CNN API 返回错误状态码: {}", status);
+        anyhow::bail!(status_error_message(status.as_u16()));
     }
 
     let text = response.text().await.context("读取响应内容失败")?;
 
     // 解析 JSON，提取历史数据
     parse_cnn_response(&text)
+}
+
+/// 把 HTTP 错误状态码翻译成用户可读的降级提示。
+///
+/// 抽成独立函数以便单元测试覆盖"网络异常/被反爬拦截时如何降级"这条路径，
+/// 不需要真实发起请求或引入 mock HTTP 服务器依赖。
+fn status_error_message(status: u16) -> String {
+    if status == 418 {
+        "CNN API 拒绝请求（反爬虫拦截），请稍后重试或使用代理".to_string()
+    } else {
+        format!("CNN API 返回错误状态码: {}", status)
+    }
 }
 
 /// 构建 HTTP 客户端
@@ -115,14 +123,17 @@ fn build_client() -> Result<Client> {
 
 /// 解析 CNN API 响应
 fn parse_cnn_response(text: &str) -> Result<FearGreedData> {
-    // 首先解析基本结构
+    // 首先解析基本结构（score 是唯一确定不会变动位置的字段）
     let cnn_data: CnnResponse = serde_json::from_str(text).context("解析 CNN API 响应失败")?;
 
-    // 提取历史数据（CNN API 可能在根级别或其他位置提供）
-    let previous_close = extract_historical_value(text, "previous_close");
-    let previous_1_week = extract_historical_value(text, "previous_1_week");
-    let previous_1_month = extract_historical_value(text, "previous_1_month");
-    let previous_1_year = extract_historical_value(text, "previous_1_year");
+    // 历史字段（previous_close 等）在 CNN API 里出现的层级不完全固定，
+    // 用结构化 JSON 树递归查找，而不是对原始字符串做逐字符扫描——
+    // 后者对 "xprevious_close_foo": 这种子串命中、科学计数法、字段顺序变化都不健壮。
+    let root: serde_json::Value = serde_json::from_str(text).context("解析 CNN API 响应失败")?;
+    let previous_close = find_number_field(&root, "previous_close");
+    let previous_1_week = find_number_field(&root, "previous_1_week");
+    let previous_1_month = find_number_field(&root, "previous_1_month");
+    let previous_1_year = find_number_field(&root, "previous_1_year");
 
     let score = cnn_data.fear_and_greed.score.clamp(0.0, 100.0) as u8;
 
@@ -135,30 +146,22 @@ fn parse_cnn_response(text: &str) -> Result<FearGreedData> {
     })
 }
 
-/// 从 JSON 文本中提取历史值
-fn extract_historical_value(json_text: &str, field: &str) -> Option<f64> {
-    // 尝试在 JSON 中查找字段
-    let pattern = format!("\"{}\":", field);
-    if let Some(start) = json_text.find(&pattern) {
-        let rest = &json_text[start + pattern.len()..];
-        // 跳过空白
-        let rest = rest.trim_start();
-        // 提取数字
-        let mut num_str = String::new();
-        for c in rest.chars() {
-            if c.is_ascii_digit() || c == '.' || c == '-' {
-                num_str.push(c);
-            } else if num_str.is_empty() && c.is_whitespace() {
-                continue;
-            } else {
-                break;
+/// 在任意深度的 JSON 树中递归查找第一个键名等于 `field` 且值为数字的字段。
+///
+/// CNN API 把这些历史字段放在 `fear_and_greed` 之下还是根级别，观察到会随接口版本变化，
+/// 因此不假设固定层级，做一次深度优先搜索；命中即返回，找不到返回 None（而非报错），
+/// 因为这些历史字段是展示性的，不应让主流程（获取当前 score）失败。
+fn find_number_field(value: &serde_json::Value, field: &str) -> Option<f64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(n) = map.get(field).and_then(|v| v.as_f64()) {
+                return Some(n);
             }
+            map.values().find_map(|v| find_number_field(v, field))
         }
-        if let Ok(value) = num_str.parse::<f64>() {
-            return Some(value);
-        }
+        serde_json::Value::Array(items) => items.iter().find_map(|v| find_number_field(v, field)),
+        _ => None,
     }
-    None
 }
 
 #[cfg(test)]
@@ -182,9 +185,59 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_historical() {
+    fn test_find_number_field_root_level() {
         let json = r#"{"fear_and_greed":{"score":45,"rating":"Fear"},"previous_close":42.5}"#;
-        let value = extract_historical_value(json, "previous_close");
-        assert_eq!(value, Some(42.5));
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(find_number_field(&root, "previous_close"), Some(42.5));
+    }
+
+    #[test]
+    fn test_find_number_field_nested_level() {
+        // 字段藏在 fear_and_greed 对象内部而不是根级别，也应该能找到
+        let json = r#"{"fear_and_greed":{"score":45,"rating":"Fear","previous_close":42.5}}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(find_number_field(&root, "previous_close"), Some(42.5));
+    }
+
+    #[test]
+    fn test_find_number_field_missing_returns_none() {
+        let json = r#"{"fear_and_greed":{"score":45,"rating":"Fear"}}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(find_number_field(&root, "previous_close"), None);
+    }
+
+    #[test]
+    fn test_find_number_field_ignores_substring_keys() {
+        // 旧的字符串扫描实现会被 "not_previous_close_at_all" 这种子串误命中；
+        // 基于 JSON 树的实现按精确键名匹配，不会误判。
+        let json = r#"{"fear_and_greed":{"score":45},"not_previous_close_at_all":99.0}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(find_number_field(&root, "previous_close"), None);
+    }
+
+    #[test]
+    fn test_parse_cnn_response_missing_history_still_succeeds() {
+        // 历史字段缺失时，主流程（score/rating）仍应正常返回，不能因为展示性字段缺失而报错
+        let json = r#"{"fear_and_greed":{"score":45,"rating":"Fear"}}"#;
+        let data = parse_cnn_response(json).expect("缺失历史字段不应导致解析失败");
+        assert_eq!(data.score, 45);
+        assert_eq!(data.previous_close, None);
+    }
+
+    #[test]
+    fn test_parse_cnn_response_malformed_json_errors() {
+        assert!(parse_cnn_response("not json at all").is_err());
+    }
+
+    #[test]
+    fn test_status_error_message_anti_bot() {
+        let msg = status_error_message(418);
+        assert!(msg.contains("反爬虫"));
+    }
+
+    #[test]
+    fn test_status_error_message_generic() {
+        let msg = status_error_message(500);
+        assert!(msg.contains("500"));
     }
 }

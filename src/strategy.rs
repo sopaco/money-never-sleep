@@ -718,7 +718,6 @@ mod tests {
     #[test]
     fn 宽基指数深度浮亏不应被排除加仓() {
         // 这是对旧规则的修正：指数跌30%正是该买的时候
-        let c = AppConfig::default_config();
         let members = vec![pos("510880", "红利ETF", "cn_stocks", 100.0, 2.0, 1.2, "2020-01-01")];
         let refs: Vec<&Position> = members.iter().collect();
         let items = split_within_leg(&refs, 10_000.0, 2.0);

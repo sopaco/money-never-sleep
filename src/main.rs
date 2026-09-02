@@ -530,6 +530,35 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
     Ok(())
 }
 
+/// 计算某个策略结果在指定日历年内的表现：(该年复合收益率, 该年内最大回撤)。
+///
+/// 收益率用剔除资金流影响的月度 `period_return` 复合得到；最大回撤基于该年内的
+/// `total_value` 序列（峰值只在年内滚动，不带入年初之前的高点），用于逐年拆开看
+/// 策略在真实下跌年份的表现，而不是只看整段回测区间的平均 Calmar。
+/// 若数据集不覆盖该年份则返回 None。
+fn year_window_stats(r: &backtest::BacktestResult, year: i32) -> Option<(f64, f64)> {
+    use chrono::Datelike;
+    let months: Vec<&backtest::Monthly> = r.monthly.iter().filter(|m| m.date.year() == year).collect();
+    if months.is_empty() {
+        return None;
+    }
+    let compounded = months.iter().fold(1.0_f64, |acc, m| acc * (1.0 + m.period_return)) - 1.0;
+    let mut peak = months[0].total_value;
+    let mut max_dd = 0.0_f64;
+    for m in &months {
+        if m.total_value > peak {
+            peak = m.total_value;
+        }
+        if peak > 0.0 {
+            let dd = (peak - m.total_value) / peak;
+            if dd > max_dd {
+                max_dd = dd;
+            }
+        }
+    }
+    Some((compounded, max_dd))
+}
+
 fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     use backtest::{BacktestConfig, Engine, SignalConfig};
 
@@ -686,6 +715,38 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     }
     println!("{}", t3);
     println!("单条历史路径上的年化差异若落在上述分布的宽度之内，就不具备统计显著性。");
+
+    // ── 2.5) 挑战期子区间：不要只看整段区间的平均 Calmar，看策略在真实下跌年份的逐段表现 ──
+    println!(
+        "
+【挑战期子区间】数据覆盖内的两次显著下跌年份，逐年拆开看（不是整段区间的平均值）"
+    );
+    let mut t25 = Table::new();
+    t25.load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["策略", "2018 年内收益", "2018 年内最大回撤", "2022 年内收益", "2022 年内最大回撤"]);
+    for (label, sc, engine) in [
+        ("目标仓位(趋势锚)", SignalConfig::trend_tilt(), Engine::TargetWeight),
+        ("目标仓位(情绪锚)", signal, Engine::TargetWeight),
+        ("买入持有", signal, Engine::BuyHold),
+    ] {
+        let r = backtest::run(&config, &bt_full, &sc, engine, &rows);
+        let y2018 = year_window_stats(&r, 2018);
+        let y2022 = year_window_stats(&r, 2022);
+        t25.add_row(vec![
+            Cell::new(label),
+            Cell::new(y2018.map(|(ret, _)| format!("{:.2}%", ret * 100.0)).unwrap_or_else(|| "无数据".into())),
+            Cell::new(y2018.map(|(_, dd)| format!("{:.2}%", dd * 100.0)).unwrap_or_else(|| "无数据".into())),
+            Cell::new(y2022.map(|(ret, _)| format!("{:.2}%", ret * 100.0)).unwrap_or_else(|| "无数据".into())),
+            Cell::new(y2022.map(|(_, dd)| format!("{:.2}%", dd * 100.0)).unwrap_or_else(|| "无数据".into())),
+        ]);
+    }
+    println!("{}", t25);
+    println!(
+        "注意：2018/2022 是本数据集(2016起)里仅有的两段明显下跌年份，均处于长期低利率+美股结构性牛市\n\
+         的大背景下，不能替代 2000-2002／2008 这类多年期熊市压力测试——那类数据当前不可得，\n\
+         该项验证仍然缺失（见下方【口径与局限】）。"
+    );
 
     // ── 3) holdout 区块 ──
     let hold = backtest::load_holdout();
