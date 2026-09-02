@@ -18,6 +18,21 @@ fear = 42.0
 neutral = 58.0
 greed = 72.0
 
+# 波段操作靠更窄的偏离带([rebalance] 里的 band_pp)驱动高频交易，目标权重曲线本身适中。
+# 驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+[target_weight]
+extreme_fear = 80.0
+fear = 72.0
+neutral = 62.0
+greed = 48.0
+extreme_greed = 38.0
+
+[rebalance]
+band_pp = 2.0                 # 更窄的偏离带：这才是"更频繁买卖"的真正机制
+min_trade_amount = 500.0
+min_holding_days_for_sell = 14
+
+# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
 [buy_ratio]
 extreme_fear = 70.0
 fear = 45.0

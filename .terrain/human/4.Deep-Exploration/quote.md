@@ -82,7 +82,7 @@ flowchart TD
 
 ## 跨模块协作场景
 
-**在"价格更新"流程中**：`cmd_update_prices`（`src/main.rs:783`）调 `update_all_prices`，拿到 `PriceUpdate` 列表后逐个 `db.update_price`（`src/main.rs:799`），同时更新 `positions.current_price` 与 `price_history`。本模块的输出是整个"账户价值计算"（portfolio/report）的输入。
+**在"价格更新"流程中**：`cmd_update_prices`（`src/main.rs:783`）调 `update_all_prices`，拿到 `PriceUpdate` 列表后逐个 `db.update_price`（`src/main.rs:799`）更新 `positions.current_price`。本模块的输出是整个"账户价值计算"（portfolio/report）的输入。
 
 **在"市场概况"流程中**：`market.rs` 调 `fetch_full_quote`（`src/market.rs:50`）抓 9 个指数，本模块提供含前收的 `StockQuote` 让市场模块算出涨跌百分比——涨绿跌红的表格直接建立在 `fetch_full_quote` 的输出上。
 

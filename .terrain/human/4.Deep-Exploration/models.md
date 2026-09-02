@@ -7,9 +7,9 @@
 
 ## 概述
 
-数据模型模块是 MNS 的"档案室"——它定义了系统里的三类核心实体：持仓（`Position`）、交易（`Transaction`）、恐贪快照（`FearGreedSnapshot`），并且把"持仓收益怎么算"这层领域逻辑直接挂在这些结构体上。你可以把它想成一份"活档案"：不只是存储字段，还自带计算方法（年化收益率、收益金额、持有天数），谁拿到 `Position` 谁就能算收益。
+数据模型模块是 MNS 的"档案室"——它定义了系统里的两类核心实体：持仓（`Position`）、交易（`Transaction`），并且把"持仓收益怎么算"这层领域逻辑直接挂在 `Position` 上。你可以把它想成一份"活档案"：不只是存储字段，还自带计算方法（年化收益率、收益金额、持有天数），谁拿到 `Position` 谁就能算收益。
 
-这个模块刻意保持**只存数据 + 计算，不碰存储**——SQL 读写全在 `db.rs`，数据库行 ↔ 结构体的映射也在 `db.rs`（`row_to_position`/`row_to_transaction`）。`models.rs` 里的三个结构体恰好对应 `db.rs` 里的三张业务表（`positions`/`transactions`/`fear_greed_snapshots`），形成清晰的"模型层 ↔ 持久化层"对照。模块很小（约 120 行），却是全系统数据契约的所在——任何模块之间的数据传递都绕不开这几个类型。
+这个模块刻意保持**只存数据 + 计算，不碰存储**——SQL 读写全在 `db.rs`，数据库行 ↔ 结构体的映射也在 `db.rs`（`row_to_position`/`row_to_transaction`）。`models.rs` 里的两个结构体对应 `db.rs` 里的两张业务表（`positions`/`transactions`）——恐贪快照表 `fear_greed_snapshots` 只写不读（`db.rs::save_fear_greed_snapshot`），没有对应的模型结构体，也没有读取接口。模块很小，却是全系统数据契约的所在——任何模块之间的数据传递都绕不开这几个类型。
 
 `Position` 在回测引擎里还有一个特别的身份：`backtest::Leg::to_position`（`src/backtest.rs:132`）把回测中间态（FIFO 批次）压平成 `Position`，喂给旧框架的买卖建议函数。同一个类型既服务实盘展示、又服务回测兼容——模型层承担了"新旧框架接口兼容"的桥接角色，这是它存在价值的又一个证明。
 
@@ -20,7 +20,6 @@
 1. **持仓模型**（`Position`，`src/models.rs:4`）——代码、名称、类别（fund/stock/etf）、已购份额、平均成本、现价、首次买入日期。
 2. **持仓收益计算**（`Position` impl，`src/models.rs:21-73`）——`total_cost`（成本总额）、`market_value`（市值）、`unrealized_pnl`（浮盈/亏）、`total_return`（总收益率）、`annualized_return`（年化收益率）、`days_held`（持有天数）。
 3. **交易模型**（`Transaction`，`src/models.rs:75`）——买卖类型（buy/sell）、代码、名称、份额、价格、金额、时间。
-4. **恐贪快照**（`FearGreedSnapshot`，`src/models.rs:92`）——日期、score、评级、环比/同比参照值。
 
 ---
 
@@ -30,7 +29,6 @@
 |---------|---------|---------|
 | `Position` | `src/models.rs:4` | 持仓数据结构 + 收益计算方法 |
 | `Transaction` | `src/models.rs:75` | 单笔交易记录 |
-| `FearGreedSnapshot` | `src/models.rs:92` | 单日恐贪指数快照 |
 | `Position::annualized_return` | `src/models.rs:51` | 年化收益率（含持有期处理） |
 | `Position::market_value` | `src/models.rs:29` | 当前市值 |
 
@@ -57,7 +55,7 @@ flowchart TD
 
 ## 关键接口与扩展点
 
-`Position` 是全系统最核心的数据契约：它既是数据库行映射，又是回测中间态视图，又是报表渲染的输入。扩展点在于"模型方法"：新增一个指标（如 Sharpe 需要历史波动）只需给 `Position`（或配合 `metrics.rs`）加方法，不需要动存储。`Transaction` 与 `FearGreedSnapshot` 是纯数据载体，字段变化需要同步 `db.rs` 的映射函数与 SQL——两者是成对演进的。
+`Position` 是全系统最核心的数据契约：它既是数据库行映射，又是回测中间态视图，又是报表渲染的输入。扩展点在于"模型方法"：新增一个指标（如 Sharpe 需要历史波动）只需给 `Position`（或配合 `metrics.rs`）加方法，不需要动存储。`Transaction` 是纯数据载体，字段变化需要同步 `db.rs` 的映射函数与 SQL——两者是成对演进的。
 
 ---
 
@@ -66,7 +64,7 @@ flowchart TD
 | 交互模块 | 方向 | 接口/协议 | 说明 |
 |---------|------|---------|------|
 | db | 被依赖 | `row_to_position`/`row_to_transaction` | 行→结构体映射 |
-| main | 依赖 | `Position`/`Transaction`/`FearGreedSnapshot` | 表格渲染与展示 |
+| main | 依赖 | `Position`/`Transaction` | 表格渲染与展示 |
 | backtest | 依赖 | `Position`（`Leg::to_position` 转换） | 旧框架回测输入 |
 | report | 依赖 | `Position` 的收益计算 | 持仓明细渲染 |
 
@@ -93,4 +91,4 @@ flowchart TD
 - **领域逻辑内聚**：收益计算直接挂在 `Position` 上（`src/models.rs:21-73`），而不是散落在 main 或 report——任何持有一份 `Position` 的模块都能得到一致的收益口径，杜绝"各处算收益口径打架"。
 - **除零与边界防御**：`days_held` 保护（`src/models.rs:56`）与年化对持有期的处理（`src/models.rs:60-66`），保证"买入当天即查看"这类极端场景不崩。
 - **单结构体多角色**：`Position` 既是数据库行映射，又是回测中间态视图（`Leg::to_position`），一个类型服务两个场景——简洁但信息密度高。
-- **薄模型理念**：`Transaction`/`FearGreedSnapshot` 保持纯数据，行为全部内聚在 `Position`——需要行为的实体才有方法，不需要的保持哑数据，避免过度设计。
+- **薄模型理念**：`Transaction` 保持纯数据，行为全部内聚在 `Position`——需要行为的实体才有方法，不需要的保持哑数据，避免过度设计。

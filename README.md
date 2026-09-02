@@ -37,11 +37,31 @@ Default allocation: US 55%, CN 25%, Gold 20%; target risk-asset weight moves bet
 | Buy & hold | **14.60%** | 14.93% | 0.98 | 3.2 |
 
 ⚠️ **Read this first**: buy-and-hold beats this strategy by ~1.9pp annualized. The tool's value
-holds only on a risk-adjusted basis (~4pp lower drawdown). The backtest also shows the Fear &
-Greed Index adds **near-zero marginal value** once a trend anchor is present, and prolonged bear
-markets (2000-2002, 2008) are not covered by the available data — yet "bear-market protection"
-is precisely this strategy's main selling point, so that claim remains untested.
-See `.ai-context/references/PROJECT-ESSENCE.md`.
+holds only on a risk-adjusted basis (~4pp lower drawdown), and prolonged bear markets
+(2000-2002, 2008) are not covered by the available data — yet "bear-market protection" is
+precisely this strategy's main selling point, so that claim remains untested.
+
+**⚠️ More importantly — the 12.75%/Calmar 1.17 above is the "trend anchor" backtest result, but
+`mns report`'s live default is the "sentiment anchor" (no trend judgment, maps the Fear & Greed
+score straight to a target weight); its in-sample figures are 9.79%/Calmar 1.07. Out-of-sample
+(walk-forward) validation shows even that risk-adjusted edge is not robust:**
+
+| Out-of-sample (from 2022-11) | Annualized | Max Drawdown | Calmar |
+|---|---|---|---|
+| Default config (sentiment anchor — `mns report`'s live behavior) | 7.91% | 9.18% | 0.86 |
+| Default config (trend anchor — backtest-only, not wired into live report) | 10.79% | 11.47% | 0.94 |
+| In-sample-tuned best (sentiment anchor) | 6.76% | 7.36% | 0.92 |
+| **Buy & hold** | **12.23%** | 11.95% | **1.02** |
+
+Out-of-sample, buy-and-hold beats both anchor configs on **both return and Calmar** — the
+in-sample "risk-adjusted edge" does not extrapolate. The bootstrap distribution (printed by
+`mns backtest validate`) shows this gap sits well inside statistical noise. `mns backtest
+validate` also breaks out 2018 and 2022 — the only two clearly-down years in the dataset — year
+by year; both anchors do show a smaller drawdown than buy-and-hold in those two years, but that
+**cannot substitute for a multi-year bear-market stress test** like 2000-2002 or 2008 — that data
+isn't available, so "bear-market protection" remains an under-tested claim. Run `mns backtest
+validate` yourself to reproduce every number above — don't rely only on the in-sample
+trend-anchor numbers `mns backtest` shows by default.
 
 ### 🔄 Buy/Sell Awareness
 Cash recovered from selling automatically counts toward buying budget, calculate sell first then buy, maximizing capital utilization.
@@ -60,8 +80,9 @@ MNS is designed for AI-assisted development, with two built-in knowledge systems
 
 | System | For | Purpose |
 |--------|-----|---------|
-| `.ai-context/` | AI Coding Agent | Quickly understand project architecture, design decisions, active issues |
-| `litho.docs/` | Human Developers | Project overview, workflows, deep dives |
+| `.agents/skills/` / `.claude/skills/` | AI Coding Agent | Skill definitions (e.g. `mns-backtest`) for the backtest workflow |
+| `.terrain/agent/` | AI Coding Agent | Project architecture, module boundaries, core flows (Terrain knowledge assets) |
+| `.terrain/human/` | Human Developers | Project overview, architecture, workflows, deep dives |
 
 ### SKILL Synergy Effect
 
@@ -72,7 +93,8 @@ When you speak keywords (like "backtest"), AI automatically activates the corres
 - ✅ **Automatically follows existing patterns when adding features**, maintaining code consistency
 - ✅ **Quickly locate root causes when debugging**, AI has complete data flow and call relationships
 
-> 💡 **One sentence triggers SKILL**: Tell OpenClaw "I want to optimize profit-taking parameters" or "help me backtest this strategy", AI will automatically read `.ai-context/SKILL.md` and gain complete project knowledge.
+> 💡 **One sentence triggers SKILL**: Tell your AI "I want to optimize profit-taking parameters" or "help me backtest this strategy", and it will automatically read
+> [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md) and gain complete project knowledge.
 
 ---
 
@@ -103,9 +125,9 @@ mns backtest validate # Out-of-sample validation + bootstrap + holdout
 
 | Documentation | Description |
 |---------------|-------------|
-| [litho.docs/](litho.docs/) | Human-friendly docs: project overview, architecture, workflows |
-| [.ai-context/](.ai-context/) | AI context: architecture decisions, design constraints, active issues |
-| [AGENTS.md](AGENTS.md) | OpenClaw AI Agent working guidelines |
+| [.terrain/human/](.terrain/human/) | Human-friendly docs: project overview, architecture, workflows |
+| [.agents/skills/mns-backtest/SKILL.md](.agents/skills/mns-backtest/SKILL.md) | Backtest skill: AI-facing steps, parameters, data-file reference |
+| [AGENTS.md](AGENTS.md) | AI Coding Agent working guidelines |
 
 ---
 

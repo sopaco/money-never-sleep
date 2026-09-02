@@ -34,8 +34,8 @@ MNS 是一套运行在本机的**个人投资决策 CLI 工具**（Rust 单二�
 | 入口/分发 | 约 20 个 `cmd_*`，串行装配数据流 | `src/main.rs` |
 | CLI 定义 | 命令树 + clap 参数 | `src/cli.rs` |
 | 配置 | `AppConfig`（Settings/Allocation/Thresholds/BuyRatio/SellRatio/Api/TargetWeight/Rebalance/Costs），TOML 读写，`validate()` 拒绝违反单调性的参数；路径 `~/.mns/config.toml`、`~/.mns/mns.db` | `src/config.rs` |
-| 账本 | SQLite：`cash`、`positions`、`transactions`、`price_history`、`fear_greed_snapshots` | `src/db.rs` |
-| 领域模型 | `Position`（收益率计算）、`Transaction`、`FearGreedSnapshot` | `src/models.rs` |
+| 账本 | SQLite：`cash`、`positions`、`transactions`、`fear_greed_snapshots` | `src/db.rs` |
+| 领域模型 | `Position`（收益率计算）、`Transaction` | `src/models.rs` |
 | 策略引擎 | `calculate_rebalance_plan` / `calculate_buy_suggestions` / `calculate_sell_suggestions` / `check_risk_warnings`；输出 `RebalancePlan`（legs、net_direction） | `src/strategy.rs` |
 | 报告 | `generate_report`（六大章节）+ `save_report` 落盘 | `src/report.rs` |
 | 情绪数据 | CNN API 抓取、解析、历史值抽取 | `src/sentiment.rs` |
@@ -110,5 +110,5 @@ MNS 是一套运行在本机的**个人投资决策 CLI 工具**（Rust 单二�
 | 入口分发 | `src/main.rs` | cmd_* 装配 |
 | 内嵌数据集 | `src/backtest.rs` | 2016–2025 真实全收益 |
 | Agent 操作手册 | `distribution/skill/money-never-sleep/SKILL.md` | 硬约束/工作流/故障表 |
-| 知识资产 | `.terrain/human/`、`.ai-context/`、`AGENTS.md` | 人类文档与 Agent 指南 |
+| 知识资产 | `.terrain/human/`、`AGENTS.md` | 人类文档与 Agent 指南 |
 ```

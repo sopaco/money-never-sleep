@@ -86,17 +86,3 @@ pub struct Transaction {
     pub tx_date: String,
     pub note: Option<String>,
 }
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct FearGreedSnapshot {
-    pub id: i64,
-    pub score: f64,
-    pub rating: String,
-    pub snapshot_date: String,
-    pub previous_close: Option<f64>,
-    pub previous_1_week: Option<f64>,
-    pub previous_1_month: Option<f64>,
-    pub previous_1_year: Option<f64>,
-    pub fetched_at: String,
-}
