@@ -1,9 +1,13 @@
 [package]
-name = "mns"
+name = "money-never-sleep"
 version = "0.6.1"
 edition = "2024"
 description = "AI-Powered Contrarian Investment Decision Assistant"
 license = "MIT"
+
+[[bin]]
+name = "mns"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
