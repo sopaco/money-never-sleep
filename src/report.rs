@@ -59,6 +59,26 @@ pub struct MonthActivity {
     pub trades: usize,
     /// 本月已发生交易的估算费用（按现行费率）
     pub estimated_fees: f64,
+    /// 本年度已发生的买卖笔数（用于年度交易预算披露）
+    pub year_trades: usize,
+}
+
+/// 日报口径披露：把「日频建议」与「回测结论」的口径差异写进报告本身，
+/// 避免用户在看建议时误把长周期代理回测当成实盘预期。
+pub fn disclosure(config: &AppConfig) -> String {
+    format!(
+        "【口径披露】\n\
+         \x20 · 本建议基于日频情绪信号（{} 天平滑 + {} 天区间确认 + 决策周期 {:?}），\n\
+         \x20\x20\x20 与 `mns backtest` 的默认审计链路同源；\n\
+         \x20 · 长周期牛熊检验使用 2016 年至今的代理标的（非实盘持仓），\n\
+         \x20\x20\x20 只用于稳健性比较，不得用于实盘收益预测；\n\
+         \x20 · 场外 QDII 存在 T+{} 赎回到账与每日限购，指令可能无法一次成交；\n\
+         \x20 · 历史回测与置换检验均不代表未来收益，本报告不构成投资建议。\n\n",
+        config.rebalance.signal_smooth_days,
+        config.rebalance.zone_confirm_days,
+        config.backtest.decision_interval,
+        config.channels.qdii_feeder.settlement_days,
+    )
 }
 
 /// 只在展示层把金额向下取整到百位；所有腿金额本身保持精确。
@@ -242,7 +262,16 @@ pub fn generate_report(
     report.push_str(&format!("  1. 操作：{}\n", action_line));
     report.push_str(&format!("  2. 原因：{}\n", why_line));
     report.push_str(&format!("  3. {}\n", fee_line));
-    report.push_str(&format!("  4. {}\n\n", drift_line));
+    report.push_str(&format!("  4. {}\n", drift_line));
+    let budget = &config.backtest;
+    let over = activity.year_trades > budget.annual_trade_budget_max as usize;
+    report.push_str(&format!(
+        "  5. 年度交易预算：本年已操作 {} 笔 / 预算 {}-{} 次{}\n\n",
+        activity.year_trades,
+        budget.annual_trade_budget_min,
+        budget.annual_trade_budget_max,
+        if over { "（已超预算，建议仅执行决策日建议）" } else { "" }
+    ));
 
     // 市场情绪（决策分数 = 平滑/确认后的信号，见 src/signal.rs；
     // 当日原始值仅展示，不再直接驱动仓位）
@@ -594,8 +623,9 @@ pub fn generate_report(
         "  · 决策信号 = CNN 恐贪指数（{}天平滑 + {}天区间确认），为情绪锚\n",
         config.rebalance.signal_smooth_days, config.rebalance.zone_confirm_days
     ));
-    report.push_str("  · 回测显示趋势锚优于情绪锚，但需≥12个月本地价格历史积累，实盘暂不可用\n");
-    report.push_str("  · 回测区间 2016-2025 无多年期熊市，恐慌期的回撤保护未经该场景检验\n\n");
+    report.push_str("  · 趋势锚在长周期代理回测中优于情绪锚，但需≥12个月本地价格历史，实盘暂不可用\n");
+    report.push_str("  · 长周期样本 2016-2026 覆盖 2018Q4/2020/2022/2026 回调，但不含 2000-2002 与 2008 型多年期熊市\n\n");
+    report.push_str(&disclosure(config));
 
     report.push_str("\n═══════════════════════════════════════════════════\n");
 
@@ -743,6 +773,7 @@ pub fn generate_observation_report(
             names[dw as usize - 1], gap
         ));
     }
+    report.push_str(&disclosure(config));
     Ok(report)
 }
 
@@ -837,6 +868,18 @@ mod tests {
         assert!(report.contains("情绪锚"));
         assert!(report.contains("趋势锚"));
         assert!(report.contains("多年期熊市"), "熊市未检验的局限应披露");
+        assert!(report.contains("年度交易预算"), "应披露年度交易预算");
+        assert!(report.contains("【口径披露】"), "应披露信号与回测口径差异");
+        assert!(report.contains("T+7"), "应披露场外 QDII 赎回结算约束");
+    }
+
+    #[test]
+    fn 观察版报告也应包含口径披露() {
+        let c = AppConfig::default_config();
+        let hist = crate::signal::ScoreHistory::new();
+        let s = crate::signal::compute(&c, 50.0, &hist, chrono::Local::now().date_naive());
+        let r = generate_observation_report(&c, &s, 0.0, &[], None, None).unwrap();
+        assert!(r.contains("【口径披露】"));
     }
 
     #[test]

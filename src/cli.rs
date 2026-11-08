@@ -127,19 +127,20 @@ pub enum Commands {
         limit: i64,
     },
 
-    /// 回测当前配置 vs 买入持有等基准（同一数据与成本模型）；样本外验证见 `backtest validate`
+    /// 实盘审计：真实标的日频回测 + 策略有效性检验 + 账户镜像（默认命令）
     #[command(
-        after_help = "回测使用内置 2016-2025 人民币计价月度全收益数据（含分红），初始资金 10 万、
-每年 3 月后注资 5 万，所有策略共用同一份数据与成本模型，保证对比公平。
-默认对比：目标仓位(趋势锚) / 目标仓位(情绪锚) / 买入持有+年度再平衡 / 买入持有。"
+        after_help = "默认链路使用实盘四只基金(018966/539001/007605/020341)与 2016-今长周期代理数据，
+信号与 mns report 同源（7天平滑 + 3天确认 + 决策周期），按真实通道建模 T+n 结算与限购。
+旧的 2016-2025 月频代理对比已降级为 `backtest legacy`，其标的与信号口径均不同于实盘，
+结论不可迁移到实盘决策。"
     )]
     Backtest {
         #[command(subcommand)]
         action: Option<BacktestAction>,
-        /// 使用指定 config.toml 回测（省略则用 ~/.mns/config.toml 当前配置）
+        /// 使用指定 config.toml（省略则用 ~/.mns/config.toml 当前配置）
         #[arg(short, long)]
         config: Option<String>,
-        /// 对比多个配置文件 (逗号分隔；自动附加买入持有基准)
+        /// 对比多个配置文件（仅 legacy 子命令使用）
         #[arg(long)]
         compare: Option<String>,
     },
@@ -190,12 +191,24 @@ pub enum CashAction {
 
 #[derive(Subcommand)]
 pub enum BacktestAction {
-    /// 样本外验证：walk-forward 调参 + 分块 bootstrap 分布 + holdout 区块
+    /// 账户镜像：严格执行策略 vs 数据库真实交易流水（仅实盘层）
+    Mirror,
+    /// 重建实盘与长周期日频数据集（抓取行情与情绪，含新鲜度校验）
+    UpdateData,
+    /// 完整有效性检验：置换/常数仓位/延迟/随机对照 + 牛熊分段 + 多折 walk-forward
+    ValidateFull {
+        /// 置换检验次数（覆盖 backtest.permutation_iterations）
+        #[arg(long)]
+        iterations: Option<usize>,
+    },
+    /// 【已降级】旧的 2016-2025 月频代理对比，结论不可迁移到实盘
+    Legacy,
+    /// 【已降级】旧版单一切分 walk-forward + 分块 bootstrap + 13 月 holdout
     Validate {
-        /// bootstrap 重采样次数（默认 2000；越大分布估计越稳，耗时按比例增加）
+        /// bootstrap 重采样次数（默认 2000）
         #[arg(long, default_value = "2000")]
         iterations: usize,
-        /// 分块长度（月），重采样保留连续月段以维持短期自相关（默认 6）
+        /// 分块长度（月，默认 6）
         #[arg(long, default_value = "6")]
         block: usize,
     },
