@@ -14,7 +14,7 @@ use crate::gui::components::*;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, Page};
 
-use super::{card_header, page_lead, notice, page_root};
+use super::{card_header, notice, page_lead, page_root};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     let agent = &shell.agent;

@@ -68,7 +68,7 @@ impl Page {
             Page::Dashboard => "总览",
             Page::Portfolio => "持仓",
             Page::Plan => "计划",
-            Page::Performance => "绩效",
+            Page::Performance => "复盘",
             Page::Agent => "助手",
             Page::Settings => "设置",
         }
@@ -892,7 +892,7 @@ pub(crate) fn brand_mark(size: f32) -> impl IntoElement {
     use std::sync::Arc;
     let image = Image::from_bytes(
         ImageFormat::Png,
-        include_bytes!("../../assets/icon-64.png").to_vec(),
+        include_bytes!("../../assets/icon-128.png").to_vec(),
     );
     img(Arc::new(image)).w(px(size)).h(px(size)).flex_none()
 }
@@ -908,7 +908,7 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> 
             title: Some("MNS · 投资助手".into()),
             ..Default::default()
         }),
-        window_bounds: Some(WindowBounds::centered(size(px(1200.), px(820.)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(1180.), px(720.)), cx)),
         ..Default::default()
     };
     let (window_handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
@@ -982,16 +982,10 @@ impl AppShell {
             .bg(rgb(SURFACE))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(brand_mark(40.))
+            .child(brand_mark(44.))
             // A hairline marks where the mark ends and the page name begins,
             // so the two never read as one label.
-            .child(
-                div()
-                    .w(px(1.))
-                    .h(px(26.))
-                    .flex_none()
-                    .bg(rgb(DIVIDER)),
-            )
+            .child(div().w(px(1.)).h(px(30.)).flex_none().bg(rgb(DIVIDER)))
             .child(
                 div()
                     .v_flex()
@@ -1228,8 +1222,8 @@ impl AppShell {
                 .placeholder("资产代码，例如 007605")
                 .default_value(code)
         });
-        let shares = cx.new(|cx| InputState::new(window, cx).placeholder("份额"));
-        let price = cx.new(|cx| InputState::new(window, cx).placeholder("成交价"));
+        let shares = cx.new(|cx| InputState::new(window, cx).placeholder("例如 1669.62"));
+        let price = cx.new(|cx| InputState::new(window, cx).placeholder("例如 1.2018"));
         self.open_dialog(
             Dialog::Trade(TradeForm {
                 side,

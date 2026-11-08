@@ -43,10 +43,10 @@ pub(crate) fn page_lead(lead: &'static str) -> Div {
         .child(
             div()
                 .w(px(2.))
-                .h(px(14.))
+                .h(px(15.))
                 .flex_none()
                 .rounded(px(1.))
-                .bg(rgb(ACCENT).opacity(0.32)),
+                .bg(rgb(ACCENT).opacity(0.55)),
         )
         .child(
             div()

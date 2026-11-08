@@ -55,9 +55,11 @@ pub const SUCCESS_SOFT: u32 = 0xdff6e4;
 pub const NEUTRAL_SOFT: u32 = 0xf0f3f8;
 
 // ── Geometry ───────────────────────────────────────────────────────────
-pub const RADIUS: f32 = 12.0;
-pub const RADIUS_SM: f32 = 8.0;
-pub const RADIUS_LG: f32 = 16.0;
+// Squarer than the first pass: 12/8/16 read as soft consumer-app bubbles,
+// which is the opposite of what a ledger should feel like.
+pub const RADIUS: f32 = 8.0;
+pub const RADIUS_SM: f32 = 6.0;
+pub const RADIUS_LG: f32 = 10.0;
 
 /// Resting elevation for cards. Two layers: a hairline contact shadow that
 /// makes the card sit on the page, plus a wide soft shadow that separates it

@@ -139,9 +139,12 @@ python3 .agents/skills/mns-backtest/data/guardrail_experiment.py
 | [`.agents/skills/mns-advisor/references/buy-sell-playbook.md`](.agents/skills/mns-advisor/references/buy-sell-playbook.md) | 「何时买 / 何时卖 / 何时不动」的完整叙事与判定链 |
 | [`distribution/skills/mns-advisor.zip`](distribution/skills/mns-advisor.zip) | **通用分发版**（与本仓库版同名但不同内容）：假定 `mns` 已在 PATH、无源码、无数据集，只教 Agent 调用命令与解读输出；跨平台，含 macOS/Linux 的 bash 与 Windows 的 PowerShell 两版只读采集脚本。安装位置 `~/.workbuddy/skills/mns-advisor/` |
 | [`docs/gui-p0.md`](docs/gui-p0.md) | 桌面端 P0：GPUI Kit 窗口/托盘、ACP 外接 `opencode` 自主运行的验证结论、已知取舍与未验证边界 |
-| [`docs/gui-design.md`](docs/gui-design.md) | 桌面端视觉系统：色彩令牌、字号阶梯、情绪氛围映射、图标的三种用法与产物管线 |
+| [`docs/gui-design.md`](docs/gui-design.md) | 桌面端视觉系统：色彩令牌、字号阶梯、情绪氛围映射、图标的四种用法与产物管线 |
+| [`docs/gui-release.md`](docs/gui-release.md) | 打包与分发：`make-dmg.sh` 的四个步骤、ad-hoc / Developer ID / 公证三档签名、架构与已知边界 |
 
 桌面端仍在 P0，入口为 `cargo run --bin mns-gui --features gui`；不启用该 feature 时 CLI 依赖与行为完全不变。外接 Agent 只需配置 CLI 路径，模型与凭据留在 `opencode` 自身配置中。
+
+要一个能双击安装的版本，执行 `./scripts/make-dmg.sh`，产物在 `target/dist/`（`.app` 与 `.dmg`）。签名、公证与分发边界见 [`docs/gui-release.md`](docs/gui-release.md)。
 
 界面语言见 [`docs/gui-design.md`](docs/gui-design.md)：红绿只表示盈亏，情绪沿蓝↔琥珀轴影响背景与装饰；图标不再与文字并排，而是作为角落水印或按钮徽记。应用图标与托盘图标由 `swift scripts/make-icons.swift` 从 `assets/app_icon.png` 一次生成（`.icns` / `.ico` / PNG / 裸 RGBA）。
 

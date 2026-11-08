@@ -6,7 +6,7 @@
 //   assets/AppIcon.icns        macOS app bundle icon
 //   assets/app.ico             Windows executable icon
 //   assets/icon-512.png        store/marketing render
-//   assets/icon-64.png         in-app brand mark (embedded via include_bytes!)
+//   assets/icon-128.png        in-app brand mark at 44pt (embedded, needs 2x)
 //   assets/tray-22.rgba        macOS menu bar bitmap (22pt, raw RGBA8)
 //   assets/tray-32.rgba        Windows/Linux tray bitmap (32px, raw RGBA8)
 
@@ -145,7 +145,7 @@ func writeRGBA(_ image: CGImage, to url: URL) {
 
 // ── PNG renditions ─────────────────────────────────────────────────────
 writePNG(render(size: 512, masked: true), to: assets.appendingPathComponent("icon-512.png"))
-writePNG(render(size: 64, masked: true), to: assets.appendingPathComponent("icon-64.png"))
+writePNG(render(size: 128, masked: true), to: assets.appendingPathComponent("icon-128.png"))
 
 // ── macOS .icns ────────────────────────────────────────────────────────
 let iconset = root.appendingPathComponent("target/AppIcon.iconset")
@@ -195,4 +195,4 @@ try! ico.write(to: assets.appendingPathComponent("app.ico"))
 writeRGBA(render(size: 22, masked: false), to: assets.appendingPathComponent("tray-22.rgba"))
 writeRGBA(render(size: 32, masked: false), to: assets.appendingPathComponent("tray-32.rgba"))
 
-print("icons written: icns, ico, 512/64 png, tray 22/32 rgba")
+print("icons written: icns, ico, 512/128 png, tray 22/32 rgba")

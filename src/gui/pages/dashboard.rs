@@ -12,7 +12,7 @@ use crate::gui::mood::Mood;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, CashKind, Page, TradeSide};
 
-use super::{card_header, page_lead, notice, page_root, row};
+use super::{card_header, notice, page_lead, page_root, row};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     let mut root = page_root("page-dashboard").child(page_lead(Page::Dashboard.subtitle()));
@@ -140,7 +140,7 @@ fn hero(data: &Snapshot) -> Div {
         ))
         .border_1()
         .border_color(rgb(BORDER))
-        .rounded(px(18.))
+        .rounded(px(RADIUS_LG))
         .shadow(shadow_card())
         // The gauge arc is the product mark, scaled up and drained of contrast:
         // it reads as a lit surface behind the number, not as a chart.
@@ -191,11 +191,10 @@ fn hero(data: &Snapshot) -> Div {
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_TERTIARY))
-                                .child(format!(
-                                    "{} · {}",
-                                    data.as_of.format("%Y-%m-%d"),
-                                    data.freshness.summary()
-                                )),
+                                // Freshness already lives in the window header;
+                                // repeating it here only diluted the number's
+                                // time reference. The hero keeps the "as of".
+                                .child(format!("截至 {}", data.as_of.format("%Y-%m-%d"))),
                         ),
                 )
                 // The mood earns its colours by saying something: the same

@@ -13,8 +13,7 @@ use crate::gui::{AppShell, Page};
 use super::{card_header, page_lead, page_root, row};
 
 pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
-    let mut root =
-        page_root("page-performance").child(page_lead(Page::Performance.subtitle()));
+    let mut root = page_root("page-performance").child(page_lead(Page::Performance.subtitle()));
 
     let Some(data) = &shell.data else {
         return root
