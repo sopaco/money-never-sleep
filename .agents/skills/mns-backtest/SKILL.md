@@ -14,6 +14,9 @@ description: |
 > 2026-11-08 整改后版本。旧的 2016–2025 月频代理对比已降级为 `mns backtest legacy`，
 > **其结论不可迁移到实盘**：标的、指数、通道、信号口径、注资假设均与真实账户不同。
 > 评估依据见 `docs/backtest-validation-review-2026-11-08.md` 与 `docs/remediation-2026-11-08.md`。
+>
+> 本 skill 只覆盖回测、验证与调参。实盘「何时买 / 何时卖」的决策编排、联网核验与留痕
+> 转 `mns-advisor` skill（`.agents/skills/mns-advisor/`）；两者不可互相引用结论。
 
 ## 操作步骤
 
@@ -21,10 +24,10 @@ description: |
 
 ```bash
 cargo build --release
-mns backtest update-data      # 重建两层日频数据集；需 Python 3 与网络
+mns backtest update-data      # 重建三层日频数据集；需 Python 3 与网络
 ```
 
-`update-data` 会同时刷新实盘层与长周期层，并输出数据新鲜度 SLA 校验结果。
+`update-data` 会同时刷新实盘层、长周期层与沪深300 单资产实验层，并输出各层新鲜度 SLA 校验结果。
 数据集落后超过 `backtest.freshness_sla_days`（默认 30 天）时，`mns backtest` 会输出醒目告警。
 
 ### 2. 运行
@@ -32,6 +35,7 @@ mns backtest update-data      # 重建两层日频数据集；需 Python 3 与�
 ```bash
 mns backtest                 # 默认：完整实盘审计
 mns backtest mirror          # 只看账户镜像（严格执行 vs 实际执行）
+mns backtest asset --dataset hs300   # 单资产对照实验（FGI vs A 股本地信号）
 mns backtest validate-full   # 只看统计检验，可加 --iterations 500
 mns backtest legacy          # 已降级：旧月频代理对比（--config / --compare 仅在此生效）
 mns config params            # 全部可调参数（含 [backtest] / [channels]）
@@ -56,9 +60,9 @@ mns config rebalance.band_pp 6
 ⚠️ 实盘建议与默认回测共用 `[target_weight]` + `[rebalance]` + `[backtest.decision_interval]`，
 不允许两条链路各设一套信号后互相引用结论。
 
-## 数据说明（两层，不可混用）
+## 数据说明（三层，不可混用）
 
-两层数据集均由 point-in-time as-of 对齐生成：每一行的 FGI 取**严格早于**该交易日的
+前两层数据集均由 point-in-time as-of 对齐生成：每一行的 FGI 取**严格早于**该交易日的
 最后一条已公布值（CNN 美股收盘后计算，北京时间次日才可得），净值取不晚于当日的
 最后一条已披露值（QDII 净值 T+1/T+2 披露，缺口沿用前值）。因此不存在
 「用当日情绪按当日净值同刻成交」的前视偏差。
@@ -67,9 +71,16 @@ mns config rebalance.band_pp 6
 |---|---|---|---|
 | `live_daily.csv` | 2024-01-11 ~ 今（682 行） | 实盘四只场外基金 018966 / 539001 / 007605 / 020341 的真实全收益指数 + 单位净值 | 账户镜像、实盘结论 |
 | `long_daily.csv` | 2016-01-04 ~ 今（2637 行） | 三腿长历史代理：539001 / H30269 中证红利低波**价格指数** / 518880 黄金 ETF | 穿越牛熊的稳健性检验 |
+| `hs300_daily.csv` | 2016-01-04 ~ 今（2633 行） | 510300 沪深300ETF 前复权（含分红），单资产实验 | `mns backtest asset --dataset hs300` |
 
-生成脚本分别为 `build_live_dataset.py` 与 `build_long_dataset.py`，元数据为
-同目录下的 `*_meta.json`（含抓取时间、各腿起止、口径限制、牛熊分段定义）。
+生成脚本分别为 `build_live_dataset.py`、`build_long_dataset.py` 与
+`build_hs300_dataset.py`，元数据为同目录下的 `*_meta.json`
+（含抓取时间、各腿起止、口径限制、牛熊分段定义）。
+
+**单资产实验层**：`hs300_daily.csv` 三腿列填同一个 510300 净值序列，调用时把
+`allocation` 覆盖为 `(1,0,0)`，等价于「沪深300 × 目标仓位 + 现金」。该层只用于
+回答「换标的/换输入信号会怎样」，**不得与实盘层或长周期层的绝对收益互相引用**。
+实验输出详见 `docs/hs300-experiment-2026-11-08.md`。
 
 **长周期层必须代理的原因**：实盘四只基金中最晚成立的 020341 只有 2024-01 起的净值，
 共同区间仅 34 个月且只有单一 regime。为覆盖 2016 年至今的四段牛熊，只能改用可比标的。
@@ -119,5 +130,25 @@ mns config rebalance.band_pp 6
    在途资金未到账）才是可执行的反馈。实盘层只有 34 个月共同区间，结论强度有限。
 4. **口径披露**。日报（`mns report`）与回测同源信号，但长周期层是代理标的；
    报告末尾的【口径披露】列明这一差异。
+5. **先做 sanity check 再读结论**。在单资产数据集上「常数仓位 100%」应与
+   「买入持有」收益一致；若出现明显差额，说明存在建仓时点或其他引擎偏差，
+   此时任何相对收益结论都不可信。2026-11-08 曾由此发现信号需 ~10 日历史才产生
+   首个决策日，导致策略整体躲过 2016-01 熔断；已改为所有方案在同一执行日、
+   同一价格按各自初始仓位建仓，并新增回归测试锁定。
+
+## 买入冷静期（不是择时功能）
+
+`mns guard` / `mns plan` 末尾的过热提示，用于应对「情绪高位时临时追加买入」。
+它**不阻断交易、不改仓位、不产生买卖指令**，只要求延迟 1 个交易日并写明理由。
+
+依据 `docs/guardrail-experiment-2026-11-08.md`：
+- 「过热之后更差」在均值与尾部检验中均未通过显著性检验（年块 bootstrap CI 跨 0）；
+- 让信号自动否决买入，在长期上行的三资产池上期望为负、在沪深300 上为正，
+  且对阈值非单调敏感，不是稳健规律；
+- 护栏的真实价值取决于「人本来会犯多大的错」，属反事实，行情数据无法测出。
+
+因此不要把 `[guardrail]` 当作择时开关，也不要据此调阈值追求收益。描述性统计
+（FGI≥75 后 60 日下跌概率 33.7% vs 25.9%）仅用于理解风险，报告已注明其不显著。
+复现实验：`python3 .agents/skills/mns-backtest/data/guardrail_experiment.py`。
 
 策略可验证的价值是**纪律性的仓位约束**，不是择时 alpha。本工具不构成投资建议。

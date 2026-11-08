@@ -1,0 +1,137 @@
+{
+ "generated_at": "2026-11-08T18:05:33+08:00",
+ "label": "沪深300 单资产实验（510300 前复权，含分红）",
+ "purpose": "检验 MNS 逆向择时框架用于单一 A 股宽基的效果；属对照实验，不构成投资建议",
+ "method": "point-in-time as-of join；复用 build_long_dataset.build；FGI 严格早于交易日",
+ "single_asset": true,
+ "required_allocation": {
+  "us_stocks": 1.0,
+  "cn_stocks": 0.0,
+  "counter_cyclical": 0.0
+ },
+ "calendar_range": [
+  "2016-01-04",
+  "2026-11-06"
+ ],
+ "calendar_observations": 2633,
+ "strategy_ready_range": [
+  "2016-01-04",
+  "2026-11-06"
+ ],
+ "strategy_ready_observations": 2633,
+ "sources": {
+  "fgi": "https://raw.githubusercontent.com/whit3rabbit/fear-greed-data/main/fear-greed.csv",
+  "fgi_range": [
+   "2011-01-03",
+   "2026-11-06"
+  ],
+  "fgi_observations": 3963,
+  "quote": "eastmoney push2his kline secid=1.510300 fqt=1（前复权，含分红再投资近似）",
+  "index_check": "eastmoney 1.000300 价格指数（不含股息），仅用于口径校验"
+ },
+ "legs": {
+  "single": {
+   "proxy": "510300 华泰柏瑞沪深300ETF 前复权收盘价（归一到区间起点 1.0）",
+   "first": "2016-01-04",
+   "last": "2026-11-06",
+   "observations": 2633,
+   "caveat": "三腿列填同一序列，配合 allocation=(1,0,0) 使用；不是三个独立资产。"
+  }
+ },
+ "regimes": [
+  {
+   "name": "2016-2017 蓝筹慢牛",
+   "from": "2016-01-04",
+   "to": "2018-01-24"
+  },
+  {
+   "name": "2018 贸易摩擦熊市",
+   "from": "2018-01-25",
+   "to": "2019-01-03"
+  },
+  {
+   "name": "2019-2021 核心资产牛市",
+   "from": "2019-01-04",
+   "to": "2021-02-10"
+  },
+  {
+   "name": "2021-2024 三年长熊",
+   "from": "2021-02-18",
+   "to": "2024-02-05"
+  },
+  {
+   "name": "2024-2025 政策反弹",
+   "from": "2024-09-24",
+   "to": "2025-12-31"
+  },
+  {
+   "name": "2026 回调",
+   "from": "2026-01-05",
+   "to": "2026-11-06"
+  }
+ ],
+ "regime_buy_hold_check": [
+  {
+   "name": "2016-2017 蓝筹慢牛",
+   "buy_hold_pct": 36.38
+  },
+  {
+   "name": "2018 贸易摩擦熊市",
+   "buy_hold_pct": -35.88
+  },
+  {
+   "name": "2019-2021 核心资产牛市",
+   "buy_hold_pct": 117.08
+  },
+  {
+   "name": "2021-2024 三年长熊",
+   "buy_hold_pct": -43.93
+  },
+  {
+   "name": "2024-2025 政策反弹",
+   "buy_hold_pct": 43.97
+  },
+  {
+   "name": "2026 回调",
+   "buy_hold_pct": -12.65
+  }
+ ],
+ "diagnostics": {
+  "price_total_return_pct": 48.83,
+  "price_annualized_pct": 3.73,
+  "price_max_drawdown_pct": -44.75,
+  "observations": 2633,
+  "fgi_vs_forward_20d_corr": 0.0562,
+  "fgi_vs_forward_20d_pairs": 2613,
+  "forward_20d_return_by_fgi_bucket": {
+   "<20": {
+    "samples": 232,
+    "avg_fwd_20d_pct": 0.486
+   },
+   "20-40": {
+    "samples": 572,
+    "avg_fwd_20d_pct": -0.155
+   },
+   "40-55": {
+    "samples": 609,
+    "avg_fwd_20d_pct": 0.21
+   },
+   "55-75": {
+    "samples": 946,
+    "avg_fwd_20d_pct": 1.347
+   },
+   ">=75": {
+    "samples": 254,
+    "avg_fwd_20d_pct": 0.209
+   }
+  }
+ },
+ "limitations": [
+  "单资产实验：不等于用户的三资产组合，结论不可直接迁移到实盘配置。",
+  "510300 前复权价格会随未来分红重算历史值，属标准复权口径；比例收益序列的时序信息不受影响。",
+  "ETF 场内价格与场外联接基金存在跟踪误差、现金留存与申赎摩擦，本实验按场内 T+1 通道建模。",
+  "CNN 恐贪指数刻画美股风险偏好，与 A 股的同步性/预测力有限；meta.diagnostics 给出实测相关性。",
+  "牛熊分段按 A 股市场共识划定的日历区间，非算法识别；各段买入持有涨跌见 regime_buy_hold_check。",
+  "未覆盖 2008 / 2015 中段等更早期极端行情；2016 起点为用户指定。"
+ ]
+}

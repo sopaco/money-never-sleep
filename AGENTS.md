@@ -21,13 +21,26 @@ cargo build --release
 ### Run
 ```bash
 mns init [--force]    # 初始化，--force 跳过确认
-mns cash set 100000   # 设置现金
+mns cash deposit 10000  # 外部入金（XIRR 口径）；cash set 只用于纠错
 mns portfolio         # 查看持仓
-mns report            # 生成报告
+mns today             # 刷价 + 生成报告（决策日默认周五）
+mns plan --monthly 3000  # 月投分配（plan 依赖本地恐贪快照）
+mns guard             # 买入冷静期提示，不阻断交易
+mns performance       # 只读：组合 XIRR / 实际回撤
 mns market            # 市场概况
-mns backtest          # 策略回测
+mns config params     # 全部可调参数
+mns backtest update-data  # 重建三层日频数据集
+mns backtest          # 默认 = 完整实盘审计（不是旧月频策略对比）
+mns backtest mirror   # 严格执行 vs 真实流水
+mns backtest asset --dataset hs300  # 单资产对照实验
+mns backtest legacy   # 已降级，结论不可迁移到实盘
 ```
-更多命令见 [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md)。
+更多命令与数据契约见 [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md)，
+实盘买卖决策编排见 [`.agents/skills/mns-advisor/SKILL.md`](.agents/skills/mns-advisor/SKILL.md)，
+功能地图与正确用法见 [`README_zh.md`](README_zh.md)，整改结论见 [`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md)。
+
+使用 mns 辅助实盘决策前，先读 mns-advisor 的 `references/buy-sell-playbook.md` 与
+`references/evidence-boundary.md`：情绪信号已被证伪为择时依据，不得据新闻或 FGI 给出买卖点。
 
 ### Test a change
 ```bash

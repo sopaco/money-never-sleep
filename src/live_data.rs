@@ -245,7 +245,7 @@ impl LiveDataset {
             .collect()
     }
 
-    /// 触发两个数据集的重建（调用仓库内 Python 脚本，单一实现避免两套抓取逻辑）。
+    /// 触发三个数据集的重建（调用仓库内 Python 脚本，单一实现避免两套抓取逻辑）。
     pub fn update_all(config: &AppConfig) -> Result<String> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".agents/skills/mns-backtest/data");
@@ -253,6 +253,7 @@ impl LiveDataset {
         for (script, out) in [
             ("build_live_dataset.py", Self::resolve_path(config)),
             ("build_long_dataset.py", LongDataset::resolve_path(config)),
+            ("build_hs300_dataset.py", LongDataset::path_for("hs300")),
         ] {
             let path = dir.join(script);
             if !path.exists() {
@@ -327,6 +328,12 @@ pub struct LongDay {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct LongMeta {
+    /// 实验数据集名称；为空时 to_bars 使用默认长周期标签
+    #[serde(default)]
+    pub label: String,
+    /// 单资产实验数据集：调用方应把 allocation 覆盖为单腿
+    #[serde(default)]
+    pub single_asset: bool,
     #[serde(default)]
     pub purpose: String,
     #[serde(default)]
@@ -341,6 +348,12 @@ pub struct LongMeta {
     pub limitations: Vec<String>,
     #[serde(default)]
     pub regimes: Vec<Regime>,
+    /// 实验数据集的附加诊断（相关系数、分档收益等），仅用于展示
+    #[serde(default)]
+    pub diagnostics: serde_json::Value,
+    /// 各牛熊段的买入持有涨跌，用于核验分段是否合理
+    #[serde(default)]
+    pub regime_buy_hold_check: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -359,15 +372,30 @@ pub struct LongDataset {
 
 impl LongDataset {
     pub fn resolve_path(_config: &AppConfig) -> PathBuf {
+        Self::path_for("long")
+    }
+
+    fn path_for(stem: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".agents/skills/mns-backtest/data/long_daily.csv")
+            .join(".agents/skills/mns-backtest/data")
+            .join(format!("{stem}_daily.csv"))
     }
 
     pub fn load(config: &AppConfig) -> Result<Self> {
-        let path = Self::resolve_path(config);
+        Self::load_named(config, "long")
+    }
+
+    /// 加载同格式的实验数据集（如 `hs300_daily.csv`）。CSV 与 meta 结构与长周期层一致，
+    /// 因而可直接送进同一套审计引擎，保证信号/成本/执行/回撤口径完全可比。
+    pub fn load_named(config: &AppConfig, stem: &str) -> Result<Self> {
+        let path = if stem == "long" {
+            Self::resolve_path(config)
+        } else {
+            Self::path_for(stem)
+        };
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!(
-                "读取长周期数据集失败: {}\n请运行 `mns backtest update-data`",
+                "读取数据集失败: {}\n请运行对应的数据构建脚本或 `mns backtest update-data`",
                 path.display()
             )
         })?;
@@ -417,7 +445,7 @@ impl LongDataset {
                 bail!("长周期数据集日期非严格升序: {} -> {}", w[0].date, w[1].date);
             }
         }
-        let mp = path.with_file_name("long_daily_meta.json");
+        let mp = path.with_file_name(format!("{stem}_daily_meta.json"));
         let meta: LongMeta = std::fs::read_to_string(mp)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -506,7 +534,11 @@ impl LongDataset {
         caveats.extend(self.meta.limitations.iter().cloned());
         BarSeries {
             kind: DatasetKind::Long,
-            label: "长周期代理（2016-今，穿越牛熊）".to_string(),
+            label: if self.meta.label.is_empty() {
+                "长周期代理（2016-今，穿越牛熊）".to_string()
+            } else {
+                self.meta.label.clone()
+            },
             bars,
             caveats,
         }
@@ -558,6 +590,19 @@ mod tests {
         // 第二日纳指腿 = 0.5*(1.2/1.1) + 0.5*(1.1/1.2)
         let expect = 0.5 * (1.2 / 1.1) + 0.5 * (1.1 / 1.2);
         assert!((legs[1][0] - expect).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 单资产实验数据集按名称加载且三腿同值() {
+        let cfg = AppConfig::default_config();
+        let Ok(ds) = LongDataset::load_named(&cfg, "hs300") else { return };
+        assert!(ds.meta.single_asset, "hs300 应标记为单资产实验数据集");
+        assert!(!ds.days.is_empty());
+        assert!(!ds.meta.label.is_empty(), "实验数据集应有自己的标签");
+        for d in ds.days.iter().take(50) {
+            assert!((d.prices[0] - d.prices[1]).abs() < 1e-9);
+            assert!((d.prices[0] - d.prices[2]).abs() < 1e-9);
+        }
     }
 
     #[test]

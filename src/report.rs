@@ -513,7 +513,7 @@ pub fn generate_report(
                 report.push_str(
                     "  今日无需调仓 —— 账户暂无资金（现金 + 持仓市值 = ¥0）。\n",
                 );
-                report.push_str("  先 `mns cash set <金额>` 注资，再运行 `mns report` 看目标仓位。\n");
+                report.push_str("  先 `mns cash deposit <金额>` 记外部入金，再运行 `mns report` 看目标仓位。\n");
             }
             NoAction::InBand => {
                 report.push_str("  今日无需调仓 —— 各类别偏离均在带宽内，持有即可。\n");
@@ -558,10 +558,10 @@ pub fn generate_report(
     // 不同情绪区间下的目标仓位预案
     report.push_str("【目标仓位预案】\n");
     if plan.total_assets <= 0.0 {
-        // 账户尚未注资（刚 init、还没 `mns cash set`）：total_assets 为 0 会让每个区间都
+        // 账户尚未入金（刚 init、还没 `mns cash deposit`）：total_assets 为 0 会让每个区间都
         // 显示 "≈ ¥0"，看起来像计算出了结果，实际只是"没有钱"——先提示注资，不展示误导性的 ¥0 列表。
         report.push_str(
-            "  账户暂无资金（现金 + 持仓市值 = ¥0），请先 `mns cash set <金额>` 注资，\n",
+            "  账户暂无资金（现金 + 持仓市值 = ¥0），请先 `mns cash deposit <金额>` 记外部入金，\n",
         );
         report.push_str("  注资后再运行 `mns report` 即可看到各情绪区间对应的目标仓位金额。\n\n");
     } else {
