@@ -9,3 +9,5 @@
 # Terrain — repomix index (regenerated locally, not versioned)
 **/.sdd-agent
 .codegraph
+
+.workbuddy/
