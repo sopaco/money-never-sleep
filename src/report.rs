@@ -24,6 +24,9 @@ pub fn generate_report(
     config: &AppConfig,
     score: f64,
     rating: &str,
+    raw_score: f64,
+    raw_zone: &str,
+    decision_note: &str,
     previous_close: Option<f64>,
     previous_1_week: Option<f64>,
     previous_1_month: Option<f64>,
@@ -56,21 +59,32 @@ pub fn generate_report(
         date_str, weekday
     ));
 
-    // 市场情绪
+    // 市场情绪（决策分数 = 平滑/确认后的信号，见 src/signal.rs；
+    // 当日原始值仅展示，不再直接驱动仓位）
     report.push_str("【市场情绪】\n");
-    report.push_str(&format!("  CNN 恐贪指数: {:.2} ({})\n", score, rating));
+    report.push_str(&format!(
+        "  CNN 恐贪指数(今日): {:.2} ({})\n",
+        raw_score, raw_zone
+    ));
+    report.push_str(&format!(
+        "  决策分数(平滑{}天): {:.2} ({})\n",
+        config.rebalance.signal_smooth_days, score, rating
+    ));
+    if !decision_note.is_empty() {
+        report.push_str(&format!("  信号说明: {}\n", decision_note));
+    }
     if let Some(pc) = previous_close {
         report.push_str(&format!("  前日收盘: {:.2}", pc));
     }
     if let Some(pw) = previous_1_week {
-        report.push_str(&format!(" | 周环比: {:.2} → {:.2}", pw, score));
+        report.push_str(&format!(" | 周环比: {:.2} → {:.2}", pw, raw_score));
     }
     report.push('\n');
     if let Some(pm) = previous_1_month {
-        report.push_str(&format!("  月环比: {:.2} → {:.2}", pm, score));
+        report.push_str(&format!("  月环比: {:.2} → {:.2}", pm, raw_score));
     }
     if let Some(py) = previous_1_year {
-        report.push_str(&format!(" | 年同比: {:.2} → {:.2}", py, score));
+        report.push_str(&format!(" | 年同比: {:.2} → {:.2}", py, raw_score));
     }
     report.push_str("\n\n");
 
@@ -341,6 +355,98 @@ pub fn generate_report(
 
     report.push_str("\n═══════════════════════════════════════════════════\n");
 
+    Ok(report)
+}
+
+/// 非决策日的观察版报告：只读状态与信号，不给买卖建议。
+///
+/// 与决策版同一套数据源（当日值 + 本地快照平滑），但明确不输出调仓计划，
+/// 避免用户被周级噪声牵引操作。下一个决策日按 `rebalance.decision_weekday` 提示。
+pub fn generate_observation_report(
+    config: &AppConfig,
+    signal: &crate::signal::DecisionSignal,
+    cash_balance: f64,
+    positions: &[Position],
+) -> Result<String> {
+    let today = Local::now();
+    let weekday = match today.weekday().num_days_from_monday() {
+        0 => "Monday",
+        1 => "Tuesday",
+        2 => "Wednesday",
+        3 => "Thursday",
+        4 => "Friday",
+        5 => "Saturday",
+        _ => "Sunday",
+    };
+    let date_str = today.format("%Y-%m-%d").to_string();
+
+    let mut report = String::new();
+    report.push_str(&format!(
+        "═══════════════════════════════════════════════════\n\
+         逆情绪投资助手 - 观察报告（非决策日，今日不产生买卖建议）\n\
+         {} ({})\n\
+         ═════════════════════════════════════════════════\n\n",
+        date_str, weekday
+    ));
+
+    report.push_str("【市场情绪】\n");
+    report.push_str(&format!(
+        "  CNN 恐贪指数(今日): {:.2} ({})\n",
+        signal.raw_score, signal.raw_zone
+    ));
+    report.push_str(&format!(
+        "  决策分数(平滑{}天, 样本{}/{}): {:.2} ({})\n",
+        config.rebalance.signal_smooth_days, signal.samples_used, config.rebalance.signal_smooth_days, signal.smoothed_score, signal.smoothed_zone
+    ));
+    report.push_str(&format!("  信号说明: {}\n", signal.note));
+    if !signal.confirmed {
+        report.push_str("  ⚠ 区间切换未确认，决策沿用旧区间，请勿按当日情绪操作\n");
+    }
+    report.push('\n');
+
+    // 距离各阈值的余量（决策分数视角）
+    report.push_str("【阈值距离】\n");
+    let t = &config.thresholds;
+    for (name, v) in [
+        ("极度恐慌", t.extreme_fear),
+        ("恐惧", t.fear),
+        ("中性", t.neutral),
+        ("贪婪", t.greed),
+    ] {
+        let d = signal.effective_score - v;
+        let dir = if d < 0.0 {
+            format!("尚差 {:.1} 分进入", -d)
+        } else {
+            format!("高出 {:.1} 分", d)
+        };
+        report.push_str(&format!("  进入「{}」({:.0}): {}\n", name, v, dir));
+    }
+    report.push('\n');
+
+    // 账户概览（简版，只展示不动手）
+    let total_mv: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let total = cash_balance + total_mv;
+    let risk_weight = if total > 0.0 { total_mv / total * 100.0 } else { 0.0 };
+    report.push_str("【账户概览】\n");
+    report.push_str(&format!("  现金余额: ¥{:.2}\n", cash_balance));
+    report.push_str(&format!("  持仓市值: ¥{:.2}\n", total_mv));
+    report.push_str(&format!("  总资产:   ¥{:.2}\n", total));
+    report.push_str(&format!("  风险资产权重: {:.1}%\n\n", risk_weight));
+
+    // 下一决策日
+    let dw = config.rebalance.decision_weekday;
+    if dw >= 1 && dw <= 7 {
+        let names = ["一", "二", "三", "四", "五", "六", "日"];
+        let today_wd = today.weekday().num_days_from_monday() as usize + 1; // 周一=1
+        let mut gap = dw as i64 - today_wd as i64;
+        if gap <= 0 {
+            gap += 7;
+        }
+        report.push_str(&format!(
+            "提示: 决策日为每周{}，{} 天后出决策版报告；非决策日的建议一律忽略。\n",
+            names[dw as usize - 1], gap
+        ));
+    }
     Ok(report)
 }
 

@@ -85,8 +85,12 @@ pub enum Commands {
     /// 查看当前恐贪指数
     Sentiment,
 
-    /// 生成今日策略报告
-    Report,
+    /// 生成今日策略报告（默认仅决策日出决策版，其余天出观察版）
+    Report {
+        /// 非决策日仍强制生成决策版报告
+        #[arg(long)]
+        decide: bool,
+    },
 
     /// 查看交易历史
     History {

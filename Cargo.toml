@@ -1,6 +1,6 @@
 [package]
 name = "money-never-sleep"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "AI-Powered Contrarian Investment Decision Assistant"
 license = "MIT"
