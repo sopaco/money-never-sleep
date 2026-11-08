@@ -31,6 +31,37 @@ pub struct AppConfig {
     /// 按真实交易通道拆分的成本与结算参数
     #[serde(default)]
     pub channels: ChannelCosts,
+    /// 买入冷静期：情绪过热时的二次确认提示（不阻断交易、不改动仓位）
+    #[serde(default)]
+    pub guardrail: GuardrailConfig,
+}
+
+/// 买入冷静期配置。
+///
+/// 设计边界（见 docs/guardrail-experiment-2026-11-08.md）：情绪信号对择时
+/// 无显著贡献，且"自动否决买入"在长期上行的三资产池上期望为负、对阈值敏感。
+/// 因此这里只做**流程约束**——减速、要求写明理由、留痕复盘，不替用户决定买不买。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailConfig {
+    /// 是否启用提示
+    pub enabled: bool,
+    /// 触发"过热"的 FGI 分数阈值
+    pub hot_threshold: f64,
+    /// 建议延迟的交易日数（仅提示，不强制）
+    pub cooldown_days: u32,
+    /// 是否显示历史描述性统计（该统计未通过显著性检验，仅供理解风险）
+    pub show_stats: bool,
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hot_threshold: 75.0,
+            cooldown_days: 1,
+            show_stats: true,
+        }
+    }
 }
 
 /// 决策周期。实盘与回测必须共用同一取值，禁止两条链路各用一套信号。
@@ -542,6 +573,7 @@ impl AppConfig {
             profile: ProfileConfig::default(),
             backtest: BacktestSettings::default(),
             channels: ChannelCosts::default(),
+            guardrail: GuardrailConfig::default(),
         }
     }
 
@@ -635,6 +667,18 @@ impl AppConfig {
             anyhow::bail!(
                 "profile.core_blend 必须在 0-1 之间: {}",
                 self.profile.core_blend
+            );
+        }
+        if !(0.0..=100.0).contains(&self.guardrail.hot_threshold) {
+            anyhow::bail!(
+                "guardrail.hot_threshold 必须在 0-100 之间: {}",
+                self.guardrail.hot_threshold
+            );
+        }
+        if self.guardrail.cooldown_days > 10 {
+            anyhow::bail!(
+                "guardrail.cooldown_days 不应超过 10 天: {}",
+                self.guardrail.cooldown_days
             );
         }
         if self.rebalance.signal_smooth_days > 60 {
@@ -843,6 +887,10 @@ impl AppConfig {
                 WeightMode::Linear => "linear".to_string(),
             }),
             "cashflow.monthly" => Some(self.cashflow.monthly.to_string()),
+            "guardrail.enabled" => Some(self.guardrail.enabled.to_string()),
+            "guardrail.hot_threshold" => Some(self.guardrail.hot_threshold.to_string()),
+            "guardrail.cooldown_days" => Some(self.guardrail.cooldown_days.to_string()),
+            "guardrail.show_stats" => Some(self.guardrail.show_stats.to_string()),
             "profile" => Some(self.profile_label().to_string()),
             "profile.core_blend" => Some(self.profile.core_blend.to_string()),
             "backtest.data_path" => Some(self.backtest.data_path.clone()),
@@ -906,6 +954,10 @@ impl AppConfig {
             "costs.sell_fee_pct" => self.costs.sell_fee_pct = value.parse()?,
             "costs.cash_annual_yield" => self.costs.cash_annual_yield = value.parse()?,
             "cashflow.monthly" => self.cashflow.monthly = value.parse()?,
+            "guardrail.enabled" => self.guardrail.enabled = value.parse()?,
+            "guardrail.hot_threshold" => self.guardrail.hot_threshold = value.parse()?,
+            "guardrail.cooldown_days" => self.guardrail.cooldown_days = value.parse()?,
+            "guardrail.show_stats" => self.guardrail.show_stats = value.parse()?,
             "target_weight.mode" => {
                 self.target_weight.mode = match value.trim().to_ascii_lowercase().as_str() {
                     "step" | "阶梯" => WeightMode::Step,

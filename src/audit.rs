@@ -88,6 +88,18 @@ pub struct SignalSeries {
 /// 一次性生成与实盘同源的信号序列。置换/随机检验只打乱这份**结果**，
 /// 不重复调用 signal::compute，保证 300 次置换在长周期数据上仍可秒级完成。
 pub fn build_signal_series(config: &AppConfig, bars: &[Bar]) -> SignalSeries {
+    let raw: Vec<f64> = bars.iter().map(|b| b.fgi.unwrap_or(50.0)).collect();
+    build_signal_series_with_raw(config, bars, &raw)
+}
+
+/// 用任意同长度的分值序列替换 FGI，仍走 `signal::compute` 的同一套
+/// 7 天平滑 + 区间确认 + 决策日逻辑。用于「换一个输入信号」的对照实验，
+/// 保证差异只来自分值本身，不来自平滑/确认/执行口径。
+pub fn build_signal_series_with_raw(
+    config: &AppConfig,
+    bars: &[Bar],
+    raw_scores: &[f64],
+) -> SignalSeries {
     let smooth = config.rebalance.signal_smooth_days.max(1) as usize;
     let confirm = config.rebalance.zone_confirm_days.max(1) as usize;
     let keep = (smooth * 4).max(confirm * 4 + 2).max(12);
@@ -99,7 +111,7 @@ pub fn build_signal_series(config: &AppConfig, bars: &[Bar]) -> SignalSeries {
 
     for i in 0..bars.len() {
         let b = &bars[i];
-        let raw = b.fgi.unwrap_or(50.0);
+        let raw = raw_scores.get(i).copied().unwrap_or(50.0);
         lo = lo.min(raw);
         hi = hi.max(raw);
         let from = hist.len().saturating_sub(keep);
@@ -333,49 +345,70 @@ pub fn run_audit(
         st.pending = still;
 
         // 2) 信号 → 目标仓位；只在决策日下单，并按 T+lag 排入执行队列
-        if opt.buy_and_hold {
-            // 买入持有基准：首日按 sleeve 一次性建满仓，此后完全不动。
-            if i == opt.start_idx {
-                let budget = st.cash;
-                for leg in 0..3 {
-                    let spec = channel(config, series.kind, leg);
-                    let mut amount = budget * sleeve_arr[leg];
-                    if spec.daily_subscription_cap > 0.0
-                        && amount > spec.daily_subscription_cap
-                    {
-                        st.blocked_cap += 1;
-                        amount = spec.daily_subscription_cap;
-                    }
-                    if amount < min_trade { continue; }
-                    let fee = amount * (spec.buy_rate() + spec.slippage_pct / 100.0);
-                    let net = amount - fee;
-                    st.cash -= net;
-                    st.fees += fee;
-                    st.lots[leg].push(Lot { shares: net / bar.prices[leg], date: bar.date });
-                    st.trades.push(AuditTrade {
-                        date: bar.date, action: "买入", leg, amount, fee, blocked: None,
-                    });
-                }
-            }
-        } else if bar.fgi.is_none() {
-            skipped_no_fgi += 1;
-        } else if sig.decision[i] {
-            let risk_w = match constant_w {
-                Some(w) => w,
-                None => (config.target_weight_for(scores[i]) / 100.0).clamp(0.0, 1.0),
-            };
+        // 2a) 起点统一建仓：所有方案在同一执行日、同一价格按各自初始仓位入场。
+        //     信号需要约 10 日历史才产生首个决策日，若只在决策日建仓，策略会整体
+        //     躲过起点急跌（2016-01 熔断），在沪深300 单资产上凭空多出 ~10% 成本优势。
+        if i == opt.start_idx {
             let target_date = bar.date + Duration::days(lag_days as i64);
             let exec = bars.partition_point(|b| b.date < target_date);
             if exec <= opt.end_idx {
-                pending_orders.insert(exec, (risk_w, true));
+                let w = if opt.buy_and_hold {
+                    1.0
+                } else {
+                    match constant_w {
+                        Some(v) => v,
+                        None => (config.target_weight_for(scores[opt.start_idx]) / 100.0)
+                            .clamp(0.0, 1.0),
+                    }
+                };
+                pending_orders.insert(exec, (w, opt.buy_and_hold));
             }
         }
 
-        // 3) 执行到期指令（买入持有基准不参与）
-        if let Some((risk_w, _)) = (!opt.buy_and_hold)
-            .then(|| pending_orders.remove(&i))
-            .flatten()
-        {
+        // 2b) 决策日信号；买入持有基准在 2a 建仓后不再产生任何指令
+        if !opt.buy_and_hold {
+            if bar.fgi.is_none() {
+                skipped_no_fgi += 1;
+            } else if sig.decision[i] {
+                let risk_w = match constant_w {
+                    Some(w) => w,
+                    None => (config.target_weight_for(scores[i]) / 100.0).clamp(0.0, 1.0),
+                };
+                let target_date = bar.date + Duration::days(lag_days as i64);
+                let exec = bars.partition_point(|b| b.date < target_date);
+                if exec <= opt.end_idx {
+                    pending_orders.insert(exec, (risk_w, false));
+                }
+            }
+        }
+
+        // 3a) 买入持有基准的一次性建仓：与其他方案在同一执行日、同一价格成交
+        if matches!(pending_orders.get(&i), Some((_, true))) {
+            pending_orders.remove(&i);
+            let budget = st.cash;
+            for leg in 0..3 {
+                let spec = channel(config, series.kind, leg);
+                let mut amount = budget * sleeve_arr[leg];
+                if spec.daily_subscription_cap > 0.0
+                    && amount > spec.daily_subscription_cap
+                {
+                    st.blocked_cap += 1;
+                    amount = spec.daily_subscription_cap;
+                }
+                if amount < min_trade { continue; }
+                let fee = amount * (spec.buy_rate() + spec.slippage_pct / 100.0);
+                let net = amount - fee;
+                st.cash = (st.cash - amount).max(0.0);
+                st.fees += fee;
+                st.lots[leg].push(Lot { shares: net / bar.prices[leg], date: bar.date });
+                st.trades.push(AuditTrade {
+                    date: bar.date, action: "买入", leg, amount, fee, blocked: None,
+                });
+            }
+        }
+
+        // 3b) 其余方案：按到期指令再平衡
+        if let Some((risk_w, _)) = pending_orders.remove(&i) {
             let prices = bar.prices;
             let shares = leg_shares(&st.lots);
             let current = [
@@ -466,11 +499,8 @@ pub fn run_audit(
                         if amount < min_trade { continue; }
                         let fee = amount * (spec.buy_rate() + spec.slippage_pct / 100.0);
                         let net = amount - fee;
-                        if net > st.cash {
-                            st.cash = 0.0;
-                        } else {
-                            st.cash -= net;
-                        }
+                        // 现金按含费金额扣减；只扣净额会把手续费凭空留在账户里
+                        st.cash = (st.cash - amount).max(0.0);
                         budget -= amount;
                         st.fees += fee;
                         st.lots[leg].push(Lot { shares: net / prices[leg], date: bar.date });
@@ -1037,7 +1067,7 @@ pub fn print_validation_suite(s: &ValidationSuite, config: &AppConfig) {
 
 pub fn print_regimes(rows: &[RegimeRow]) {
     let widths = [30, 24, 14, 14, 14, 14, 8];
-    println!("\n── 牛熊分段（长周期代理层，策略与买入持有同口径） ──────────────────");
+    println!("\n── 牛熊分段（策略与买入持有同口径） ────────────────────────────────");
     println!("{}", row(&["区间", "起止", "策略收益", "策略MaxDD", "持有收益", "持有MaxDD", "笔数"], &widths));
     println!("{}", "-".repeat(128));
     for r in rows {
@@ -1109,6 +1139,53 @@ mod tests {
             bars: v,
             caveats: vec![],
         }
+    }
+
+    /// 回归：起点急跌样本里，信号需 N 日历史才给出首个决策日。
+    /// 若策略/常数仓位等到决策日才建仓，就会整体躲过起点跌幅，形成虚假的相对收益。
+    #[test]
+    fn 起点统一建仓_常数满仓与买入持有不应有偏差() {
+        let mut c = cfg();
+        c.allocation.us_stocks = 1.0;
+        c.allocation.cn_stocks = 0.0;
+        c.allocation.counter_cyclical = 0.0;
+        c.rebalance.min_trade_amount = 1.0;
+        let prices = [100.0, 92.0, 85.0, 88.0, 90.0, 95.0,
+                      100.0, 105.0, 110.0, 112.0, 115.0, 118.0];
+        let start = NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+        let bs = BarSeries {
+            kind: DatasetKind::Long,
+            label: "start-drop".into(),
+            bars: prices.iter().enumerate().map(|(i, p)| Bar {
+                date: start + Duration::days(i as i64),
+                fgi: Some(50.0),
+                fgi_age_days: 1,
+                prices: [*p, *p, *p],
+                unit_nav: None,
+            }).collect(),
+            caveats: vec![],
+        };
+        let n = bs.bars.len();
+        let sig = SignalSeries {
+            effective: vec![50.0; n],
+            decision: (0..n).map(|i| i == 8).collect(),
+            raw_min: 0.0,
+            raw_max: 100.0,
+        };
+        let mut bh = AuditOptions::spanning("买入持有", &bs, &c);
+        bh.initial_cash = 100_000.0;
+        bh.buy_and_hold = true;
+        let mut c100 = bh.clone();
+        c100.name = "常数满仓".into();
+        c100.buy_and_hold = false;
+        c100.variant = SignalVariant::Constant(1.0);
+        let a = run_audit(&c, &bs, &sig, &bh).unwrap();
+        let b = run_audit(&c, &bs, &sig, &c100).unwrap();
+        assert!(
+            (a.total_return - b.total_return).abs() < 0.005,
+            "同一执行日建仓时常数满仓 {:+.4} 与买入持有 {:+.4} 应一致，差异说明存在起点偏差",
+            b.total_return, a.total_return
+        );
     }
 
     #[test]

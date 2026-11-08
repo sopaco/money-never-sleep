@@ -3,6 +3,7 @@ mod backtest;
 mod cli;
 mod config;
 mod db;
+mod guardrail;
 // 数据集模块含完整的 CSV 元数据契约与可复算轨迹（抓取日、各腿起止、stale 天数、
 // FGI 来源段等），部分字段供审计导出使用、当前打印层未全部消费。
 #[allow(dead_code)]
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
         Commands::Report { decide } => cmd_report(decide).await?,
         Commands::Today { decide, quiet } => cmd_today(decide, quiet).await?,
         Commands::Plan { monthly } => cmd_plan(monthly)?,
+        Commands::Guard => cmd_guard()?,
         Commands::History { limit } => cmd_history(limit)?,
         Commands::Backtest {
             action,
@@ -69,6 +71,7 @@ async fn main() -> Result<()> {
         } => match action {
             None => cmd_backtest_audit(config)?,
             Some(BacktestAction::Mirror) => cmd_backtest_mirror(config)?,
+            Some(BacktestAction::Asset { dataset }) => cmd_backtest_asset(config, &dataset)?,
             Some(BacktestAction::UpdateData) => cmd_backtest_update_data()?,
             Some(BacktestAction::ValidateFull { iterations }) => {
                 cmd_backtest_validate_full(config, iterations)?
@@ -1134,6 +1137,36 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
     );
     println!("提示: 执行后用 `mns buy <代码> <份额> <价格>` 记录，未买完的钱留在现金里下月继续。");
     println!("定投不产生收益 alpha，提升的是储蓄率与执行纪律。");
+    guardrail::print_advice(&config, score);
+    Ok(())
+}
+
+/// 买入冷静期：只读当前情绪状态，给出二次确认提示，不改动任何仓位。
+fn cmd_guard() -> Result<()> {
+    let config = AppConfig::load()?;
+    let db = db::Database::open()?;
+    let history = db.recent_fear_greed_scores(90)?;
+    let latest = history
+        .last()
+        .map(|(_, s)| *s)
+        .ok_or_else(|| anyhow::anyhow!("本地没有恐贪快照，请先运行一次 `mns report`"))?;
+    let today = chrono::Local::now().date_naive();
+    let signal = signal::compute(&config, latest, &history, today);
+
+    println!("=================================================================");
+    println!("   买入冷静期（流程约束，非择时信号）");
+    println!("=================================================================");
+    println!();
+    println!(
+        "最新恐贪快照 {:.1} | 有效决策分数 {:.1} | 过热阈值 {:.0} | 分区 {}",
+        latest,
+        signal.effective_score,
+        config.guardrail.hot_threshold,
+        config.sentiment_zone(signal.effective_score)
+    );
+    guardrail::print_advice(&config, signal.effective_score);
+    println!();
+    println!("执行买入时把理由记进流水（`mns history` 可复盘），本工具不替你做决定。");
     Ok(())
 }
 
@@ -1225,6 +1258,11 @@ fn cmd_backtest_update_data() -> Result<()> {
     if let Ok(f) = long.freshness(config.backtest.freshness_sla_days) {
         println!("长周期层 {}", f.banner());
     }
+    if let Ok(hs) = live_data::LongDataset::load_named(&config, "hs300") {
+        if let Ok(f) = hs.freshness(config.backtest.freshness_sla_days) {
+            println!("沪深300 实验 {}", f.banner());
+        }
+    }
     Ok(())
 }
 
@@ -1281,6 +1319,133 @@ fn cmd_backtest_validate_full(config_path: Option<String>, iterations: Option<us
 
     println!("\n═══ 边界声明 ═══════════════════════════════════════════════════════");
     for c in &long_bars.caveats {
+        println!("  · {c}");
+    }
+    println!("  · 本报告为工程与方法验证，不构成投资建议。");
+    Ok(())
+}
+
+/// 因果性本地逆向分值：只用 t 及之前的收盘价算 200 日均线偏离。
+/// 分数语义与 FGI 一致（低分 = 超跌/恐慌 → 加仓；高分 = 超涨/贪婪 → 减仓）。
+/// 替换输入后仍走 `signal::compute` 的同一套平滑/确认/决策逻辑，
+/// 因此与 FGI 组的差异只来自分值本身，不来自执行口径。
+fn local_reversal_scores(bars: &[live_data::Bar], window: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(bars.len());
+    let mut sum = 0.0_f64;
+    for i in 0..bars.len() {
+        let p = bars[i].prices[0];
+        sum += p;
+        if i >= window {
+            sum -= bars[i - window].prices[0];
+        }
+        let count = (i + 1).min(window);
+        let ma = sum / count as f64;
+        let dev = p / ma - 1.0;
+        out.push((50.0 + dev * 200.0).clamp(0.0, 100.0));
+    }
+    out
+}
+
+/// 单资产对照实验：同一套引擎、同一套信号/成本/执行/回撤口径，
+/// 检验 MNS 逆向择时框架放到单一宽基（默认沪深300）上的效果。
+/// 额外加一组 A 股本地信号，用来区分「FGI 这个输入不合适」与「框架本身无效」。
+fn cmd_backtest_asset(config_path: Option<String>, dataset: &str) -> Result<()> {
+    let mut config = load_audit_config(config_path)?;
+    let ds = live_data::LongDataset::load_named(&config, dataset)?;
+    if ds.days.is_empty() {
+        anyhow::bail!("实验数据集为空: {dataset}");
+    }
+    // 单资产：把三腿权重压到第一腿，严格等价于「标的 × 仓位 + 现金」
+    if ds.meta.single_asset {
+        config.allocation.us_stocks = 1.0;
+        config.allocation.cn_stocks = 0.0;
+        config.allocation.counter_cyclical = 0.0;
+    }
+    let bars = ds.to_bars();
+
+    println!("\n═══ 单资产对照实验：{dataset} ══════════════════════════════════════════");
+    if let Ok(f) = ds.freshness(config.backtest.freshness_sla_days) {
+        println!("  数据 {}", f.banner());
+    }
+    println!("  区间 {} ~ {}，{} 个交易日",
+        bars.bars.first().map(|b| b.date.to_string()).unwrap_or_default(),
+        bars.bars.last().map(|b| b.date.to_string()).unwrap_or_default(),
+        bars.bars.len());
+    println!("  标的 {}；通道 场内 ETF T+1；本金 ¥100,000，无外部注资", bars.label);
+    println!("  口径 与 `mns backtest` 完全一致：7 天平滑 + 3 天确认 + 周频决策、");
+    println!("       T+1 执行、同一成本模型、同一日频净值与回撤口径");
+    println!("  ⚠ 单资产对照实验，结论不可迁移到三资产实盘配置；不构成投资建议");
+
+    let mut opt = audit::AuditOptions::spanning("情绪信号(FGI)", &bars, &config);
+    opt.initial_cash = 100_000.0;
+
+    println!("\n── A. 原策略：CNN 恐贪指数 FGI ──────────────────────────────────────");
+    let sig = audit::build_signal_series(&config, &bars.bars);
+    let suite = audit::run_validation_suite(&config, &bars, &sig, &opt)?;
+    audit::print_validation_suite(&suite, &config);
+
+    println!("\n── B. 仅替换输入信号：沪深300 自身 200 日均线偏离（逆向） ──────────────");
+    println!("   平滑/确认/决策日/成本/执行与 A 组完全相同，差异只来自分值本身");
+    let local_raw = local_reversal_scores(&bars.bars, 200);
+    let local_sig = audit::build_signal_series_with_raw(&config, &bars.bars, &local_raw);
+    let mut local_opt = opt.clone();
+    local_opt.name = "本地趋势逆向信号".to_string();
+    let local_suite = audit::run_validation_suite(&config, &bars, &local_sig, &local_opt)?;
+    audit::print_validation_suite(&local_suite, &config);
+
+    // holdout：末尾连续 36 个月，与主序列共用同一复利净值
+    let end = bars.bars.len() - 1;
+    let hold_from = bars.bars[end].date - chrono::Duration::days(365 * 3);
+    let hs = bars.bars.partition_point(|b| b.date < hold_from);
+    let mut ho = opt.clone();
+    ho.start_idx = hs;
+    ho.end_idx = end;
+    ho.name = "最近 36 月 holdout".to_string();
+    let hold_real = audit::run_audit(&config, &bars, &sig, &ho)?;
+    let mut ho_bh = ho.clone();
+    ho_bh.name = "holdout 买入持有".to_string();
+    ho_bh.variant = audit::SignalVariant::Constant(1.0);
+    ho_bh.buy_and_hold = true;
+    let hold_bh = audit::run_audit(&config, &bars, &sig, &ho_bh)?;
+    audit::print_result_table(&[&hold_real, &hold_bh], "holdout ≥36 月（连续复利）");
+
+    if !ds.meta.regimes.is_empty() {
+        println!("  分段按 A 股市场共识日历划定（非算法识别），各段买入持有涨跌见下方诊断");
+        let rows = audit::run_regimes(&config, &bars, &sig, &opt, &ds.meta.regimes);
+        audit::print_regimes(&rows);
+    }
+
+    println!("\n═══ 数据诊断 ═══════════════════════════════════════════════════════");
+    let num = |k: &str| ds.meta.diagnostics.get(k).and_then(|v| v.as_f64());
+    if let (Some(tot), Some(ann), Some(dd)) = (
+        num("price_total_return_pct"), num("price_annualized_pct"), num("price_max_drawdown_pct")) {
+        println!("  标的全期 {tot:+.2}% / 年化 {ann:+.2}% / 日频最大回撤 {dd:.2}%");
+    }
+    if let (Some(c), Some(n)) = (num("fgi_vs_forward_20d_corr"), num("fgi_vs_forward_20d_pairs")) {
+        println!("  FGI 与 A 股未来 20 日收益相关系数 {c:.4}（n={:.0}）", n);
+    }
+    if let Some(obj) = ds.meta.diagnostics.get("forward_20d_return_by_fgi_bucket")
+        .and_then(|v| v.as_object()) {
+        println!("  各 FGI 分档的未来 20 日平均收益：");
+        for k in ["<20", "20-40", "40-55", "55-75", ">=75"] {
+            if let Some(v) = obj.get(k) {
+                let avg = v.get("avg_fwd_20d_pct").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+                let n = v.get("samples").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                println!("    {k:>6}  n={n:>4.0}  {avg:+.3}%");
+            }
+        }
+    }
+    if let Some(arr) = ds.meta.regime_buy_hold_check.as_array() {
+        println!("  各牛熊段买入持有：");
+        for v in arr {
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let r = v.get("buy_hold_pct").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+            println!("    {name:<24} {r:+7.2}%");
+        }
+    }
+
+    println!("\n═══ 边界声明 ═══════════════════════════════════════════════════════");
+    for c in &bars.caveats {
         println!("  · {c}");
     }
     println!("  · 本报告为工程与方法验证，不构成投资建议。");
@@ -1743,12 +1908,22 @@ fn cmd_config_params() -> Result<()> {
     println!("  【显示】不驱动交易，仅改变报告/持仓表展示");
     println!("    settings.annualized_target_high  年化收益 ≥ 此值(%)时绿色标记 (默认: 15)");
     println!();
+    println!("  【买入冷静期】只做减速与留痕，不阻断交易、不改仓位");
+    println!("    guardrail.enabled          是否启用过热提示 (默认: true)");
+    println!("    guardrail.hot_threshold    触发提示的 FGI 分数 (默认: 75)");
+    println!("    guardrail.cooldown_days    建议延迟的交易日数 (默认: 1)");
+    println!("    guardrail.show_stats       显示历史描述性统计（未通过显著性检验）");
+    println!("    注: 自动否决买入在长期上行资产池上期望为负，故本功能不拦截。");
+    println!("        详见 docs/guardrail-experiment-2026-11-08.md");
+    println!();
     println!("用法示例:");
     println!("  mns backtest                           # 实盘审计：有效性检验 + 牛熊分段 + 账户镜像");
     println!("  mns backtest mirror                    # 只看严格执行 vs 实际执行");
-    println!("  mns backtest update-data               # 重建两层日频数据集（含新鲜度校验）");
+    println!("  mns backtest asset --dataset hs300     # 单资产对照实验（含 A 股本地信号对照）");
+    println!("  mns backtest update-data               # 重建三层日频数据集（含新鲜度校验）");
     println!("  mns backtest validate-full             # 只看统计检验（可 --iterations 覆盖次数）");
     println!("  mns backtest legacy                    # 已降级：2016-2025 月频代理对比，不可用于实盘");
+    println!("  mns guard                              # 查看当前是否处于买入冷静期");
     println!("  mns config rebalance.band_pp 6          # 放宽偏离带以减少交易");
     Ok(())
 }

@@ -108,7 +108,7 @@ pub enum Commands {
         /// 非决策日仍强制生成决策版报告（含调仓指令）
         #[arg(long)]
         decide: bool,
-        /// 只输出结论与报告路径，不打印价格明细
+        /// 跳过过程日志与价格更新明细（报告全文仍照常打印）
         #[arg(long)]
         quiet: bool,
     },
@@ -119,6 +119,9 @@ pub enum Commands {
         #[arg(long)]
         monthly: Option<f64>,
     },
+
+    /// 买入冷静期：查看当前情绪是否过热及二次确认提示（不阻断交易、不改仓位）
+    Guard,
 
     /// 查看交易流水（买入/卖出/入金/出金/纠错，新→旧）
     History {
@@ -193,6 +196,12 @@ pub enum CashAction {
 pub enum BacktestAction {
     /// 账户镜像：严格执行策略 vs 数据库真实交易流水（仅实盘层）
     Mirror,
+    /// 单资产对照实验：用同一套审计引擎检验策略用于单一宽基的效果（默认沪深300）
+    Asset {
+        /// 实验数据集名称，对应 `<name>_daily.csv`
+        #[arg(long, default_value = "hs300")]
+        dataset: String,
+    },
     /// 重建实盘与长周期日频数据集（抓取行情与情绪，含新鲜度校验）
     UpdateData,
     /// 完整有效性检验：置换/常数仓位/延迟/随机对照 + 牛熊分段 + 多折 walk-forward

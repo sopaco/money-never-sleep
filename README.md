@@ -11,12 +11,22 @@
 
 ---
 
+> **Status update (2026-11-08)**: the default `mns backtest` is now a live-account audit
+> (real fund NAVs, point-in-time signals, channel-level settlement, account mirror), not the
+> 2016–2025 monthly-proxy strategy comparison described in the tables below. Those legacy
+> numbers are kept for history only and **must not be used for live decisions** — the old
+> engine is `mns backtest legacy`. Validation shows the sentiment signal has no statistically
+> significant timing contribution (63rd percentile in a permutation test, below the 80th
+> percentile threshold); constant 70–75% exposure is often equivalent or better with fewer
+> trades. See [`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md) and the
+> Chinese README for the current feature map and correct usage.
+
 ## The biggest enemy of investing is not the market, but human nature
 
 Fear prevents buying when prices drop, greed prevents selling when prices rise—this is the instinctive dilemma every investor faces. MNS digitizes contrarian investment strategies, replacing emotion with rules, letting data drive decisions:
 
 - 🎯 **Automatically suggest buying during extreme fear**, not panic selling
-- 💰 **Remind to take profit when annualized returns meet targets**, not chasing highs
+- ⚠️ **Warn when a position is more than 20% underwater**, with wording that depends on sentiment
 - ⚠️ **Smart alerts when positions are underwater**, not ignoring losses
 - 📊 **Honest backtest reporting**: better risk-adjusted than buy-and-hold (Calmar 1.17 vs 0.98), but **lower returns**
 
@@ -27,7 +37,13 @@ Fear prevents buying when prices drop, greed prevents selling when prices rise�
 ### 🧠 Based on Real Market Data
 Integrated CNN Fear & Greed Index, real-time market sentiment sensing, automatically saves historical snapshots for retrospective analysis.
 
-### 📈 Validated Strategy Parameters
+### 📈 Legacy Backtest Numbers (2026-11-08: demoted, do not use for live decisions)
+The tables in this section come from the **old monthly proxy engine** (`mns backtest legacy`):
+2016-2025 monthly bars, 3-month smoothing, month-end execution, ¥100k start plus ¥50k/year inflow.
+They do not match the live account or the current signal path. Current evidence and usage are in
+[`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md) and
+[`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md).
+
 Backtested on 2016-2025 **real total-return data** (CNY-denominated, dividends included), **net of transaction costs, tiered redemption fees and cash yield**.
 Default allocation: US 55%, CN 25%, Gold 20%; target risk-asset weight moves between 35% and 85% with sentiment.
 
@@ -75,16 +91,20 @@ The live decision path therefore applies three filters (see `src/signal.rs`, con
 | `zone_confirm_days` | `3` | A zone switch takes effect only after the smoothed score holds the new zone for N consecutive days; otherwise the previous zone stays |
 | `decision_weekday` | `5` | `mns report` outputs a full "decision report" only on that weekday (1=Mon…7=Sun, 0=daily); other days output an observation-only report; `mns report --decide` forces a decision report |
 
-In-sample comparison (monthly backtest, `mns backtest` comparison table): smoothing window 1 → 3 → 6 months
-changes XIRR 8.57% → 9.79% → 9.91%, Sharpe 0.87 → 1.01 → 1.09, trades/year 14.8 → 10.2 → 6.4 —
-longer smoothing means fewer trades and better risk-adjusted numbers. Daily snapshots are stored
-locally (`fear_greed_snapshots` in SQLite), so smoothing works offline and survives CNN API changes.
+The old in-sample smoothing comparison (14.8 → 10.2 → 6.4 trades/year) has been **retracted**:
+it used a non-active config with monthly signals and does not reproduce under the active
+configuration. Do not cite it as evidence. Daily snapshots are stored locally
+(`fear_greed_snapshots` in SQLite), so smoothing works offline and survives CNN API changes.
 
 ### 🔄 Buy/Sell Awareness
 Cash recovered from selling automatically counts toward buying budget, calculate sell first then buy, maximizing capital utilization.
 
-### 🛡️ Dual Profit-Taking Mechanism
-Annualized return target OR absolute return ≥30%, two ways to lock in profits, not missing long-term compounding effects.
+### 🛡️ No profit-taking rules in the current decision path
+The "dual profit-taking" description in older docs is obsolete. `mns report` does not sell to
+lock in profits: target weights depend only on the sentiment score, never on an individual
+position's P&L. The only return-related behaviour is that `mns portfolio` highlights a position
+whose annualized return crosses `settings.annualized_target_high`, and the decision report
+shows a risk warning for positions more than 20% underwater.
 
 ### 🎯 Contrarian Buying Logic
 The more underwater, the more suggested to buy (with weight cap), truly achieving "be greedy when others are fearful".
@@ -125,19 +145,33 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Initialize
 mns init
-mns cash set 100000
+mns cash deposit 10000       # external inflow (XIRR basis); `cash set` is a correction tool only
+mns add 018966 "Nasdaq 100 feeder" us_stocks
+mns buy 018966 <shares> <price>
+mns config params            # full list of tunable parameters
 
-# Daily usage
-mns add QQQ "Nasdaq 100" us_stocks
-mns buy QQQ 50 380.00
-mns today           # One-shot: refresh prices + report (continues if prices fail)
-mns report          # Decision report on config'd weekday, otherwise observation-only
-mns report --decide # Force a decision report on any day
-mns plan --monthly 3000  # Monthly DCA plan (buys only)
-mns config profile balanced  # Risk profile: steady / balanced / aggressive
-mns backtest          # Strategy comparison + 3 profiles + inflow frequency
-mns backtest validate # Out-of-sample validation + bootstrap + holdout
+# Weekly (default decision day: Friday)
+mns today                    # refresh prices + report; observation-only on other days
+mns performance              # read-only XIRR / actual max drawdown
+
+# Monthly
+mns plan --monthly 3000      # buy-only DCA allocation; --monthly is required if cashflow.monthly = 0
+mns guard                    # cooling-off hint: delay 1 trading day + write down the reason
+mns history 20               # review executions
+
+# Periodic audit
+mns backtest update-data     # rebuild 3 daily datasets + freshness SLA (default 30 days)
+mns backtest                 # full live audit: controls, holdout, regimes, walk-forward, mirror
+mns backtest mirror          # strict strategy vs actual transactions only
+mns backtest asset --dataset hs300   # single-asset control experiment
+
+# Demoted, do not use for live decisions
+mns backtest legacy          # old 2016-2025 monthly proxy comparison
+mns backtest validate        # old single-split walk-forward + bootstrap
 ```
+
+`mns guard` is a process guardrail, not a timing signal: it does not block trades, change
+weights or issue buy/sell instructions. See [`docs/guardrail-experiment-2026-11-08.md`](docs/guardrail-experiment-2026-11-08.md).
 
 ### Risk profiles
 
@@ -156,6 +190,10 @@ behavior.
 |---------------|-------------|
 | [.terrain/human/](.terrain/human/) | Human-friendly docs: project overview, architecture, workflows |
 | [.agents/skills/mns-backtest/SKILL.md](.agents/skills/mns-backtest/SKILL.md) | Backtest skill: AI-facing steps, parameters, data-file reference |
+| [README_zh.md](README_zh.md) | Current feature map and correct usage (Chinese, post-remediation) |
+| [docs/remediation-2026-11-08.md](docs/remediation-2026-11-08.md) | Live-audit remediation, dataset contracts, acceptance results |
+| [docs/guardrail-experiment-2026-11-08.md](docs/guardrail-experiment-2026-11-08.md) | Cooling-off guardrail significance experiment |
+| [docs/hs300-experiment-2026-11-08.md](docs/hs300-experiment-2026-11-08.md) | CSI 300 single-asset control experiment |
 | [AGENTS.md](AGENTS.md) | AI Coding Agent working guidelines |
 
 ---
