@@ -13,7 +13,7 @@ mod strategy;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{BacktestAction, CashAction, Commands};
+use cli::{BacktestAction, CashAction, Commands, ConfigAction};
 use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use config::AppConfig;
 
@@ -23,13 +23,18 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { force } => cmd_init(force)?,
-        Commands::Config { key, value } => cmd_config(key, value)?,
+        Commands::Config { action, key, value } => match action {
+            None => cmd_config(key, value)?,
+            Some(ConfigAction::Params) => cmd_config_params()?,
+        },
         Commands::Cash { action } => match action {
             None => cmd_cash()?,
             Some(CashAction::Set { amount }) => cmd_cash_set(amount)?,
-            Some(CashAction::Add { amount }) => cmd_cash_add(amount)?,
+            Some(CashAction::Deposit { amount, note }) => cmd_cash_deposit(amount, note)?,
+            Some(CashAction::Withdraw { amount, note }) => cmd_cash_withdraw(amount, note)?,
         },
         Commands::Portfolio => cmd_portfolio()?,
+        Commands::Performance => cmd_performance()?,
         Commands::Add {
             code,
             name,
@@ -52,17 +57,18 @@ async fn main() -> Result<()> {
         Commands::Today { decide, quiet } => cmd_today(decide, quiet).await?,
         Commands::Plan { monthly } => cmd_plan(monthly)?,
         Commands::History { limit } => cmd_history(limit)?,
-        Commands::Backtest { action } => match action {
-            None => cmd_backtest(None, None)?,
-            Some(BacktestAction::Run { config, compare }) => cmd_backtest(config, compare)?,
+        Commands::Backtest {
+            action,
+            config,
+            compare,
+        } => match action {
+            None => cmd_backtest(config, compare)?,
             Some(BacktestAction::Validate { iterations, block }) => {
                 cmd_backtest_validate(iterations, block)?
             }
-            Some(BacktestAction::Params) => cmd_backtest_params()?,
         },
         Commands::UpdatePrices => cmd_update_prices().await?,
         Commands::Market => cmd_market().await?,
-        Commands::MarketIndices => cmd_market_indices().await?,
         Commands::Analyze { symbol } => cmd_analyze(&symbol).await?,
     }
 
@@ -122,10 +128,11 @@ fn cmd_init(force: bool) -> Result<()> {
     println!("  数据库:   {}", db_path.display());
     println!("  报告目录: {}", report_dir);
     println!(
-        "  风险档位: {}（中性目标 {:.0}%，用 `mns config profile <steady|balanced|aggressive>` 切换）",
+        "  风险档位: {}（中性目标 {:.0}%，用 `mns config profile <none|steady|balanced|aggressive>` 切换）",
         config.profile_label(),
         config.effective_neutral_weight()
     );
+    println!("  档位语义: 档位抬高常驻仓位并收窄择时摆幅（不降低风险）；追求最小回撤可选 none（曲线原样）");
     Ok(())
 }
 
@@ -147,21 +154,120 @@ fn cmd_config(key: Option<String>, value: Option<String>) -> Result<()> {
         }
         (Some(k), Some(v)) => {
             // 修改配置项：校验通过后才落盘，避免写出无法加载的配置
+            let old_config = config.clone();
             config.set_value(&k, &v)?;
             config.validate()?;
             config.save()?;
             println!("✓ {} = {}", k, v);
+            // 档位类改动会立即重锚目标仓位——切换前预告将引发的调仓规模
+            // （带宽/平滑/确认管不到这个盲区），见 P1-5。
+            if k == "profile" || k == "profile.core_blend" {
+                print_profile_switch_preview(&old_config, &config);
+            }
         }
         (None, Some(_)) => unreachable!(),
     }
     Ok(())
 }
 
+/// `mns config profile` 切换后的调仓影响预告（W5）。
+///
+/// 用最新本地恐贪快照算决策分数，对比新旧档位的目标仓位与当前实际权重，
+/// 预告"下次决策日预计需要买/卖多少"。本地无数据时降级为一句说明，
+/// 不阻塞配置修改本身。
+fn print_profile_switch_preview(old: &AppConfig, new: &AppConfig) {
+    let attempted = (|| -> Result<()> {
+        let db = db::Database::open()?;
+        let history = db.recent_fear_greed_scores(90)?;
+        let Some((&(snap_date, latest), _)) = history.split_last() else {
+            println!("  （本地无恐贪快照，跳过调仓影响预告——运行一次 mns report 后可得）");
+            return Ok(());
+        };
+        // split_last 的 rest 是切片；signal::compute 需要 Vec（不含"今天"的升序历史）
+        let rest: crate::signal::ScoreHistory = history[..history.len() - 1].to_vec();
+        let today = chrono::Local::now().date_naive();
+        let signal = signal::compute(new, latest, &rest, today);
+        let cash = db.get_cash_balance()?;
+        let positions = db.list_positions()?;
+        let impact =
+            strategy::profile_switch_impact(old, new, signal.effective_score, cash, &positions);
+
+        if impact.current_risk <= 0.0 && cash <= 0.0 {
+            println!("  （账户未注资，跳过调仓影响预告）");
+            return Ok(());
+        }
+        println!(
+            "  ▸ 档位切换预告（快照 {}，决策分数 {:.1}）:",
+            snap_date.format("%Y-%m-%d"),
+            signal.effective_score
+        );
+        println!(
+            "    目标风险仓位: {:.1}% → {:.1}%（当前实际 {:.1}%）",
+            impact.old_target, impact.new_target, impact.current_risk
+        );
+        if impact.in_band {
+            println!(
+                "    下次决策日预计无需调仓（偏离 {:+.1}pp 在带宽 ±{:.1}pp 内）",
+                impact.drift_pp, new.rebalance.band_pp
+            );
+        } else {
+            println!(
+                "    下次决策日预计需{}约 ¥{:.0}（偏离 {:+.1}pp；实际执行还受各腿带宽/最短持有期约束）",
+                impact.direction, impact.est_amount, impact.drift_pp
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = attempted {
+        println!("  （调仓影响预告不可用: {}）", e);
+    }
+}
+
 fn cmd_cash() -> Result<()> {
     let db = db::Database::open()?;
     let balance = db.get_cash_balance()?;
     println!("现金余额: ¥{:.2}", balance);
+
+    // C1：余额 + 最近 5 条外部流水，让"钱从哪来"一眼可查
+    let flows = db.list_cash_flows(5)?;
+    if flows.is_empty() {
+        println!("（暂无流水；外部资金进出用 mns cash deposit / withdraw）");
+    } else {
+        println!("\n最近流水:");
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .apply_modifier(UTF8_ROUND_CORNERS);
+        table.set_header(vec![
+            Cell::new("日期"),
+            Cell::new("类型"),
+            Cell::new("金额"),
+            Cell::new("备注"),
+        ]);
+        for f in &flows {
+            table.add_row(vec![
+                Cell::new(f.flow_date.format("%Y-%m-%d").to_string()),
+                Cell::new(flow_kind_cn(&f.kind)),
+                Cell::new(format!("{:+.2}", f.amount)),
+                Cell::new(f.note.clone().unwrap_or_default()),
+            ]);
+        }
+        for line in table.to_string().lines() {
+            println!("  {}", line);
+        }
+    }
     Ok(())
+}
+
+/// 台账类型 → 中文（展示用）。
+fn flow_kind_cn(kind: &str) -> &'static str {
+    match kind {
+        "deposit" => "入金",
+        "withdraw" => "出金",
+        "opening" => "期初",
+        "adjust" => "调整",
+        _ => "未知",
+    }
 }
 
 fn cmd_cash_set(amount: f64) -> Result<()> {
@@ -169,15 +275,60 @@ fn cmd_cash_set(amount: f64) -> Result<()> {
         anyhow::bail!("现金余额不能为负数: {}", amount);
     }
     let db = db::Database::open()?;
+    let old = db.get_cash_balance()?;
     db.set_cash_balance(amount)?;
-    println!("✓ 现金余额已设置为: ¥{:.2}", amount);
+    // C1：set 是纠错工具，但每次纠错都记 adjust 流水（带 原值→新值），
+    // 保证余额历史可以从台账重建；无变化则不记（避免噪声）
+    let delta = amount - old;
+    if delta.abs() >= 0.005 {
+        let today = chrono::Local::now().date_naive();
+        db.add_cash_flow(
+            today,
+            delta,
+            "adjust",
+            Some(&format!("余额纠错: ¥{:.2} → ¥{:.2}", old, amount)),
+        )?;
+        println!(
+            "✓ 现金余额已设置为: ¥{:.2}（已记调整流水 {:+.2}）",
+            amount, delta
+        );
+    } else {
+        println!("✓ 现金余额已设置为: ¥{:.2}", amount);
+    }
     Ok(())
 }
 
-fn cmd_cash_add(amount: f64) -> Result<()> {
+/// C1：外部入金——资金进入组合的主通道（XIRR 口径的资金流入）。
+fn cmd_cash_deposit(amount: f64, note: Option<String>) -> Result<()> {
+    if amount <= 0.0 {
+        anyhow::bail!("入金金额必须为正数: {}", amount);
+    }
     let db = db::Database::open()?;
     let new_balance = db.add_cash(amount)?;
-    println!("✓ 已增加 ¥{:.2}，当前余额: ¥{:.2}", amount, new_balance);
+    let today = chrono::Local::now().date_naive();
+    db.add_cash_flow(today, amount, "deposit", note.as_deref())?;
+    println!("✓ 入金 ¥{:.2}，当前余额: ¥{:.2}", amount, new_balance);
+    Ok(())
+}
+
+/// C1：外部出金——资金离开组合（XIRR 口径的资金流出）。
+fn cmd_cash_withdraw(amount: f64, note: Option<String>) -> Result<()> {
+    if amount <= 0.0 {
+        anyhow::bail!("出金金额必须为正数: {}", amount);
+    }
+    let db = db::Database::open()?;
+    let balance = db.get_cash_balance()?;
+    if amount > balance + 0.005 {
+        anyhow::bail!(
+            "出金超过现金余额（当前 ¥{:.2}，要取出 ¥{:.2}）。若资金在持仓里，\
+             请先用 mns sell 落账再取",
+            balance, amount
+        );
+    }
+    db.set_cash_balance(balance - amount)?;
+    let today = chrono::Local::now().date_naive();
+    db.add_cash_flow(today, -amount, "withdraw", note.as_deref())?;
+    println!("✓ 出金 ¥{:.2}，当前余额: ¥{:.2}", amount, balance - amount);
     Ok(())
 }
 
@@ -258,6 +409,241 @@ fn cmd_portfolio() -> Result<()> {
     println!("\n现金余额: ¥{:.2}", cash);
     println!("持仓市值: ¥{:.2}", total_mv);
     println!("总资产:   ¥{:.2}", cash + total_mv);
+    Ok(())
+}
+
+/// C2 组合仪表盘：只读性能视图，零写入（常用路径保持轻量，此为单独入口）。
+///
+/// 章节与数据源：
+/// 1. 组合 XIRR —— cash_flows 全部外部流水 + 当日终值（金额加权，资金
+///    何时到账才算数）；metrics::xirr 本就支持不规则日期流，只需把台账
+///    的「入金为正」翻转成 XIRR 的「投入为负」。
+/// 2. 实际最大回撤 —— portfolio_snapshots 的 total_value 日序列（C3 积累）。
+/// 3. 对照策略预期 —— 参考值现场计算（当前配置 × 内置数据集，单引擎秒级），
+///    不硬编码回测数字——数字会过期（与 W1 同一决策）。
+/// 4. 资产曲线摘要 —— 快照序列的期初/当前/峰值/谷值。
+/// 5. 趋势锚就绪进度（C4）—— price_history 每腿最长净值历史天数。
+fn cmd_performance() -> Result<()> {
+    use backtest::{BacktestConfig, Engine, SignalConfig};
+
+    let db = db::Database::open()?;
+    let config = AppConfig::load()?;
+    let positions = db.list_positions()?;
+    let cash = db.get_cash_balance()?;
+    let today = chrono::Local::now().date_naive();
+    // 终值与账户概览同口径（无现价时退回成本）
+    let holdings_value: f64 =
+        positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let terminal = cash + holdings_value;
+
+    println!("═════════════════════════════════════════════════");
+    println!(" 组合绩效仪表盘（只读） {}", today.format("%Y-%m-%d"));
+    println!("═════════════════════════════════════════════════");
+
+    // ── 1. 组合 XIRR ─────────────────────────────
+    println!("\n【组合 XIRR（金额加权）】");
+    let flows = db.all_cash_flows()?;
+    let ledger: Vec<(chrono::NaiveDate, f64)> =
+        flows.iter().map(|f| (f.flow_date, f.amount)).collect();
+    let net_inflow: f64 = flows.iter().map(|f| f.amount).sum::<f64>() + 0.0;
+    let flow_days = flows
+        .first()
+        .map(|f| (today - f.flow_date).num_days())
+        .unwrap_or(0);
+    if flows.is_empty() {
+        println!("  暂无台账记录");
+    } else {
+        println!(
+            "  外部净流入: ¥{:.2}（{} 笔，自 {} 起，追踪 {} 天）",
+            net_inflow,
+            flows.len(),
+            flows.first().unwrap().flow_date.format("%Y-%m-%d"),
+            flow_days
+        );
+        println!("  当前总资产: ¥{:.2}", terminal);
+        let xirr_flows = metrics::xirr_flows_from_ledger(&ledger, terminal, today);
+        match metrics::xirr(&xirr_flows) {
+            Some(x) => {
+                println!("  XIRR: {:+.2}%", x * 100.0);
+                if flow_days < 30 {
+                    println!("  （追踪 {} 天，样本过短，仅供参考）", flow_days);
+                }
+            }
+            None => println!("  XIRR: 暂无法计算（无符号相反的现金流——余额与市值均为 0？）"),
+        }
+    }
+
+    // ── 2. 实际最大回撤 ─────────────────────────
+    println!("\n【实际最大回撤】（基于每日总资产快照）");
+    let series = db.portfolio_snapshot_series()?;
+    let curve_days = series
+        .first()
+        .map(|(d, _)| (today - *d).num_days())
+        .unwrap_or(0);
+    let actual_dd = metrics::drawdown_summary(&series);
+    match (&actual_dd, series.last()) {
+        (Some(s), Some(&(last_date, last_value))) => {
+            println!(
+                "  最大回撤: {:.2}%（峰值 ¥{:.2} @ {} → 谷值 ¥{:.2} @ {}）",
+                s.max_dd * 100.0,
+                s.peak_value,
+                s.peak_date.format("%Y-%m-%d"),
+                s.trough_value,
+                s.trough_date.format("%Y-%m-%d")
+            );
+            if last_value < s.all_time_peak && s.all_time_peak > 0.0 {
+                println!(
+                    "  当前距峰值: {:.2}%（全期峰值 ¥{:.2} @ {}，当前 ¥{:.2} @ {}）",
+                    (s.all_time_peak - last_value) / s.all_time_peak * 100.0,
+                    s.all_time_peak,
+                    s.all_time_peak_date.format("%Y-%m-%d"),
+                    last_value,
+                    last_date.format("%Y-%m-%d")
+                );
+            } else {
+                println!("  当前即全期峰值（¥{:.2}）", last_value);
+            }
+            println!(
+                "  （{} 个数据点，自 {} 起积累）",
+                series.len(),
+                series.first().unwrap().0.format("%Y-%m-%d")
+            );
+        }
+        _ => println!("  暂无足够数据点（需 ≥2 天快照；mns report / mns today 每日积累）"),
+    }
+
+    // ── 3. 对照策略预期 ─────────────────────────
+    // 参考值现场计算：单引擎 + 当前配置（与实盘一致的情绪锚 SignalConfig::default），
+    // 不跑对比矩阵。回测口径：初始 10 万 + 年注资 5 万（与 mns backtest 相同）。
+    println!("\n【对照策略预期】（参考值现场计算，非硬编码）");
+    let rows = backtest::load_main();
+    if rows.is_empty() {
+        println!("  回测数据集为空，无法生成参考值");
+    } else {
+        let bt = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
+        let bt_result =
+            backtest::run(&config, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let dd_str = match &actual_dd {
+            Some(s) => format!("{:.2}%", s.max_dd * 100.0),
+            None => "暂无数据".to_string(),
+        };
+        let xirr_str = metrics::xirr(&metrics::xirr_flows_from_ledger(&ledger, terminal, today))
+            .map(|x| format!("{:+.2}%", x * 100.0))
+            .unwrap_or_else(|| "暂无法计算".to_string());
+        println!(
+            "  回测口径: {} ~ {}（当前配置，情绪锚目标仓位引擎）",
+            bt.start_date.format("%Y-%m"),
+            bt.end_date.format("%Y-%m")
+        );
+        println!(
+            "  实际最大回撤 {} vs 回测 {:.2}%",
+            dd_str,
+            bt_result.max_drawdown * 100.0
+        );
+        println!(
+            "  实际 XIRR    {} vs 回测 {:.2}%",
+            xirr_str,
+            bt_result.xirr * 100.0
+        );
+        if curve_days >= 90 {
+            match &actual_dd {
+                Some(s) if s.max_dd <= bt_result.max_drawdown + 1e-9 => println!(
+                    "  判定: 在策略预期内（实际回撤未超回测口径）"
+                ),
+                Some(_) => println!(
+                    "  判定: 偏离预期——实际回撤超过回测口径，建议核对执行纪律与数据记录"
+                ),
+                None => println!("  判定: 数据不足（无快照序列）"),
+            }
+        } else {
+            println!("  （追踪 {} 天 < 90 天，对照仅供参考，不做判定）", curve_days);
+        }
+        println!("  （回测为历史区间模拟，实际环境可能不同；不做统计显著性声明）");
+    }
+
+    // ── 4. 资产曲线摘要 ─────────────────────────
+    println!("\n【资产曲线摘要】");
+    if series.is_empty() {
+        println!("  暂无快照（mns report / mns today 每日积累）");
+    } else {
+        let first = series.first().unwrap();
+        let last = series.last().unwrap();
+        let mut peak = series[0];
+        let mut trough = series[0];
+        for &p in &series {
+            if p.1 > peak.1 {
+                peak = p;
+            }
+            if p.1 < trough.1 {
+                trough = p;
+            }
+        }
+        println!(
+            "  期初: ¥{:.2}（{}） → 当前: ¥{:.2}（{}）",
+            first.1,
+            first.0.format("%Y-%m-%d"),
+            last.1,
+            last.0.format("%Y-%m-%d")
+        );
+        println!(
+            "  峰值: ¥{:.2}（{}） · 谷值: ¥{:.2}（{}）",
+            peak.1,
+            peak.0.format("%Y-%m-%d"),
+            trough.1,
+            trough.0.format("%Y-%m-%d")
+        );
+    }
+
+    // ── 5. 趋势锚就绪进度（C4）───────────────────
+    // 每腿取该腿内历史最长的净值天数；达标不自动切换信号锚——切换是独立的
+    // 产品决策（需先对照验证），此处只积累 + 报告。
+    println!("\n【趋势锚就绪进度】");
+    let legs = [
+        ("us_stocks", "美股"),
+        ("cn_stocks", "A股"),
+        ("counter_cyclical", "逆周期(黄金)"),
+    ];
+    let mut all_ready = true;
+    for (cat, name) in legs {
+        let members: Vec<&crate::models::Position> =
+            positions.iter().filter(|p| p.category == cat).collect();
+        if members.is_empty() {
+            println!("  · {}: —（无持仓）", name);
+            all_ready = false;
+            continue;
+        }
+        // 腿级聚合：取该腿内 span 最长的成员
+        let mut best_days: i64 = -1;
+        let mut best_start: Option<chrono::NaiveDate> = None;
+        for p in &members {
+            if let Some((lo, hi)) = db.price_history_span(&p.asset_code)? {
+                let days = (hi - lo).num_days();
+                if days > best_days {
+                    best_days = days;
+                    best_start = Some(lo);
+                }
+            }
+        }
+        match best_start {
+            Some(lo) => {
+                let days = best_days.max(0);
+                println!("  · {}: {}/365 天（{} 起）", name, days, lo.format("%Y-%m-%d"));
+                if days < 365 {
+                    all_ready = false;
+                }
+            }
+            None => {
+                println!("  · {}: 0/365 天（无本地价格记录）", name);
+                all_ready = false;
+            }
+        }
+    }
+    if all_ready {
+        println!("  ✓ 已就绪，等待产品决策启用（切换信号锚前需先对照验证）");
+    } else {
+        println!("  （自 C4 上线日起积累，不回填历史）");
+    }
+
     Ok(())
 }
 
@@ -433,6 +819,10 @@ fn price_age_days(positions: &[models::Position]) -> Option<i64> {
         .max()
 }
 
+/// 降级快照的可用期（天）。与 `signal_smooth_days = 7` 同语义：一周内的
+/// 恐贪分数对月度级调仓决策仍具代表性；超过即视为失效数据，不得驱动决策。
+const DEGRADED_SNAPSHOT_MAX_AGE_DAYS: i64 = 7;
+
 async fn cmd_report_inner(
     force_decide: bool,
     quiet: bool,
@@ -445,47 +835,143 @@ async fn cmd_report_inner(
         println!("正在获取恐贪指数...");
     }
 
-    // 使用配置的 API URL
+    // 使用配置的 API URL；获取失败时降级到本地最新快照（W4）：
+    // CNN 418 反爬是文档已知的常态风险，不能让整个报告随之失败——
+    // 最需要看报告的日子往往正是数据源最不稳定的日子。
     let url = &config.api.fear_greed_url;
-    let data = sentiment::fetch_fear_greed_data(url).await?;
+    let today = chrono::Local::now().date_naive();
+    // 降级状态：(快照距今天数, 快照日期)。None = 数据新鲜。
+    let mut degraded: Option<(i64, chrono::NaiveDate)> = None;
+    let data = match sentiment::fetch_fear_greed_data(url).await {
+        Ok(d) => d,
+        Err(err) => {
+            let snap = db
+                .latest_fear_greed_snapshot()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "恐贪指数获取失败（{}），且本地无历史快照可回退——\
+                         请检查网络后重试",
+                        err
+                    )
+                })?;
+            degraded = Some(((today - snap.date).num_days(), snap.date));
+            sentiment::FearGreedData {
+                score: snap.score.round().clamp(0.0, 100.0) as u8,
+                previous_close: snap.previous_close,
+                previous_1_week: snap.previous_1_week,
+                previous_1_month: snap.previous_1_month,
+                previous_1_year: snap.previous_1_year,
+            }
+        }
+    };
+    // W4 分级降级（7 天分界，产品 2026-11-08 拍板）：
+    // - 快照年龄 ≤ 7 天：数据仍有代表性，决策流照常——决策日照常出决策版
+    //   （顶部带警告）；--decide 亦允许；
+    // - 快照年龄 > 7 天：数据失效，强制只出观察版；--decide 拒绝执行并明确
+    //   报错——一个月前的恐贪分数不该驱动真实调仓。
+    let snapshot_expired = degraded
+        .map(|(age, _)| age > DEGRADED_SNAPSHOT_MAX_AGE_DAYS)
+        .unwrap_or(false);
+    if force_decide && snapshot_expired {
+        let (age, snap_date) = degraded.expect("snapshot_expired 蕴含 degraded 为 Some");
+        anyhow::bail!(
+            "恐贪指数获取失败，且本地快照已过期（{} 的数据，距今 {} 天 > {} 天上限）：\
+             --decide 已拒绝，失效数据不驱动买卖建议。\
+             请先修复网络后重跑；不带 --decide 仍会输出观察报告",
+            snap_date.format("%Y-%m-%d"),
+            age,
+            DEGRADED_SNAPSHOT_MAX_AGE_DAYS
+        );
+    }
     let today_score = data.score as f64;
     let today_zone = config.sentiment_zone(today_score);
-    // 保存快照（含历史数据）——先落库，再从本地表读历史做平滑
-    db.save_fear_greed_snapshot(
-        today_score,
-        today_zone,
-        data.previous_close,
-        data.previous_1_week,
-        data.previous_1_month,
-        data.previous_1_year,
-    )?;
+    if degraded.is_none() {
+        // 只在拿到新鲜数据时落库；降级数据若落在今天之前的日期，
+        // 写入会把旧数据误标为今天，污染历史
+        db.save_fear_greed_snapshot(
+            today_score,
+            today_zone,
+            data.previous_close,
+            data.previous_1_week,
+            data.previous_1_month,
+            data.previous_1_year,
+        )?;
+    }
 
     // 决策信号：平滑 + 区间确认 + 决策日过滤（详见 src/signal.rs）；
     // 当日原始值仅展示，不驱动仓位，避免周级噪声引起操作干扰
-    let today = chrono::Local::now().date_naive();
-    let history = db.recent_fear_greed_scores(90)?;
-    let signal = signal::compute(&config, today_score, &history, today);
+    let mut history = db.recent_fear_greed_scores(90)?;
+    if degraded.is_some() {
+        // 降级时最新快照将作为"今天"的替身传入 compute；
+        // 先从历史里摘出，避免同一天被计两次
+        history.pop();
+    }
+    let mut signal = signal::compute(&config, today_score, &history, today);
 
+    // 降级说明：按快照年龄分级措辞，写进信号说明与报告横幅
+    let degraded_banner = degraded.map(|(age, snap_date)| {
+        let snap_note = if snapshot_expired {
+            format!(
+                "恐贪指数获取失败，本地快照已过期（{} 天前，{} 的数据，超过 {} 天可用期）；\
+                 今日强制只出观察报告，不产生买卖建议；--decide 在数据过期时不可用，\
+                 请先修复网络后重跑",
+                age,
+                snap_date.format("%Y-%m-%d"),
+                DEGRADED_SNAPSHOT_MAX_AGE_DAYS
+            )
+        } else {
+            format!(
+                "恐贪指数获取失败，已回退本地快照（{} 天前，{} 的数据，在 {} 天可用期内）；\
+                 决策流程照常，请留意情绪数据滞后",
+                age,
+                snap_date.format("%Y-%m-%d"),
+                DEGRADED_SNAPSHOT_MAX_AGE_DAYS
+            )
+        };
+        signal.note.push_str(&format!("；{}", snap_note));
+        snap_note
+    });
+
+    // 控制台与报告体同口径：--decide 强制决策时明确标注，
+    // 避免控制台"信号说明"仍写'只出观察报告'而随后却出了决策报告
+    let forced_decide = force_decide && !signal.decision_day;
+    let display_note = if forced_decide {
+        format!("{}（--decide 强制决策）", signal.note)
+    } else {
+        signal.note.clone()
+    };
     if !quiet {
         println!(
             "恐贪指数: {} ({}) | 决策分数: {} ({})",
             data.score, today_zone, signal.effective_score, signal.effective_zone
         );
-        println!("信号说明: {}", signal.note);
+        println!("信号说明: {}", display_note);
         println!("今日报告类型: {} 平滑 (样本 {}/{})", signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days);
     }
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
-    let decide_today = signal.decision_day || force_decide;
+
+    // C3 每日总资产快照：当日终态（同日重跑覆盖），实际回撤/收益曲线的数据源。
+    // fear_score 记当日决策分数（降级时即降级所用的分数）；字段与账户概览同口径。
+    let holdings_value: f64 =
+        positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    db.upsert_portfolio_snapshot(
+        today,
+        cash,
+        holdings_value,
+        cash + holdings_value,
+        Some(signal.effective_score),
+    )?;
+    let tracking_since = db.portfolio_tracking_since()?;
+
+    // 快照过期：无论是否决策日，一律观察版（force_decide 组合已在上方被拒绝）；
+    // 其余情况（新鲜数据，或 ≤7 天的可用降级）走正常决策流
+    let decide_today = !snapshot_expired && (signal.decision_day || force_decide);
 
     let report = if decide_today {
         // 策略计算：目标仓位 + 偏离带（与回测引擎同源），用决策分数而非当日值
-        let decide_note = if force_decide && !signal.decision_day {
-            format!("{}（--decide 强制决策）", signal.note)
-        } else {
-            signal.note.clone()
-        };
+        let decide_note = display_note;
         let risk_warnings =
             strategy::check_risk_warnings(&config, signal.effective_score, &positions);
         let plan = strategy::calculate_rebalance_plan(
@@ -514,10 +1000,24 @@ async fn cmd_report_inner(
             &risk_warnings,
             &activity,
             price_age_days,
+            tracking_since,
         )?
     } else {
         // 非决策日：只出观察报告，不给买卖建议
-        report::generate_observation_report(&config, &signal, cash, &positions, price_age_days)?
+        report::generate_observation_report(
+            &config,
+            &signal,
+            cash,
+            &positions,
+            price_age_days,
+            tracking_since,
+        )?
+    };
+
+    // 降级横幅置顶：陈旧数据警告必须在报告第一眼可见的位置
+    let report = match &degraded_banner {
+        Some(note) => format!("⚠ {}\n\n{}", note, report),
+        None => report,
     };
 
     let filepath = report::save_report(&config, &report)?;
@@ -736,7 +1236,7 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
     let mut senti = backtest::run(&config, &bt_config, &signal, Engine::TargetWeight, &rows);
     senti.name = "目标仓位(情绪锚)".to_string();
     results.push(senti);
-    for e in [Engine::Legacy, Engine::BuyHoldRebalanced, Engine::BuyHold] {
+    for e in [Engine::BuyHoldRebalanced, Engine::BuyHold] {
         results.push(backtest::run(&config, &bt_config, &signal, e, &rows));
     }
 
@@ -1052,8 +1552,8 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     Ok(())
 }
 
-fn cmd_backtest_params() -> Result<()> {
-    println!("可调参数列表:");
+fn cmd_config_params() -> Result<()> {
+    println!("可调参数列表（`mns config <键> <值>` 修改，改后立即生效）:");
     println!();
     println!("  【目标仓位曲线】风险资产占总资产的目标权重(%)，逆向策略要求随情绪升高单调不增");
     println!("    target_weight.extreme_fear     极度恐慌 (默认: 85)");
@@ -1068,7 +1568,7 @@ fn cmd_backtest_params() -> Result<()> {
     println!("    rebalance.min_holding_days_for_sell  卖出最短持有天数，规避惩罚性赎回费 (默认: 30)");
     println!();
     println!("  【风险档位与现金流】");
-    println!("    profile                     稳健/平衡/进取/custom（一键套用 core_blend 0.4/0.6/0.8）");
+    println!("    profile                     无档位/稳健/平衡/进取/custom（core_blend 0/0.4/0.6/0.8；档位抬高常驻仓位，不降低风险）");
     println!("    target_weight.mode          阶梯 step 或线性 linear 过渡");
     println!("    cashflow.monthly            `mns plan` 默认月投入金额");
     println!();
@@ -1087,14 +1587,14 @@ fn cmd_backtest_params() -> Result<()> {
     println!("  【资产配置】风险资产内部比例，三者之和须为 100");
     println!("    allocation.us_stocks / cn_stocks / counter_cyclical");
     println!();
-    println!("  【旧框架参数】仅供 `旧框架(现金比例)` 对照回测使用，已不驱动 mns report");
-    println!("    buy_ratio.* / sell_ratio.* / settings.annualized_target_*");
+    println!("  【显示】不驱动交易，仅改变报告/持仓表展示");
+    println!("    settings.annualized_target_high  年化收益 ≥ 此值(%)时绿色标记 (默认: 15)");
     println!();
     println!("用法示例:");
     println!("  mns backtest                           # 四种策略对比（同一数据与成本模型）");
     println!("  mns backtest validate                  # 样本外验证 + bootstrap 分布");
-    println!("  mns backtest run --config my.toml       # 使用指定配置文件");
-    println!("  mns backtest run --compare a.toml,b.toml # 对比多个配置");
+    println!("  mns backtest --config my.toml           # 使用指定配置文件回测");
+    println!("  mns backtest --compare a.toml,b.toml    # 对比多个配置");
     println!("  mns config rebalance.band_pp 6          # 放宽偏离带以减少交易");
     Ok(())
 }
@@ -1198,38 +1698,6 @@ async fn cmd_market() -> Result<()> {
             println!("⚠️  获取恐贪指数失败: {}", e);
         }
     }
-
-    Ok(())
-}
-
-/// 全球主要指数查询
-async fn cmd_market_indices() -> Result<()> {
-    println!("📈 全球主要指数\n");
-
-    let indices = market::fetch_market_indices().await?;
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_header(vec!["指数", "价格", "涨跌", "涨跌幅"]);
-
-    for quote in &indices {
-        let change_color = if quote.change >= 0.0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
-
-        table.add_row(vec![
-            Cell::new(&format!("{} {}", quote.symbol, quote.name)),
-            Cell::new(&format!("{:.2}", quote.price)),
-            Cell::new(&format!("{:+.2}", quote.change)).fg(change_color),
-            Cell::new(&format!("{:+.2}%", quote.change_percent)).fg(change_color),
-        ]);
-    }
-
-    println!("{}", table);
 
     Ok(())
 }

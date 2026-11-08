@@ -3,10 +3,8 @@
 # 此配置仅供研究参考，不建议直接用于实盘
 
 [settings]
-annualized_target_low = 15.0    # 提高止盈门槛
 annualized_target_high = 22.0
 min_holding_days = 21
-min_absolute_profit_days = 60
 max_contrarian_weight = 3.0
 report_output_dir = "./reports"
 
@@ -23,7 +21,7 @@ neutral = 55.0
 greed = 75.0
 
 # ⚠️ 同样是拟合历史数据得出的目标权重曲线，spread 72pp(默认 50pp)——过拟合风险与上面的免责声明一致。
-# 驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+# 驱动 mns report/默认回测引擎的是这一段。
 [target_weight]
 extreme_fear = 92.0
 fear = 80.0
@@ -35,23 +33,6 @@ extreme_greed = 20.0
 band_pp = 3.0
 min_trade_amount = 500.0
 min_holding_days_for_sell = 21
-
-# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
-[buy_ratio]
-# 激进买入
-extreme_fear = 80.0     # 极度恐慌80%仓位
-fear = 55.0             # 恐慌55%
-neutral = 0.0           # 中性不买
-greed = 0.0
-
-[sell_ratio]
-# 更早止盈
-extreme_greed_target_high = 60.0
-extreme_greed_target_low = 40.0
-extreme_greed_below_target = 30.0
-greed_target_high = 50.0
-greed_target_low = 35.0
-neutral_target_high = 25.0
 
 [api]
 fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"

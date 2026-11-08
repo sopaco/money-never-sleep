@@ -1,9 +1,7 @@
 # 极致逆向配置 - 最大化恐慌区间买入
 [settings]
-annualized_target_low = 8.0   # 降低止盈线，更快锁定利润
 annualized_target_high = 12.0
 min_holding_days = 21         # 缩短最小持仓天数
-min_absolute_profit_days = 60
 max_contrarian_weight = 3.0   # 提高逆向权重，更激进地加仓浮亏标的
 report_output_dir = "./reports"
 
@@ -19,7 +17,7 @@ neutral = 55.0
 greed = 70.0                  # 提前进入贪婪区间
 
 # 最大化恐慌区间买入、贪婪区间快速减仓 → 目标权重曲线 spread 65pp（默认 50pp）。
-# 驱动 mns report/默认回测引擎的是这一段，不是下面的 buy_ratio。
+# 驱动 mns report/默认回测引擎的是这一段。
 [target_weight]
 extreme_fear = 90.0
 fear = 78.0
@@ -31,21 +29,6 @@ extreme_greed = 25.0
 band_pp = 3.0                 # 更窄的偏离带：更快跟上目标仓位
 min_trade_amount = 500.0
 min_holding_days_for_sell = 21
-
-# 下面 [buy_ratio]/[sell_ratio] 仅供"旧框架"(Engine::Legacy)对比使用，对 mns report 无效。
-[buy_ratio]
-extreme_fear = 80.0           # 极度恐慌时重仓
-fear = 50.0                   # 恐慌时半仓
-neutral = 0.0                 # 中性不买
-greed = 0.0
-
-[sell_ratio]
-extreme_greed_target_high = 70.0   # 极度贪婪高收益减仓70%
-extreme_greed_target_low = 50.0
-extreme_greed_below_target = 30.0
-greed_target_high = 60.0
-greed_target_low = 40.0
-neutral_target_high = 20.0
 
 [api]
 fear_greed_url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"

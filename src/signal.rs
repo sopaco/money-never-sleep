@@ -97,8 +97,15 @@ pub fn compute(
     let smooth_w = r.signal_smooth_days.max(1) as usize;
     let confirm_d = r.zone_confirm_days.max(1) as usize;
 
-    // 完整序列 = 历史 + 今天
+    // 完整序列 = 历史 + 今天。
+    // 防御：生产路径先 `save_fear_greed_snapshot` 再读历史，history 末尾
+    // 可能已含今天的记录——若直接追加会重复计数（今天的原始值在 7 天平滑
+    // 窗口里占 2/7 而非 1/7 权重，削弱平滑、放大单日毛刺）。这里改为
+    // **替换**为最新值，保证"今天"只计一次且取最新数据。
     let mut series = history.clone();
+    if series.last().map(|(d, _)| *d) == Some(today) {
+        series.pop();
+    }
     series.push((today, today_raw));
     // 供平滑/确认使用的近期窗口（原始分数，升序，含今天）
     let window_today = smoothed_at(&series, smooth_w);
@@ -332,6 +339,35 @@ mod tests {
             "决策分数应落于旧区间「中性」[45,55): {}",
             s.effective_score
         );
+    }
+
+    #[test]
+    fn 同日已落库的快照不应被重复计数() {
+        // 生产路径：先 save_fear_greed_snapshot 再读历史 → history 末尾已含今天。
+        // 修复前 series 会变成 [50×6, 20, 20]，今天的毛刺占 2/7 权重（均值 41.4），
+        // 削弱平滑；修复后替换为最新值 → [50×6, 20]，均值 45.71（与单日毛刺测试一致）。
+        let c = cfg(); // smooth=7
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let mut history: ScoreHistory = (1..=6)
+            .map(|i| (day(today, i), 50.0))
+            .collect();
+        history.push((today, 20.0)); // 今天已落库
+        let s = compute(&c, 20.0, &history, today);
+        assert_eq!(s.samples_used, 7, "今天只应计一次");
+        assert!((s.smoothed_score - (20.0 + 50.0 * 6.0) / 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn 同日落库值过期时以最新抓取值替换() {
+        // 早上 report 落库 30，下午 CNN 更新为 20 → 以 20 为准（替换而非并存）
+        let c = cfg();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let mut history: ScoreHistory = (1..=6)
+            .map(|i| (day(today, i), 50.0))
+            .collect();
+        history.push((today, 30.0));
+        let s = compute(&c, 20.0, &history, today);
+        assert!((s.smoothed_score - (20.0 + 50.0 * 6.0) / 7.0).abs() < 1e-6);
     }
 
     #[test]

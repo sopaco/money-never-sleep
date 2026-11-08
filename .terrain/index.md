@@ -32,23 +32,30 @@ source: .
   - .claude/
     - skills/
   - Cargo.lock
+  - docs/
+    - product-review-2026-11-08.md
+    - cli-help-cleanup-spec-2026-11-08.md
   - README.md
   - .cargo/
     - config.toml
+  - .workbuddy/
+    - memory/
   - .gitignore
   - README_zh.md
-  - .github/
-    - workflows/
   - AGENTS.md
   - CLAUDE.md
   - .codegraph/
     - codegraph.db
     - .gitignore
-    - errors.log
+  - reports/
+    - 2026-11-05.txt
+    - 2026-09-02.txt
+    - 2026-11-08.txt
   - src/
     - strategy.rs
     - quote.rs
     - market.rs
+    - signal.rs
     - config.rs
     - sentiment.rs
     - models.rs

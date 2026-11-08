@@ -98,6 +98,84 @@ pub fn max_drawdown(values: &[f64]) -> f64 {
     mdd
 }
 
+/// 带日期的回撤摘要（C2 实际回撤展示用）。
+#[derive(Debug, Clone, Copy)]
+pub struct DrawdownSummary {
+    /// 最大回撤（正小数）
+    pub max_dd: f64,
+    /// MaxDD 对应的峰值日与值
+    pub peak_date: NaiveDate,
+    pub peak_value: f64,
+    /// MaxDD 对应的谷值日与值
+    pub trough_date: NaiveDate,
+    pub trough_value: f64,
+    /// 全期最高点（可能与 MaxDD 峰值不同——回撤后创新高时）
+    pub all_time_peak: f64,
+    pub all_time_peak_date: NaiveDate,
+}
+
+/// 基于带日期的资产序列计算回撤摘要。少于 2 个点返回 None。
+///
+/// 谷值取「从峰值回撤最深」的点；全期峰值用于「当前距峰值距离」——
+/// 若曲线在深回撤后又创新高，两者会不同。
+pub fn drawdown_summary(series: &[(NaiveDate, f64)]) -> Option<DrawdownSummary> {
+    if series.len() < 2 {
+        return None;
+    }
+    let mut peak_value = series[0].1;
+    let mut peak_date = series[0].0;
+    let mut best = DrawdownSummary {
+        max_dd: 0.0,
+        peak_date,
+        peak_value,
+        trough_date: series[0].0,
+        trough_value: series[0].1,
+        all_time_peak: series[0].1,
+        all_time_peak_date: series[0].0,
+    };
+    for &(date, v) in series.iter().skip(1) {
+        if v > best.all_time_peak {
+            best.all_time_peak = v;
+            best.all_time_peak_date = date;
+        }
+        if v > peak_value {
+            peak_value = v;
+            peak_date = date;
+        } else if peak_value > 0.0 {
+            let dd = (peak_value - v) / peak_value;
+            if dd > best.max_dd {
+                best.max_dd = dd;
+                best.peak_date = peak_date;
+                best.peak_value = peak_value;
+                best.trough_date = date;
+                best.trough_value = v;
+            }
+        }
+    }
+    Some(best)
+}
+
+/// C1 台账流水（入金为正、出金为负）→ XIRR 输入流（本模块约定：入金为负、
+/// 流出为正），并追加当日终值（+现金+持市值，视同期末赎回）。
+///
+/// 台账与 XIRR 的符号约定相反并非失误：台账是「账本视角」（钱进钱包为正），
+/// XIRR 是「投资视角」（掏出钱包投进去为负、期末拿回来为正）。
+pub fn xirr_flows_from_ledger(
+    flows: &[(NaiveDate, f64)],
+    terminal_value: f64,
+    terminal_date: NaiveDate,
+) -> Vec<CashFlow> {
+    let mut out: Vec<CashFlow> = flows
+        .iter()
+        .map(|&(d, a)| CashFlow { date: d, amount: -a })
+        .collect();
+    out.push(CashFlow {
+        date: terminal_date,
+        amount: terminal_value,
+    });
+    out
+}
+
 pub fn mean(xs: &[f64]) -> f64 {
     if xs.is_empty() {
         return 0.0;
@@ -311,6 +389,64 @@ mod tests {
     #[test]
     fn 单调上涨无回撤() {
         assert_eq!(max_drawdown(&[1.0, 2.0, 3.0]), 0.0);
+    }
+
+    #[test]
+    fn 回撤摘要带日期且全期峰值独立于回撤峰值() {
+        // C2 验收样例：12000 → 10000 → 11000
+        // MaxDD = (12000-10000)/12000 = 16.7%；当前 11000 距全期峰值 8.3%
+        let s = [
+            (d(2026, 9, 1), 12_000.0),
+            (d(2026, 10, 1), 10_000.0),
+            (d(2026, 11, 1), 11_000.0),
+        ];
+        let sum = drawdown_summary(&s).unwrap();
+        assert!((sum.max_dd - 2_000.0 / 12_000.0).abs() < 1e-9, "{}", sum.max_dd);
+        assert_eq!(sum.peak_date, d(2026, 9, 1));
+        assert_eq!(sum.trough_date, d(2026, 10, 1));
+        assert_eq!(sum.peak_value, 12_000.0);
+        assert_eq!(sum.trough_value, 10_000.0);
+        // 全期峰值 = 12000（未创新高）；当前距峰 = (12000-11000)/12000
+        assert_eq!(sum.all_time_peak, 12_000.0);
+        assert_eq!(sum.all_time_peak_date, d(2026, 9, 1));
+    }
+
+    #[test]
+    fn 回撤摘要_深回撤后创新高时全期峰值为新峰() {
+        let s = [
+            (d(2026, 1, 1), 100.0),
+            (d(2026, 2, 1), 50.0),   // MaxDD 50%
+            (d(2026, 3, 1), 150.0),  // 新高
+        ];
+        let sum = drawdown_summary(&s).unwrap();
+        assert!((sum.max_dd - 0.5).abs() < 1e-9);
+        assert_eq!(sum.peak_date, d(2026, 1, 1));
+        assert_eq!(sum.trough_date, d(2026, 2, 1));
+        assert_eq!(sum.all_time_peak, 150.0);
+        assert_eq!(sum.all_time_peak_date, d(2026, 3, 1));
+    }
+
+    #[test]
+    fn 回撤摘要不足两个数据点返回空() {
+        assert!(drawdown_summary(&[(d(2026, 1, 1), 1.0)]).is_none());
+        assert!(drawdown_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn 台账流水转XIRR符号约定正确() {
+        // 台账：期初 +10000（D0）、入金 +5000（D+30）；终值 16000（D+90）。
+        // XIRR 视角：投出 -10000、-5000，期末拿回 +16000 → 盈利为正。
+        let ledger = vec![(d(2026, 1, 1), 10_000.0), (d(2026, 1, 31), 5_000.0)];
+        let flows = xirr_flows_from_ledger(&ledger, 16_000.0, d(2026, 4, 1));
+        assert_eq!(flows.len(), 3);
+        assert_eq!(flows[0].amount, -10_000.0);
+        assert_eq!(flows[1].amount, -5_000.0);
+        assert_eq!(flows[2].amount, 16_000.0);
+        let x = xirr(&flows).unwrap();
+        assert!(x > 0.0, "投入15000收回16000应为正收益，实际 {}", x);
+        // 亏钱则应为负
+        let flows2 = xirr_flows_from_ledger(&ledger, 12_000.0, d(2026, 4, 1));
+        assert!(xirr(&flows2).unwrap() < 0.0);
     }
 
     #[test]

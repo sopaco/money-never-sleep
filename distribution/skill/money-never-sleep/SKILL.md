@@ -74,9 +74,10 @@ npm install -g @never-sleeps/mns-cli
 | 命令 | 作用 | 备注 |
 |---|---|---|
 | `mns init` | 初始化配置与数据库 | **会清空既有数据**，有确认提示；`--force` 跳过确认 |
-| `mns cash` | 查看现金余额 | |
-| `mns cash set <金额>` | 设为指定余额 | 覆盖式 |
-| `mns cash add <金额>` | 增加现金（注资） | 金额须为正 |
+| `mns cash` | 查看现金余额与最近流水 | |
+| `mns cash set <金额>` | 设为指定余额 | 覆盖式；纠错用，会记 adjust 流水 |
+| `mns cash deposit <金额> [--note 备注]` | 外部入金 | 金额须为正；XIRR 口径的资金流入主通道 |
+| `mns cash withdraw <金额> [--note 备注]` | 外部出金 | 金额须为正且不超过现金余额 |
 | `mns portfolio` | 持仓概览（份额/成本/现价/市值/收益） | 只读，最常用 |
 | `mns add <代码> <名称> <类别>` | 把标的加入持仓池（份额为0） | 类别只能是 `us_stocks` / `cn_stocks` / `counter_cyclical` |
 | `mns buy <代码> <份额> <价格>` | **登记**已成交买入 | 现金不足会报错；须先 `add` |
@@ -90,10 +91,10 @@ npm install -g @never-sleeps/mns-cli
 | `mns config` | 打印全部配置 | |
 | `mns config <键>` | 读单项 | 必须是完整叶子键 |
 | `mns config <键> <值>` | 改单项 | 校验不通过则拒绝写入，原配置不变 |
-| `mns backtest` | 四种策略对比回测 | 纯离线，不碰账本 |
+| `mns backtest` | 四种策略对比回测 | 纯离线，不碰账本；`--config x.toml` 用指定配置，`--compare a.toml,b.toml` 多配置对比 |
 | `mns backtest validate` | 样本外验证 + 收益分布 | `--iterations` / `--block` 可调 |
-| `mns backtest params` | 列出可调参数及默认值 | 忘记键名时先跑这个 |
-| `mns market` / `mns market-indices` / `mns analyze <代码>` | 全球指数 / 个股报价 | 依赖 Yahoo，**部分网络环境不可用**，见 §7 |
+| `mns config params` | 列出可调参数及默认值 | 忘记键名时先跑这个 |
+| `mns market` / `mns analyze <代码>` | 市场综合概况（指数+恐贪）/ 个股报价 | 依赖 Yahoo，**部分网络环境不可用**，见 §7 |
 
 数据位置：配置 `~/.mns/config.toml`，账本 `~/.mns/mns.db`，报告 `./reports/`。
 
@@ -157,7 +158,7 @@ mns buy 518880 1000 8.38                        # 再登记已成交买入
 ### 4.4 参数调整
 
 ```bash
-mns backtest params                    # 先查键名与默认值
+mns config params                     # 先查键名与默认值
 mns config rebalance.band_pp           # 读当前值
 mns config rebalance.band_pp 6         # 改（校验不通过会拒绝）
 mns backtest                           # 改完跑回测看影响
@@ -233,9 +234,9 @@ mns cash set 100000
 | `mns report` / `sentiment` 失败 | CNN 接口需要网络，且可能反爬返回 418 | 内置重试；仍失败则告知用户拿不到实时情绪，**不要**用旧指数假装是今天的 |
 | `mns market` / `analyze` 全部失败，报 HTTP 403 | 部分网络环境完全拦截 Yahoo Finance | 属环境限制，非配置问题。告知用户需代理；`update-prices` 的**国内基金**部分仍可用 |
 | `update-prices` 个别标的被跳过 | 该代码在数据源无对应数据（如特殊 QDII） | 用 `mns price <代码> <价格>` 手工补 |
-| `Error: 现金余额不足` | 登记买入金额超过账面现金 | 多为漏记注资，先 `mns cash add`，或核对成交金额 |
+| `Error: 现金余额不足` | 登记买入金额超过账面现金 | 多为漏记注资，先 `mns cash deposit`，或核对成交金额 |
 | `Error: 卖出份额超出持有量` | 份额记错，或漏记了此前买入 | 用 `mns portfolio` / `mns history` 核对 |
-| `Error: 未知的配置项: buy_ratio` | 只能读写完整叶子键 | 用 `mns config buy_ratio.extreme_fear`；或 `mns config` 看全量 |
+| `Error: 未知的配置项: target_weight` | 只能读写完整叶子键 | 用 `mns config target_weight.neutral`；或 `mns config` 看全量 |
 | `Error: 情绪阈值必须满足单调递增` / `target_weight 必须随情绪升高而单调不增` | 参数值违反策略内在约束 | 校验已拒绝写入，原配置完好。按提示改成合法值 |
 | 中文输出乱码（Windows） | PowerShell 默认 GBK | 切 UTF-8 终端，或重定向到文件再读 |
 | 数据库被锁 | 多进程并发写 SQLite | **串行调用**，不要并发跑多个 mns 命令 |
@@ -249,7 +250,7 @@ mns cash set 100000
 | ❌ 错误 | ✅ 正确 |
 |---|---|
 | `mns history --limit 50` | `mns history 50`（位置参数） |
-| `mns config buy_ratio` | `mns config buy_ratio.fear`（叶子键） |
+| `mns config target_weight` | `mns config target_weight.neutral`（叶子键） |
 | 看到建议就 `mns buy` 落账 | 只登记用户**实际已成交**的交易 |
 | 报告无建议就反复重跑 | "不动作"是正常结论，直接如实汇报 |
 | 为了产出建议而调窄 `band_pp` | 参数调整需用户同意，且要说明影响 |
@@ -268,5 +269,5 @@ mns --version        # 二进制可用
 mns config           # 配置可加载（旧配置缺新字段会自动取默认值）
 mns portfolio        # 账本可读
 mns sentiment        # 网络与 CNN 接口可用
-mns backtest params  # 参数键名参考
+mns config params  # 参数键名参考
 ```
