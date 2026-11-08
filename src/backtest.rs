@@ -14,8 +14,6 @@
 
 use crate::config::AppConfig;
 use crate::metrics::{self, CashFlow, RiskMetrics};
-use crate::models::Position;
-use crate::strategy::{calculate_buy_suggestions, calculate_sell_suggestions, check_risk_warnings};
 use chrono::{Datelike, NaiveDate};
 use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use std::collections::HashMap;
@@ -29,8 +27,6 @@ const DATASET_HOLDOUT: &str =
     include_str!("../.agents/skills/mns-backtest/data/monthly_total_return_holdout.csv");
 
 pub const LEG_NAMES: [&str; 3] = ["美股(纳指QDII)", "A股(红利)", "黄金"];
-pub const LEG_CODES: [&str; 3] = ["US", "CN", "GOLD"];
-pub const LEG_CATEGORIES: [&str; 3] = ["us_stocks", "cn_stocks", "counter_cyclical"];
 
 // ───────────────────────── 数据 ─────────────────────────
 
@@ -113,17 +109,15 @@ impl Leg {
         self.shares() * price
     }
 
-    fn cost_basis(&self) -> f64 {
-        self.lots.iter().map(|l| l.shares * l.price).sum()
-    }
-
+    /// 平均成本（FIFO 测试断言用）
+    #[cfg(test)]
     fn avg_cost(&self) -> f64 {
         let s = self.shares();
-        if s > 0.0 { self.cost_basis() / s } else { 0.0 }
-    }
-
-    fn first_buy(&self) -> Option<NaiveDate> {
-        self.lots.first().map(|l| l.date)
+        if s > 0.0 {
+            self.lots.iter().map(|l| l.shares * l.price).sum::<f64>() / s
+        } else {
+            0.0
+        }
     }
 
     fn buy(&mut self, shares: f64, price: f64, date: NaiveDate) {
@@ -170,27 +164,6 @@ impl Leg {
         self.lots = keep;
         self.lots.sort_by_key(|l| l.date);
         (net, fees, sold)
-    }
-
-    fn to_position(&self, idx: usize, price: f64) -> Option<Position> {
-        let shares = self.shares();
-        if shares <= 0.0 {
-            return None;
-        }
-        Some(Position {
-            id: idx as i64 + 1,
-            asset_code: LEG_CODES[idx].to_string(),
-            asset_name: LEG_NAMES[idx].to_string(),
-            category: LEG_CATEGORIES[idx].to_string(),
-            shares,
-            cost_price: self.avg_cost(),
-            current_price: Some(price),
-            first_buy_date: self
-                .first_buy()
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_default(),
-            updated_at: String::new(),
-        })
     }
 }
 
@@ -244,8 +217,6 @@ impl BacktestConfig {
 pub enum Engine {
     /// 目标仓位 + 偏离带（新框架）
     TargetWeight,
-    /// 旧框架：买入=现金的百分比，卖出=份额的百分比 + 逆向加权
-    Legacy,
     /// 买入持有基准：按 allocation 固定权重，仅注资时买入，不再平衡
     BuyHold,
     /// 买入持有 + 年度再平衡（用于分离"再平衡贡献"与"择时贡献"）
@@ -256,7 +227,6 @@ impl Engine {
     pub fn label(&self) -> &'static str {
         match self {
             Engine::TargetWeight => "目标仓位+偏离带",
-            Engine::Legacy => "旧框架(现金比例)",
             Engine::BuyHold => "买入持有",
             Engine::BuyHoldRebalanced => "买入持有+年度再平衡",
         }
@@ -483,12 +453,6 @@ impl State {
         self.cash + self.leg_values(prices).iter().sum::<f64>()
     }
 
-    fn positions(&self, prices: &[f64; 3]) -> Vec<Position> {
-        (0..3)
-            .filter_map(|i| self.legs[i].to_position(i, prices[i]))
-            .collect()
-    }
-
     fn do_buy(
         &mut self,
         leg: usize,
@@ -642,7 +606,6 @@ pub fn run(
                 min_trade,
                 min_hold,
             ),
-            Engine::Legacy => step_legacy(&mut st, config, row, signal, &zone),
             Engine::BuyHold => {
                 // 只在有可投现金时按固定权重建仓，之后不动
                 if st.cash > min_trade {
@@ -768,54 +731,6 @@ fn rebalance_to_weights(
         if amount >= min_trade.min(budget) {
             st.do_buy(leg, amount, row.prices[leg], row.date, costs, zone, row.fgi);
         }
-    }
-}
-
-/// 旧框架：买入=可用现金的百分比（逆向加权分配），卖出=份额的百分比。
-/// 保留以便在同一成本模型下与新框架做公平对照。
-fn step_legacy(
-    st: &mut State,
-    config: &AppConfig,
-    row: &MonthRow,
-    signal: f64,
-    zone: &str,
-) {
-    let costs = &config.costs;
-    let min_hold = config.rebalance.min_holding_days_for_sell;
-    let positions = st.positions(&row.prices);
-
-    // 卖出
-    let sells = calculate_sell_suggestions(config, signal, &positions);
-    for s in &sells {
-        if let Some(leg) = LEG_CODES.iter().position(|c| *c == s.asset_code) {
-            st.do_sell(
-                leg,
-                s.sell_amount,
-                row.prices[leg],
-                row.date,
-                costs,
-                min_hold,
-                zone,
-                row.fgi,
-            );
-        }
-    }
-
-    // 买入
-    let positions = st.positions(&row.prices);
-    let warns = check_risk_warnings(config, signal, &positions);
-    let buy = calculate_buy_suggestions(config, signal, st.cash, &positions, &[], &warns);
-    if buy.total_amount <= 0.0 {
-        return;
-    }
-    let (a, b, c) = config.sleeve_split();
-    let amounts = [
-        buy.total_amount * a,
-        buy.total_amount * b,
-        buy.total_amount * c,
-    ];
-    for leg in 0..3 {
-        st.do_buy(leg, amounts[leg], row.prices[leg], row.date, costs, zone, row.fgi);
     }
 }
 
@@ -1283,8 +1198,9 @@ mod tests {
 
     #[test]
     fn 目标仓位框架不应出现弹药几何衰减() {
-        // 旧框架在连续恐慌期会越买越少（每次只花现金的固定比例）。
-        // 新框架应能把仓位推到目标附近，因此极度恐慌期末现金占比应显著低于目标留存。
+        // 回归防护：若买入退化为"每次只花现金的固定比例"，
+        // 连续恐慌期会越买越少（弹药几何衰减）。
+        // 正确实现应能把仓位推到目标附近，因此极度恐慌期现金占比应显著低于目标留存。
         let cfg = AppConfig::default_config();
         let rows = load_main();
         let bt = BacktestConfig::default();

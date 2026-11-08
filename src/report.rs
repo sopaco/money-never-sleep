@@ -92,6 +92,8 @@ pub fn generate_report(
     risk_warnings: &[RiskWarning],
     activity: &MonthActivity,
     price_age_days: Option<i64>,
+    // C3 资产曲线的追踪起点（最早每日快照日期），None = 尚未启用
+    tracking_since: Option<chrono::NaiveDate>,
 ) -> Result<String> {
     let today = Local::now();
     let weekday = match today.weekday().num_days_from_monday() {
@@ -126,19 +128,33 @@ pub fn generate_report(
     // 结论先行：四行 TL;DR，长文保留在后面
     let fees = plan.estimated_fees(&config.costs);
     let no_action = no_action_reason(plan);
-    let action_line = if plan.has_action() {
+    // 无可执行标的（产品 C 批发现）：腿级金额已算出（has_action 为真）但
+    // 所有腿的 items 为空——空标的池时 split_within_leg 无从分摊，个别
+    // 类别缺资产同样无法分摊。此时费用为 0，若照常输出"买入 ¥9400"会与
+    // "¥0 无需交易"的费用行自相矛盾。如实引导建池，类似 EmptyAccount
+    // 的注资引导。
+    let no_executable_items = plan.has_action() && plan.legs.iter().all(|l| l.items.is_empty());
+    // 动作行用精确金额（¥{:.2}），与下方调仓明细同口径——费用是估算值，
+    // 保持 fmt_money 的取整不动；动作金额是"要执行多少钱"，必须精确。
+    let action_line = if no_executable_items {
+        if positions.is_empty() {
+            "资金已就位，但标的池为空——先 `mns add <代码> <名称> <类别>` 建池".to_string()
+        } else {
+            "目标类别下暂无可执行标的——用 `mns add` 补齐对应类别后再执行".to_string()
+        }
+    } else if plan.has_action() {
         if plan.total_buy > 0.0 && plan.total_sell > 0.0 {
             format!(
-                "先卖出 ¥{:.0}，再买入 ¥{:.0}（净{} ¥{:.0}）",
-                round_hundred(plan.total_sell),
-                round_hundred(plan.total_buy),
+                "先卖出 ¥{:.2}，再买入 ¥{:.2}（净{} ¥{:.2}）",
+                plan.total_sell,
+                plan.total_buy,
                 if plan.total_buy >= plan.total_sell { "买入" } else { "卖出" },
-                round_hundred((plan.total_buy - plan.total_sell).abs())
+                (plan.total_buy - plan.total_sell).abs()
             )
         } else if plan.total_buy > 0.0 {
-            format!("买入 ¥{:.0}", round_hundred(plan.total_buy))
+            format!("买入 ¥{:.2}", plan.total_buy)
         } else {
-            format!("卖出 ¥{:.0}", round_hundred(plan.total_sell))
+            format!("卖出 ¥{:.2}", plan.total_sell)
         }
     } else {
         match &no_action {
@@ -153,7 +169,12 @@ pub fn generate_report(
         .legs
         .iter()
         .max_by(|a, b| a.drift_pp.abs().partial_cmp(&b.drift_pp.abs()).unwrap_or(std::cmp::Ordering::Equal));
-    let why_line = if plan.has_action() {
+    let why_line = if no_executable_items {
+        format!(
+            "情绪 {}（{:.0} 分），目标风险仓位 {:.0}%——暂无可执行标的，建池后下个决策日即可执行",
+            rating, score, plan.target_risk_weight
+        )
+    } else if plan.has_action() {
         format!(
             "情绪 {}（{:.0} 分），目标风险仓位 {:.0}%，当前 {:.0}%",
             rating, score, plan.target_risk_weight, plan.current_risk_weight
@@ -188,7 +209,9 @@ pub fn generate_report(
         }
     };
 
-    let fee_line = if fees < 1.0 {
+    let fee_line = if no_executable_items {
+        "预计费用：—（无可执行标的）".to_string()
+    } else if fees < 1.0 {
         "预计费用：¥0（本次无需交易）".to_string()
     } else {
         format!(
@@ -223,13 +246,23 @@ pub fn generate_report(
 
     // 市场情绪（决策分数 = 平滑/确认后的信号，见 src/signal.rs；
     // 当日原始值仅展示，不再直接驱动仓位）
+    //
+    // 档位语义如实披露：core_blend 把曲线向满仓收缩 = 抬高常驻仓位 + 收窄摆幅，
+    // 这**提高**而不是降低风险（回撤最小的是无档位/曲线原样），不能让用户
+    // 把"稳健"档误读为"更小回撤"。
+    let profile_note = if config.profile.core_blend > 0.0 {
+        "档位会抬高常驻仓位并收窄择时摆幅，这不降低风险；追求更小回撤可评估无档位"
+    } else {
+        "无档位：目标仓位完全由你的曲线决定，择时摆幅最大"
+    };
     report.push_str(&format!(
         "【风险档位】{}\n",
         config.profile_label()
     ));
     report.push_str(&format!(
-        "  中性目标仓位 {:.0}%（档位只收窄择时摆幅，不改你的曲线锚点）\n\n",
-        config.effective_neutral_weight()
+        "  中性目标仓位 {:.0}%（{}）\n\n",
+        config.effective_neutral_weight(),
+        profile_note
     ));
     report.push_str("【市场情绪】\n");
     report.push_str(&format!(
@@ -273,7 +306,14 @@ pub fn generate_report(
     report.push_str("【账户概览】\n");
     report.push_str(&format!("  现金余额: ¥{:.2}\n", cash_balance));
     report.push_str(&format!("  持仓市值: ¥{:.2}\n", total_mv));
-    report.push_str(&format!("  总资产:   ¥{:.2}\n\n", total_assets));
+    report.push_str(&format!("  总资产:   ¥{:.2}\n", total_assets));
+    if let Some(since) = tracking_since {
+        report.push_str(&format!(
+            "  （资产曲线自 {} 起每日追踪，此前无记录）\n",
+            since.format("%Y-%m-%d")
+        ));
+    }
+    report.push('\n');
 
     // 持仓明细
     if !positions.is_empty() {
@@ -546,6 +586,17 @@ pub fn generate_report(
         report.push('\n');
     }
 
+    // 信号与局限：诚实披露常驻尾注（不随行情变化，固定三行）。
+    // 此前该信息只在用户很少运行的 `mns backtest validate` 里；
+    // 日报是用户每天看的地方，局限必须出现在这里。
+    report.push_str("【信号与局限】\n");
+    report.push_str(&format!(
+        "  · 决策信号 = CNN 恐贪指数（{}天平滑 + {}天区间确认），为情绪锚\n",
+        config.rebalance.signal_smooth_days, config.rebalance.zone_confirm_days
+    ));
+    report.push_str("  · 回测显示趋势锚优于情绪锚，但需≥12个月本地价格历史积累，实盘暂不可用\n");
+    report.push_str("  · 回测区间 2016-2025 无多年期熊市，恐慌期的回撤保护未经该场景检验\n\n");
+
     report.push_str("\n═══════════════════════════════════════════════════\n");
 
     Ok(report)
@@ -561,6 +612,8 @@ pub fn generate_observation_report(
     cash_balance: f64,
     positions: &[Position],
     price_age_days: Option<i64>,
+    // C3 资产曲线的追踪起点（最早每日快照日期），None = 尚未启用
+    tracking_since: Option<chrono::NaiveDate>,
 ) -> Result<String> {
     let today = Local::now();
     let weekday = match today.weekday().num_days_from_monday() {
@@ -584,9 +637,17 @@ pub fn generate_observation_report(
     ));
 
     report.push_str(&format!(
-        "【风险档位】{}（中性目标 {:.0}%）\n\n",
+        "【风险档位】{}（中性目标 {:.0}%）\n",
         config.profile_label(),
         config.effective_neutral_weight()
+    ));
+    report.push_str(&format!(
+        "  {}\n\n",
+        if config.profile.core_blend > 0.0 {
+            "档位会抬高常驻仓位并收窄择时摆幅，这不降低风险；追求更小回撤可评估无档位"
+        } else {
+            "无档位：目标仓位完全由你的曲线决定，择时摆幅最大"
+        }
     ));
 
     if let Some(days) = price_age_days.filter(|d| *d >= 1) {
@@ -659,7 +720,14 @@ pub fn generate_observation_report(
     report.push_str(&format!("  现金余额: ¥{:.2}\n", cash_balance));
     report.push_str(&format!("  持仓市值: ¥{:.2}\n", total_mv));
     report.push_str(&format!("  总资产:   ¥{:.2}\n", total));
-    report.push_str(&format!("  风险资产权重: {:.1}%\n\n", risk_weight));
+    report.push_str(&format!("  风险资产权重: {:.1}%\n", risk_weight));
+    if let Some(since) = tracking_since {
+        report.push_str(&format!(
+            "  （资产曲线自 {} 起每日追踪，此前无记录）\n",
+            since.format("%Y-%m-%d")
+        ));
+    }
+    report.push('\n');
 
     // 下一决策日
     let dw = config.rebalance.decision_weekday;
@@ -679,12 +747,26 @@ pub fn generate_observation_report(
 }
 
 pub fn save_report(config: &AppConfig, content: &str) -> Result<String> {
-    let today = Local::now().format("%Y-%m-%d").to_string();
+    let now = Local::now();
+    let date_str = now.format("%Y-%m-%d").to_string();
     let output_dir = &config.settings.report_output_dir;
     fs::create_dir_all(output_dir)?;
 
-    let filepath = Path::new(output_dir).join(format!("{}.txt", today));
-    fs::write(&filepath, content)?;
+    let filepath = Path::new(output_dir).join(format!("{}.txt", date_str));
+    // 同日多次运行：追加而非覆盖。"先留档再决策"要求每次运行的快照都
+    // 可回溯——如同日切换档位后重跑，两份报告应能对照（此前 fs::write
+    // 会静默销毁更早的版本）。
+    if filepath.exists() {
+        let mut previous = fs::read_to_string(&filepath)?;
+        previous.push_str(&format!(
+            "\n\n═══════════ 追加运行 {} ═════════════════════════════\n\n",
+            now.format("%H:%M:%S")
+        ));
+        previous.push_str(content);
+        fs::write(&filepath, previous)?;
+    } else {
+        fs::write(&filepath, content)?;
+    }
 
     Ok(filepath.to_string_lossy().to_string())
 }
@@ -692,6 +774,7 @@ pub fn save_report(config: &AppConfig, content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::LegItem;
 
     fn plan(total: f64, legs: Vec<LegPlan>) -> RebalancePlan {
         RebalancePlan {
@@ -718,6 +801,334 @@ mod tests {
             hold_reason: reason.map(|s| s.to_string()),
             items: Vec::new(),
         }
+    }
+
+    fn make_report(config: &AppConfig) -> String {
+        let p = plan(
+            100_000.0,
+            vec![leg("us_stocks", Some("偏离 +2.0pp 在带宽 ±4.0pp 内"))],
+        );
+        generate_report(
+            config,
+            50.0,
+            "中性",
+            50.0,
+            "中性",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[],
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn 决策报告包含信号与局限尾注() {
+        let report = make_report(&AppConfig::default_config());
+        assert!(report.contains("【信号与局限】"), "诚实披露尾注应存在");
+        assert!(report.contains("情绪锚"));
+        assert!(report.contains("趋势锚"));
+        assert!(report.contains("多年期熊市"), "熊市未检验的局限应披露");
+    }
+
+    #[test]
+    fn TLDR动作行使用精确金额与明细同口径() {
+        // P3：动作行曾是"买入 ¥1300"（百位取整）而明细是 ¥1352.31，
+        // 两数并存会让人怀疑哪个才是要执行的金额——动作行必须精确。
+        let config = AppConfig::default_config();
+        let mut p = plan(
+            100_000.0,
+            vec![leg("us_stocks", Some("偏离 +2.0pp 在带宽 ±4.0pp 内"))],
+        );
+        p.total_buy = 1352.31;
+        // 可执行明细存在（买入腿有标的），TL;DR 才走"买入"分支；
+        // 全空 items 属于无可执行标的引导，另行测试
+        p.legs[0].items = vec![LegItem {
+            asset_code: "QQQ".into(),
+            asset_name: "纳指100".into(),
+            amount: 1352.31,
+            note: None,
+            holding_days: None,
+        }];
+        let report = generate_report(
+            &config,
+            50.0,
+            "中性",
+            50.0,
+            "中性",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[],
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            report.contains("1. 操作：买入 ¥1352.31"),
+            "TL;DR 动作行应为精确金额，实际: {}",
+            report
+                .lines()
+                .find(|l| l.contains("操作："))
+                .unwrap_or("<未找到>")
+        );
+        // 卖出方向同样精确
+        p.total_buy = 0.0;
+        p.total_sell = 2202.00;
+        p.legs[0].items = vec![LegItem {
+            asset_code: "QQQ".into(),
+            asset_name: "纳指100".into(),
+            amount: -2202.00,
+            note: None,
+            holding_days: Some(365),
+        }];
+        let report = generate_report(
+            &config,
+            50.0,
+            "中性",
+            50.0,
+            "中性",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[],
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(report.contains("1. 操作：卖出 ¥2202.00"));
+    }
+
+    #[test]
+    fn 空标的池时引导建池而非给出无法执行的建议() {
+        // 产品 C 批发现：空池 + 有现金 → has_action 为真（腿级金额已算出）
+        // 但 items 全空、费用为 0，"操作：买入 ¥9400" 与 "¥0 无需交易"
+        // 自相矛盾。正确 UX 是引导 mns add 建池。
+        let config = AppConfig::default_config();
+        let mut p = plan(100_000.0, vec![leg("us_stocks", None)]);
+        p.total_buy = 9400.00; // 腿级金额存在，但空池无从分摊 → items 为空
+        p.legs[0].amount = 9400.00;
+        let report = generate_report(
+            &config,
+            22.0,
+            "恐惧",
+            22.0,
+            "恐惧",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[], // 空标的池
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let action = report
+            .lines()
+            .find(|l| l.contains("1. 操作："))
+            .unwrap_or("<未找到>");
+        assert!(
+            action.contains("标的池为空") && action.contains("mns add"),
+            "TL;DR 应引导建池，实际动作行: {}",
+            action
+        );
+        assert!(
+            !action.contains("买入"),
+            "TL;DR 不得给出无法执行的动作金额，实际: {}",
+            action
+        );
+        assert!(
+            report.contains("预计费用：—（无可执行标的）"),
+            "费用行应如实标注无可执行标的"
+        );
+    }
+
+    #[test]
+    fn 有持仓但目标类别缺资产时同样不给出无法执行的建议() {
+        // items 全空的另一种形态：持仓存在，但要买入的类别下没有资产
+        // （如只持有美股，恐贪走高后逆周期腿要买入却无标的可分摊）。
+        let config = AppConfig::default_config();
+        let mut p = plan(100_000.0, vec![leg("counter_cyclical", None)]);
+        p.total_buy = 5000.00;
+        p.legs[0].amount = 5000.00;
+        let positions = vec![Position {
+            id: 1,
+            asset_code: "QQQ".into(),
+            asset_name: "纳指100".into(),
+            category: "us_stocks".into(),
+            shares: 100.0,
+            cost_price: 400.0,
+            current_price: Some(500.0),
+            first_buy_date: "2026-01-01".into(),
+            updated_at: "2026-01-01".into(),
+        }];
+        let report = generate_report(
+            &config,
+            22.0,
+            "恐惧",
+            22.0,
+            "恐惧",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &positions,
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let action = report
+            .lines()
+            .find(|l| l.contains("1. 操作："))
+            .unwrap_or("<未找到>");
+        assert!(
+            action.contains("目标类别下暂无可执行标的"),
+            "TL;DR 应提示目标类别缺资产，实际: {}",
+            action
+        );
+        assert!(!action.contains("买入"));
+    }
+
+    #[test]
+    fn 决策与观察报告披露资产曲线追踪起点() {
+        // C3：追踪说明让用户知道回撤曲线从哪天起算，此前无记录
+        // 不会误以为曲线起点就是开户日。
+        let config = AppConfig::default_config();
+        let since = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let p = plan(
+            100_000.0,
+            vec![leg("us_stocks", Some("偏离 +2.0pp 在带宽 ±4.0pp 内"))],
+        );
+        let report = generate_report(
+            &config,
+            50.0,
+            "中性",
+            50.0,
+            "中性",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[],
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            Some(since),
+        )
+        .unwrap();
+        assert!(
+            report.contains("资产曲线自 2026-01-05 起每日追踪"),
+            "决策报告的账户概览应披露追踪起点"
+        );
+
+        let signal = crate::signal::DecisionSignal {
+            raw_score: 50.0,
+            raw_zone: "中性".into(),
+            smoothed_score: 50.0,
+            smoothed_zone: "中性".into(),
+            effective_score: 50.0,
+            effective_zone: "中性".into(),
+            confirmed: true,
+            decision_day: false,
+            report_kind: "观察",
+            samples_used: 3,
+            note: String::new(),
+        };
+        let obs = generate_observation_report(
+            &config,
+            &signal,
+            100_000.0,
+            &[],
+            None,
+            Some(since),
+        )
+        .unwrap();
+        assert!(
+            obs.contains("资产曲线自 2026-01-05 起每日追踪"),
+            "观察报告的账户概览应披露追踪起点"
+        );
+
+        // 未启用（None）时不出现说明
+        let obs2 =
+            generate_observation_report(&config, &signal, 100_000.0, &[], None, None).unwrap();
+        assert!(!obs2.contains("资产曲线自"), "未启用追踪时不应有该说明");
+    }
+
+    #[test]
+    fn 档位语义应如实披露不降低风险() {
+        // 无档位：说明摆幅最大
+        let mut c = AppConfig::default_config();
+        c.apply_profile(crate::config::RiskProfile::Base);
+        let report = make_report(&c);
+        assert!(report.contains("无档位：目标仓位完全由你的曲线决定"));
+
+        // 有档位：必须说明抬高常驻仓位、不降低风险
+        c.apply_profile(crate::config::RiskProfile::Steady);
+        let report = make_report(&c);
+        assert!(
+            report.contains("不降低风险"),
+            "档位文案不得暗示'稳健'=更小回撤: {}",
+            report.lines().find(|l| l.contains("档位会")).unwrap_or("")
+        );
+        assert!(report.contains("抬高常驻仓位"));
+    }
+
+    #[test]
+    fn 同日重复运行追加而非覆盖() {
+        let dir = std::env::temp_dir().join(format!("mns-report-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::default_config();
+        config.settings.report_output_dir = dir.to_string_lossy().to_string();
+
+        let p1 = save_report(&config, "第一份报告").unwrap();
+        let content1 = std::fs::read_to_string(&p1).unwrap();
+        assert!(content1.contains("第一份报告"));
+        assert!(!content1.contains("追加运行"), "首次写入应为全新文件");
+
+        let p2 = save_report(&config, "第二份报告").unwrap();
+        assert_eq!(p1, p2, "同日应写入同一文件");
+        let content2 = std::fs::read_to_string(&p2).unwrap();
+        assert!(
+            content2.contains("第一份报告") && content2.contains("第二份报告"),
+            "两份内容都应保留，实际:\n{}",
+            content2
+        );
+        assert!(content2.contains("追加运行"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

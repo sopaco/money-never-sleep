@@ -1,47 +1,6 @@
 use crate::config::AppConfig;
 use crate::models::Position;
-use chrono::{Local, NaiveDate};
-
-/// 旧框架的建议结构。仍被 `Engine::Legacy` 对照回测使用，
-/// 但已不再驱动 `mns report`（改由 `RebalancePlan`）。
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct BuySuggestion {
-    pub total_amount: f64,
-    pub us_amount: f64,
-    pub cn_amount: f64,
-    pub counter_amount: f64,
-    pub details: Vec<BuyDetail>,
-    pub excluded: Vec<ExcludedFromBuy>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct BuyDetail {
-    pub asset_code: String,
-    pub asset_name: String,
-    pub amount: f64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct SellSuggestion {
-    pub asset_code: String,
-    pub asset_name: String,
-    pub annualized_return: Option<f64>,
-    pub absolute_return: f64,
-    pub sell_ratio: f64,
-    pub sell_shares: f64,
-    pub sell_amount: f64,
-    pub reason: SellReason,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum SellReason {
-    AnnualizedHigh,      // 年化收益达标
-    AbsoluteProfit,      // 绝对收益足够，长期持有获利了结
-}
+use chrono::NaiveDate;
 
 #[derive(Debug)]
 pub struct RiskWarning {
@@ -56,235 +15,6 @@ pub enum RiskAdvice {
     ConsiderBuyMore,  // 恐慌环境下浮亏，可能是加仓机会
     ReviewFundamentals, // 中性环境下浮亏，审视基本面
     UrgentReview,      // 贪婪环境下浮亏，需要紧急审视
-}
-
-/// 计算卖出建议后回收的现金总额
-fn total_sell_proceeds(suggestions: &[SellSuggestion]) -> f64 {
-    suggestions.iter().map(|s| s.sell_amount).sum()
-}
-
-/// 买入建议中标记因高浮亏被排除加仓的标的
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct ExcludedFromBuy {
-    pub asset_code: String,
-    pub asset_name: String,
-    pub loss_ratio: f64,
-    pub reason: String,
-}
-
-/// 计算买入建议
-/// sell_proceeds: 卖出建议预计回收的现金，用于实现买卖互感知
-/// risk_warnings: 风险警告列表，高浮亏标的将被排除加仓
-pub fn calculate_buy_suggestions(
-    config: &AppConfig,
-    score: f64,
-    cash_balance: f64,
-    positions: &[Position],
-    sell_suggestions: &[SellSuggestion],
-    risk_warnings: &[RiskWarning],
-) -> BuySuggestion {
-    // 买入可用现金 = 当前现金 + 卖出回收
-    let sell_proceeds = total_sell_proceeds(sell_suggestions);
-    let available_cash = cash_balance + sell_proceeds;
-
-    let ratio = config.buy_ratio_for(score) / 100.0;
-    let total_amount = available_cash * ratio;
-
-    let us_ratio = config.allocation.us_stocks / 100.0;
-    let cn_ratio = config.allocation.cn_stocks / 100.0;
-    let cc_ratio = config.allocation.counter_cyclical / 100.0;
-
-    let us_amount = total_amount * us_ratio;
-    let cn_amount = total_amount * cn_ratio;
-    let counter_amount = total_amount * cc_ratio;
-
-    // 按逆向加权分配：浮亏越多获得越多资金
-    // 高浮亏标的（≥30%）排除加仓，避免"越亏越买"的风险
-    let excluded: Vec<ExcludedFromBuy> = risk_warnings
-        .iter()
-        .filter(|w| w.loss_ratio >= 30.0)
-        .map(|w| ExcludedFromBuy {
-            asset_code: w.asset_code.clone(),
-            asset_name: w.asset_name.clone(),
-            loss_ratio: w.loss_ratio,
-            reason: "浮亏≥30%，暂停逆向加仓以防基本面恶化".to_string(),
-        })
-        .collect();
-    let excluded_codes: Vec<String> = excluded.iter().map(|e| e.asset_code.clone()).collect();
-
-    let mut details = Vec::new();
-
-    let us_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "us_stocks").collect();
-    let cn_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "cn_stocks").collect();
-    let cc_positions: Vec<&Position> = positions.iter().filter(|p| p.category == "counter_cyclical").collect();
-
-    let max_weight = config.settings.max_contrarian_weight;
-
-    details.extend(distribute_amount_contrarian(&us_positions, us_amount, max_weight, &excluded_codes));
-    details.extend(distribute_amount_contrarian(&cn_positions, cn_amount, max_weight, &excluded_codes));
-    details.extend(distribute_amount_contrarian(&cc_positions, counter_amount, max_weight, &excluded_codes));
-
-    BuySuggestion {
-        total_amount,
-        us_amount,
-        cn_amount,
-        counter_amount,
-        details,
-        excluded,
-    }
-}
-
-/// 逆向加权分配：浮亏/低估的标的获得更多资金
-/// 权重 = min(max_weight, max(1.0, cost_price / current_price))，即浮亏越多权重越高但有上限
-/// 若所有持仓都浮盈，则等额分配
-/// excluded_codes: 因高浮亏被排除加仓的标的代码列表
-fn distribute_amount_contrarian(positions: &[&Position], total: f64, max_weight: f64, excluded_codes: &[String]) -> Vec<BuyDetail> {
-    if positions.is_empty() || total <= 0.0 {
-        return Vec::new();
-    }
-
-    // 过滤掉被排除的标的
-    let eligible: Vec<&&Position> = positions
-        .iter()
-        .filter(|p| !excluded_codes.contains(&p.asset_code))
-        .collect();
-
-    if eligible.is_empty() {
-        return Vec::new();
-    }
-    if eligible.len() == 1 {
-        return vec![BuyDetail {
-            asset_code: eligible[0].asset_code.clone(),
-            asset_name: eligible[0].asset_name.clone(),
-            amount: total,
-        }];
-    }
-
-    // 计算逆向权重：浮亏的标获得更高权重，但有上限防止过度集中
-    let weights: Vec<f64> = eligible
-        .iter()
-        .map(|p| {
-            match p.current_price {
-                Some(cur) if cur > 0.0 && p.cost_price > 0.0 => {
-                    // 浮亏时 cost/cur > 1，浮盈时 < 1，取 max(1.0, ...) 保证浮盈标的也有基础权重
-                    // 限制最大权重防止单标的过度集中
-                    (p.cost_price / cur).max(1.0).min(max_weight)
-                }
-                _ => 1.0, // 无现价时给予等额权重
-            }
-        })
-        .collect();
-
-    let total_weight: f64 = weights.iter().sum();
-    if total_weight <= 0.0 {
-        // 等额分配兜底
-        let per = total / eligible.len() as f64;
-        return eligible
-            .iter()
-            .map(|p| BuyDetail {
-                asset_code: p.asset_code.clone(),
-                asset_name: p.asset_name.clone(),
-                amount: per,
-            })
-            .collect();
-    }
-
-    eligible
-        .iter()
-        .zip(weights.iter())
-        .map(|(p, w)| BuyDetail {
-            asset_code: p.asset_code.clone(),
-            asset_name: p.asset_name.clone(),
-            amount: total * (w / total_weight),
-        })
-        .collect()
-}
-
-/// 计算卖出建议
-/// 改进：
-/// 1. 使用最小持仓天数门槛，避免短期年化失真触发卖出
-/// 2. 增加绝对收益考量：长期持有绝对收益超30%也可止盈
-/// 3. 中性区间按PRD矩阵补齐
-pub fn calculate_sell_suggestions(
-    config: &AppConfig,
-    score: f64,
-    positions: &[Position],
-) -> Vec<SellSuggestion> {
-    let today = Local::now().date_naive();
-    let min_days = config.settings.min_holding_days;
-    let min_abs_days = config.settings.min_absolute_profit_days;
-    let mut suggestions = Vec::new();
-
-    for pos in positions {
-        if pos.shares <= 0.0 {
-            continue;
-        }
-        let current = match pos.current_price {
-            Some(p) if p > 0.0 => p,
-            _ => continue,
-        };
-
-        // 计算持仓天数
-        let holding_days = NaiveDate::parse_from_str(&pos.first_buy_date, "%Y-%m-%d")
-            .ok()
-            .map(|d| (today - d).num_days())
-            .unwrap_or(0);
-
-        // 年化收益（含最小天数门槛）
-        let ann_ret = pos.annualized_return_with_min_days(&today, min_days);
-
-        // 绝对收益（不受天数限制）
-        let abs_ret = pos.absolute_return().unwrap_or(0.0);
-
-        // 判断是否触发卖出
-        let (ratio, reason) = if let Some(ann) = ann_ret {
-            // 年化收益有效，按矩阵判断
-            let r = config.sell_ratio_for(score, ann * 100.0) / 100.0;
-            if r > 0.0 {
-                (r, SellReason::AnnualizedHigh)
-            } else if abs_ret >= 0.30 && holding_days >= min_abs_days {
-                // 年化不达标但绝对收益≥30%且持仓足够长（长期持有获利），在贪婪及以上环境减仓
-                if score >= config.thresholds.neutral {
-                    (0.20, SellReason::AbsoluteProfit)
-                } else {
-                    (0.0, SellReason::AnnualizedHigh) // 不触发
-                }
-            } else {
-                (0.0, SellReason::AnnualizedHigh) // 不触发
-            }
-        } else if abs_ret >= 0.30 && holding_days >= min_abs_days {
-            // 年化无效（持仓不足门槛天数），但绝对收益≥30%且持仓足够长
-            // 根据情绪区间差异化减仓：极度贪婪更多，中性较少
-            if score >= config.thresholds.greed {
-                (0.15, SellReason::AbsoluteProfit)
-            } else if score >= config.thresholds.neutral {
-                (0.10, SellReason::AbsoluteProfit)
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
-
-        if ratio > 0.0 {
-            let sell_shares = pos.shares * ratio;
-            let sell_amount = sell_shares * current;
-            suggestions.push(SellSuggestion {
-                asset_code: pos.asset_code.clone(),
-                asset_name: pos.asset_name.clone(),
-                annualized_return: ann_ret,
-                absolute_return: abs_ret,
-                sell_ratio: ratio * 100.0,
-                sell_shares,
-                sell_amount,
-                reason,
-            });
-        }
-    }
-    // 按绝对收益从高到低排序：优先卖出收益最高的标的以锁定利润
-    suggestions.sort_by(|a, b| b.absolute_return.partial_cmp(&a.absolute_return).unwrap_or(std::cmp::Ordering::Equal));
-    suggestions
 }
 
 /// 检查风险警告（浮亏超 20%）
@@ -321,12 +51,12 @@ pub fn check_risk_warnings(config: &AppConfig, score: f64, positions: &[Position
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 目标仓位 + 偏离带框架（新，与回测引擎同源）
+// 目标仓位 + 偏离带框架（与回测引擎同源）
 //
-// 旧逻辑的问题：买入是"现金的百分比"、卖出是"份额的百分比"，两者没有共同锚点，
-// 导致 (1) 连续恐慌期弹药几何衰减；(2) 路径依赖——刚注资则买入金额被放大；
-// (3) 无再平衡，权重可无限漂移；(4) 仓位无上限。
-// 新逻辑始终对照"应该持有多少"，并只在偏离超过带宽时动作。
+// 设计锚点：始终对照"应该持有多少风险资产"，并只在偏离超过带宽时动作。
+// 不用"花掉手上现金的百分之几"式买入——那会导致 (1) 连续恐慌期弹药
+// 几何衰减；(2) 路径依赖——刚注资则买入金额被放大；(3) 无再平衡，
+// 权重可无限漂移；(4) 仓位无上限。
 // ═══════════════════════════════════════════════════════════════
 
 /// 单腿调仓建议
@@ -440,7 +170,9 @@ pub fn calculate_rebalance_plan(
     let min_trade = config.rebalance.min_trade_amount;
     let min_hold = config.rebalance.min_holding_days_for_sell;
 
-    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum();
+    // 空持仓时 .sum() 的浮点累加起点会留下 -0.0，"{:.1}" 打印成 "-0.0%"——
+    // 加 0.0 归一化符号（-0.0 + 0.0 == 0.0，与 report.rs 账户概览同款处理）
+    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
     let total = cash_balance + holdings;
 
     let mut legs: Vec<LegPlan> = Vec::new();
@@ -449,7 +181,8 @@ pub fn calculate_rebalance_plan(
 
     for (idx, cat) in categories.iter().enumerate() {
         let members: Vec<&Position> = positions.iter().filter(|p| p.category == *cat).collect();
-        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum();
+        // 同上：空腿 -0.0 归一化，避免腿表格"当前 -0.0%"
+        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
         let target_value = total * leg_target[idx];
         let target_weight = leg_target[idx] * 100.0;
         let current_weight = if total > 0.0 { current / total * 100.0 } else { 0.0 };
@@ -581,7 +314,8 @@ pub fn calculate_monthly_plan(
     let (tu, tc, tcc) = config.asset_target_weights(score);
     let leg_target = [tu, tc, tcc];
     let risk_w = config.target_weight_for(score) / 100.0;
-    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum();
+    // 同上：空持仓时 -0.0 归一化，避免计划行"当前 -0.0%"
+    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
     // 新钱到账后的总资产口径
     let total = cash_balance + holdings + monthly;
 
@@ -591,7 +325,8 @@ pub fn calculate_monthly_plan(
 
     for (idx, cat) in categories.iter().enumerate() {
         let members: Vec<&Position> = positions.iter().filter(|p| p.category == *cat).collect();
-        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum();
+        // 同上：空腿 -0.0 归一化，避免腿表格"当前 -0.0%"
+        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
         let target_value = total * leg_target[idx];
         let current_weight = if total > 0.0 { current / total * 100.0 } else { 0.0 };
         let deficit = (target_value - current).max(0.0);
@@ -655,6 +390,63 @@ fn holding_days(p: &Position, today: NaiveDate) -> i64 {
         .ok()
         .map(|d| (today - d).num_days())
         .unwrap_or(0)
+}
+
+/// 档位切换的量化影响（供 `mns config profile` 切换前预告，纯计算便于测试）。
+///
+/// 切换档位会立即重锚目标仓位——这是产品自身"反冲击"机制（带宽/平滑/确认）
+/// 管不到的盲区，用户应在按下开关前看到它将引发的调仓规模。
+#[derive(Debug)]
+pub struct ProfileSwitchImpact {
+    /// 旧档位在当前决策分数下的风险资产目标权重（%）
+    pub old_target: f64,
+    /// 新档位在当前决策分数下的风险资产目标权重（%）
+    pub new_target: f64,
+    /// 当前实际风险资产权重（%）
+    pub current_risk: f64,
+    /// 新目标与当前权重的偏离（百分点，正数需买入）
+    pub drift_pp: f64,
+    /// 偏离是否在新带宽内（无需动作）
+    pub in_band: bool,
+    /// "买入" / "卖出" / "不动作"
+    pub direction: &'static str,
+    /// 预计调仓金额（补齐到目标，与 calculate_rebalance_plan 同口径）
+    pub est_amount: f64,
+}
+
+pub fn profile_switch_impact(
+    old: &AppConfig,
+    new: &AppConfig,
+    score: f64,
+    cash: f64,
+    positions: &[Position],
+) -> ProfileSwitchImpact {
+    let old_target = old.target_weight_for(score);
+    let new_target = new.target_weight_for(score);
+    // 空持仓时 f64 的 .sum() 返回 -0.0，"{:.1}" 会打印成 "-0.0%"——加 0.0 归一化
+    // （与 report.rs 的账户概览同款处理）
+    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let total = cash + holdings;
+    let current_risk = if total > 0.0 { holdings / total * 100.0 } else { 0.0 };
+    let drift_pp = new_target - current_risk;
+    let band = new.rebalance.band_pp;
+    let in_band = total <= 0.0 || drift_pp.abs() <= band;
+    let est_amount = if in_band { 0.0 } else { drift_pp.abs() / 100.0 * total };
+    ProfileSwitchImpact {
+        old_target,
+        new_target,
+        current_risk,
+        drift_pp,
+        in_band,
+        direction: if in_band {
+            "不动作"
+        } else if drift_pp > 0.0 {
+            "买入"
+        } else {
+            "卖出"
+        },
+        est_amount,
+    }
 }
 
 /// 腿内分摊：逆向加权（浮亏者多分），但对**个股**的深度浮亏做排除，
@@ -740,6 +532,17 @@ mod tests {
         let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &[], today());
         assert_eq!(p.target_risk_weight, 85.0);
         assert_eq!(p.current_risk_weight, 0.0);
+        // assert_eq 抓不住 -0.0（IEEE 里 -0.0 == 0.0），必须显式查符号：
+        // 空持仓时 .sum() 的浮点累加会留下 -0.0，"{:.1}" 打印成 "-0.0%"
+        assert!(
+            p.current_risk_weight.is_sign_positive(),
+            "当前权重符号应为正零，实际 {:?}",
+            p.current_risk_weight
+        );
+        assert!(
+            p.legs.iter().all(|l| l.current_weight.is_sign_positive()),
+            "腿级当前权重符号应为正零（表格里不得出现 -0.0%）"
+        );
         // 无持仓标的，腿内无可分摊对象，但腿级金额应已给出
         let total: f64 = p.legs.iter().map(|l| l.amount).sum();
         assert!((total - 85_000.0).abs() < 1.0, "应建议买入约8.5万, 实际{}", total);
@@ -955,6 +758,67 @@ mod tests {
             assert!(p.target_risk_weight <= prev, "情绪{}目标仓位不应升高", score);
             prev = p.target_risk_weight;
         }
+    }
+
+    #[test]
+    fn 档位切换预告_更进取档位应预告买入() {
+        let mut old = AppConfig::default_config();
+        old.apply_profile(crate::config::RiskProfile::Steady);
+        let mut new = old.clone();
+        new.apply_profile(crate::config::RiskProfile::Aggressive);
+        // 恐慌期（score 30，默认曲线 fear=75）：
+        // steady(0.4) 目标 = 40+0.6×75 = 85；aggressive(0.8) 目标 = 40+0.2×75 = 95
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 500.0, 1.0, 1.0, "2020-01-01"),
+            pos("B", "红利ETF", "cn_stocks", 300.0, 1.0, 1.0, "2020-01-01"),
+            pos("C", "黄金ETF", "counter_cyclical", 200.0, 1.0, 1.0, "2020-01-01"),
+        ]; // 风险资产 1000 + 现金 1000 → current 50%
+        let impact = profile_switch_impact(&old, &new, 30.0, 1_000.0, &positions);
+        assert!((impact.old_target - 85.0).abs() < 1e-9);
+        assert!((impact.new_target - 95.0).abs() < 1e-9);
+        assert!((impact.current_risk - 50.0).abs() < 1e-9);
+        assert_eq!(impact.direction, "买入");
+        assert!((impact.est_amount - 0.45 * 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 档位切换预告_偏离在带宽内不动作() {
+        let mut c = AppConfig::default_config();
+        c.apply_profile(crate::config::RiskProfile::Steady);
+        let mut new = c.clone();
+        new.apply_profile(crate::config::RiskProfile::Balanced);
+        // score 90（极度贪婪，曲线 extreme_greed=35）：
+        // steady(0.4) 目标 = 40+0.6×35 = 61%；balanced(0.6) 目标 = 60+0.4×35 = 74%
+        // current 构造为 72% → 新档位偏离 +2pp < 带宽 4pp → 无需动作
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 720.0, 1.0, 1.0, "2020-01-01"),
+            pos("B", "红利ETF", "cn_stocks", 0.0, 1.0, 1.0, "2020-01-01"),
+            pos("C", "黄金ETF", "counter_cyclical", 0.0, 1.0, 1.0, "2020-01-01"),
+        ]; // 风险 720 + 现金 280 → current 恰为 72%
+        let impact = profile_switch_impact(&c, &new, 90.0, 280.0, &positions);
+        assert!((impact.new_target - 74.0).abs() < 1e-9);
+        assert!(impact.in_band, "偏离 {:+.1}pp 应在带宽内", impact.drift_pp);
+        assert_eq!(impact.direction, "不动作");
+        assert_eq!(impact.est_amount, 0.0);
+    }
+
+    #[test]
+    fn 档位切换预告_切到无档位在贪婪期预告卖出() {
+        let mut old = AppConfig::default_config();
+        old.apply_profile(crate::config::RiskProfile::Steady);
+        let mut new = old.clone();
+        new.apply_profile(crate::config::RiskProfile::Base);
+        // score 90：steady 目标 61%，无档位目标 = 曲线原样 35%
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 650.0, 1.0, 1.0, "2020-01-01"),
+            pos("B", "红利ETF", "cn_stocks", 390.0, 1.0, 1.0, "2020-01-01"),
+            pos("C", "黄金ETF", "counter_cyclical", 260.0, 1.0, 1.0, "2020-01-01"),
+        ]; // 风险 1300 + 现金 700 → current 65%
+        let impact = profile_switch_impact(&old, &new, 90.0, 700.0, &positions);
+        assert!((impact.old_target - 61.0).abs() < 1e-9);
+        assert!((impact.new_target - 35.0).abs() < 1e-9, "无档位贪婪目标应为曲线原样 35");
+        assert_eq!(impact.direction, "卖出");
+        assert!((impact.est_amount - 0.30 * 2000.0).abs() < 1e-9);
     }
 
     #[test]

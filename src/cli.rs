@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "mns",
     version,
-    about = "逆情绪投资助手 - Money Never Sleeps（Market Neutral Strategist）"
+    about = "逆情绪投资助手 - Money Never Sleeps（Market Neutral Strategist）",
+    after_help = "策略速览: 恐贪指数 → 目标风险仓位（默认 35%~85%，五档）→ 偏离带再平衡（默认 ±4pp）
+决策节奏: 默认每周五决策日（rebalance.decision_weekday 可改），其余天出观察版
+快速上手: mns init → mns cash deposit 10000 → mns add QQQ 纳指100 us_stocks → mns today
+调参清单: mns config params（全部可调参数、默认值与效果说明）"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -13,7 +17,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// 初始化配置文件和数据库
+    /// 初始化 ~/.mns/config.toml 与 ~/.mns/mns.db（默认平衡档；已有数据会提示确认）
     /// 使用 --force 跳过确认提示
     Init {
         /// 跳过确认，强制覆盖已有数据
@@ -21,22 +25,27 @@ pub enum Commands {
         force: bool,
     },
 
-    /// 查看/修改配置项
+    /// 无参数=输出完整配置(TOML)；KEY=查看；KEY VALUE=修改（校验通过后落盘）
     Config {
-        /// 配置项名称 (如 thresholds.fear)
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+        /// 配置项名称，点路径（如 thresholds.fear；清单见 `mns config params`）
         key: Option<String>,
         /// 配置项新值
         value: Option<String>,
     },
 
-    /// 现金管理 (无子命令时查看余额)
+    /// 现金管理 (无子命令时查看余额与最近流水)
     Cash {
         #[command(subcommand)]
         action: Option<CashAction>,
     },
 
-    /// 查看持仓概览（含年化收益）
+    /// 查看持仓概览（含年化收益）；组合级 XIRR/回撤见 performance
     Portfolio,
+
+    /// 组合绩效仪表盘：XIRR / 实际最大回撤 / 对照策略预期（只读，零写入）；单标的角度见 portfolio
+    Performance,
 
     /// 新增资产到持仓池
     Add {
@@ -44,7 +53,8 @@ pub enum Commands {
         code: String,
         /// 资产名称 (如 "纳指100")
         name: String,
-        /// 类别: us_stocks / cn_stocks / counter_cyclical
+        /// 类别: us_stocks(美股宽基) / cn_stocks(A股宽基) / counter_cyclical(逆周期·黄金等)；
+        /// 三腿内部比例由 allocation.* 控制
         category: String,
     },
 
@@ -68,7 +78,7 @@ pub enum Commands {
         price: f64,
     },
 
-    /// 更新资产当前价格
+    /// 查看/更新单个资产当前价（批量自动更新见 update-prices）
     Price {
         /// 资产代码
         code: String,
@@ -82,19 +92,20 @@ pub enum Commands {
         code: String,
     },
 
-    /// 查看当前恐贪指数
+    /// 获取 CNN 恐贪指数并保存当日快照（历史快照用于信号平滑与区间确认）
     Sentiment,
 
-    /// 生成今日策略报告（默认仅决策日出决策版，其余天出观察版）
+    /// 生成今日策略报告（决策日→决策版含调仓指令；其余天→观察版仅提示不动手。
+    /// 决策日默认周五，`rebalance.decision_weekday` 可改）
     Report {
-        /// 非决策日仍强制生成决策版报告
+        /// 非决策日仍强制生成决策版报告（含调仓指令）
         #[arg(long)]
         decide: bool,
     },
 
-    /// 一键：先更新价格，再生成今日报告（价格失败也继续）
+    /// 一键：先更新价格，再生成今日报告（价格失败也继续）；--decide 同 report
     Today {
-        /// 非决策日仍强制生成决策版报告
+        /// 非决策日仍强制生成决策版报告（含调仓指令）
         #[arg(long)]
         decide: bool,
         /// 只输出结论与报告路径，不打印价格明细
@@ -102,36 +113,44 @@ pub enum Commands {
         quiet: bool,
     },
 
-    /// 定投计划：每月买什么、买多少（只买不卖）
+    /// 定投计划：按当前情绪与目标仓位给出本月各腿买入金额（只买不卖）
     Plan {
-        /// 每月投入金额（省略则读取 cashflow.monthly）
+        /// 每月投入金额（省略则读取 cashflow.monthly 配置）
         #[arg(long)]
         monthly: Option<f64>,
     },
 
-    /// 查看交易历史
+    /// 查看交易流水（买入/卖出/入金/出金/纠错，新→旧）
     History {
-        /// 显示条数
+        /// 显示最近 N 条（默认 20）
         #[arg(default_value = "20")]
         limit: i64,
     },
 
-    /// 策略回测 (基于历史数据验证策略表现)
+    /// 回测当前配置 vs 买入持有等基准（同一数据与成本模型）；样本外验证见 `backtest validate`
+    #[command(
+        after_help = "回测使用内置 2016-2025 人民币计价月度全收益数据（含分红），初始资金 10 万、
+每年 3 月后注资 5 万，所有策略共用同一份数据与成本模型，保证对比公平。
+默认对比：目标仓位(趋势锚) / 目标仓位(情绪锚) / 买入持有+年度再平衡 / 买入持有。"
+    )]
     Backtest {
         #[command(subcommand)]
         action: Option<BacktestAction>,
+        /// 使用指定 config.toml 回测（省略则用 ~/.mns/config.toml 当前配置）
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 对比多个配置文件 (逗号分隔；自动附加买入持有基准)
+        #[arg(long)]
+        compare: Option<String>,
     },
 
-    /// 自动更新所有资产的当前价格
+    /// 自动拉取全部持仓最新价（mns today 也会先做这一步）
     UpdatePrices,
 
     /// 市场综合概况（指数、恐贪指数）
     Market,
 
-    /// 全球主要指数查询
-    MarketIndices,
-
-    /// 个股基础分析（报价、估值）
+    /// 个股报价查询（价格、涨跌幅）
     Analyze {
         /// 股票代码 (如 AAPL, MSFT)
         symbol: String,
@@ -139,39 +158,45 @@ pub enum Commands {
 }
 
 #[derive(Subcommand)]
+pub enum ConfigAction {
+    /// 列出全部可调参数（默认值与效果说明）
+    Params,
+}
+
+#[derive(Subcommand)]
 pub enum CashAction {
-    /// 设置现金余额
+    /// 设置现金余额（纠错工具；会记一条 adjust 流水保证台账可重建）
     Set {
         /// 金额
         amount: f64,
     },
-    /// 增加现金
-    Add {
-        /// 金额
+    /// 外部入金——资金进入组合的主通道（XIRR 口径）
+    Deposit {
+        /// 金额（正数）
         amount: f64,
+        /// 备注（如来源/用途）
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// 外部出金——资金离开组合
+    Withdraw {
+        /// 金额（正数）
+        amount: f64,
+        /// 备注（如用途）
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 pub enum BacktestAction {
-    /// 运行回测
-    Run {
-        /// 配置文件路径 (省略则使用默认配置)
-        #[arg(short, long)]
-        config: Option<String>,
-        /// 对比多个配置文件 (逗号分隔)
-        #[arg(short, long)]
-        compare: Option<String>,
-    },
     /// 样本外验证：walk-forward 调参 + 分块 bootstrap 分布 + holdout 区块
     Validate {
-        /// bootstrap 重采样次数
+        /// bootstrap 重采样次数（默认 2000；越大分布估计越稳，耗时按比例增加）
         #[arg(long, default_value = "2000")]
         iterations: usize,
-        /// 分块长度（月），保留短期自相关
+        /// 分块长度（月），重采样保留连续月段以维持短期自相关（默认 6）
         #[arg(long, default_value = "6")]
         block: usize,
     },
-    /// 查看可调参数列表
-    Params,
 }

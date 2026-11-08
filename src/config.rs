@@ -8,8 +8,6 @@ pub struct AppConfig {
     pub settings: Settings,
     pub allocation: Allocation,
     pub thresholds: Thresholds,
-    pub buy_ratio: BuyRatio,
-    pub sell_ratio: SellRatio,
     pub api: ApiConfig,
     /// 风险资产目标总权重曲线（目标仓位框架）
     #[serde(default = "TargetWeight::default_curve")]
@@ -40,23 +38,31 @@ pub enum WeightMode {
     Linear,
 }
 
-/// 风险档位预设：不改变用户的曲线形状，只把曲线**向满仓收缩**的程度分三档。
+/// 风险档位预设：不改变用户的曲线形状，只把曲线**向满仓收缩**的程度分档。
 ///
 /// 目标权重 = `core_blend × 100 + (1-core_blend) × 原曲线(score)`。
-/// `core_blend=0` 完全等价旧行为；越大则底仓越高、择时摆幅越小。
+/// `core_blend=0`（无档位）完全等价旧行为、择时摆幅最大；越大则底仓越高、
+/// 摆幅越小。注意：档位抬高的是**常驻仓位**，不是"更稳健"——回测显示
+/// 回撤最小的是无档位（曲线原样），档位带来的是更少交易与更平滑的行为。
 /// 这是风险偏好旋钮，不是收益增强：主样本外仍不保证赢买入持有。
+///
+/// 变体命名用 `Base` 而非 `None`：避免与 `Option::None` 在 match 臂里混淆
+/// （序列化 id 仍为 "none"，用户侧无感知）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RiskProfile {
+    /// 无档位：曲线原样执行（core_blend=0），择时摆幅最大、常驻仓位最低
+    Base,
     Steady,
     Balanced,
     Aggressive,
 }
 
 impl RiskProfile {
-    pub const ALL: [RiskProfile; 3] = [Self::Steady, Self::Balanced, Self::Aggressive];
+    pub const ALL: [RiskProfile; 4] = [Self::Base, Self::Steady, Self::Balanced, Self::Aggressive];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "raw" | "无档位" => Some(Self::Base),
             "steady" | "conservative" | "稳健" => Some(Self::Steady),
             "balanced" | "平衡" => Some(Self::Balanced),
             "aggressive" | "进取" | "激进" => Some(Self::Aggressive),
@@ -67,6 +73,7 @@ impl RiskProfile {
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::Base => "none",
             Self::Steady => "steady",
             Self::Balanced => "balanced",
             Self::Aggressive => "aggressive",
@@ -75,6 +82,7 @@ impl RiskProfile {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Base => "无档位",
             Self::Steady => "稳健",
             Self::Balanced => "平衡",
             Self::Aggressive => "进取",
@@ -84,6 +92,7 @@ impl RiskProfile {
     /// 曲线向满仓收缩的权重（0~1）。
     pub fn core_blend(self) -> f64 {
         match self {
+            Self::Base => 0.0,
             Self::Steady => 0.4,
             Self::Balanced => 0.6,
             Self::Aggressive => 0.8,
@@ -120,7 +129,7 @@ impl Default for ProfileConfig {
 /// 各情绪区间下"风险资产合计"的目标权重（占总资产百分比）。
 ///
 /// 这是仓位管理的锚：策略始终对照"我应该持有多少风险资产"，
-/// 而非旧逻辑的"把手上现金花掉百分之几"。后者会导致弹药几何衰减
+/// 而非"把手上现金花掉百分之几"。后者会导致弹药几何衰减
 /// （连续恐慌期越到后面越没钱买）与路径依赖（刚注资则买入金额被放大）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TargetWeight {
@@ -265,10 +274,9 @@ impl Costs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub annualized_target_low: f64,
+    /// 年化收益达标线（%）：持仓表/报告中年化收益 ≥ 此值时绿色标记
     pub annualized_target_high: f64,
     pub min_holding_days: i64,
-    pub min_absolute_profit_days: i64,
     pub max_contrarian_weight: f64,
     pub report_output_dir: String,
 }
@@ -286,24 +294,6 @@ pub struct Thresholds {
     pub fear: f64,
     pub neutral: f64,
     pub greed: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuyRatio {
-    pub extreme_fear: f64,
-    pub fear: f64,
-    pub neutral: f64,
-    pub greed: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SellRatio {
-    pub extreme_greed_target_high: f64,
-    pub extreme_greed_target_low: f64,
-    pub extreme_greed_below_target: f64,
-    pub greed_target_high: f64,
-    pub greed_target_low: f64,
-    pub neutral_target_high: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,11 +325,9 @@ impl AppConfig {
         // 防御配置 - 低回撤优先，逆向策略
         Self {
             settings: Settings {
-                annualized_target_low: 10.0,   // 降低止盈门槛，更早锁定收益
-                annualized_target_high: 15.0,  // 年化15%大笔减仓
-                min_holding_days: 45,          // 更长持仓，避免短期波动
-                min_absolute_profit_days: 120, // 绝对收益持仓天数更长
-                max_contrarian_weight: 2.0,    // 降低逆势加仓权重
+                annualized_target_high: 15.0, // 年化15%在持仓表中绿色标记
+                min_holding_days: 45,          // 年化收益需至少持仓这么多天才显示
+                max_contrarian_weight: 2.0,    // 逆向加仓时单标的最大相对权重
                 report_output_dir: "./reports".to_string(),
             },
             allocation: Allocation {
@@ -352,20 +340,6 @@ impl AppConfig {
                 fear: 45.0,         // 恐慌阈值
                 neutral: 55.0,      // 中性阈值
                 greed: 70.0,        // 更早触发贪婪卖出
-            },
-            buy_ratio: BuyRatio {
-                extreme_fear: 60.0, // 极度恐慌适度买入
-                fear: 35.0,         // 恐慌保守买入
-                neutral: 0.0,       // 中性不买
-                greed: 0.0,         // 贪婪不买
-            },
-            sell_ratio: SellRatio {
-                extreme_greed_target_high: 50.0,  // 极度贪婪减仓50%
-                extreme_greed_target_low: 30.0,   // 极度贪婪低收益减仓30%
-                extreme_greed_below_target: 20.0, // 极度贪婪未达标减仓20%
-                greed_target_high: 40.0,          // 贪婪减仓40%
-                greed_target_low: 25.0,           // 贪婪低收益减仓25%
-                neutral_target_high: 15.0,        // 中性减仓15%
             },
             api: ApiConfig {
                 fear_greed_url: "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -603,66 +577,13 @@ impl AppConfig {
         (risk * us, risk * cn, risk * cc)
     }
 
-    /// 根据情绪区间获取买入比例（旧框架，保留用于对照回测）
-    pub fn buy_ratio_for(&self, score: f64) -> f64 {
-        if score < self.thresholds.extreme_fear {
-            self.buy_ratio.extreme_fear
-        } else if score < self.thresholds.fear {
-            self.buy_ratio.fear
-        } else if score < self.thresholds.neutral {
-            self.buy_ratio.neutral
-        } else if score < self.thresholds.greed {
-            self.buy_ratio.greed
-        } else {
-            0.0 // 极度贪婪时暂停买入
-        }
-    }
-
-    /// 根据情绪区间和年化收益获取卖出减仓比例
-    pub fn sell_ratio_for(&self, score: f64, annualized: f64) -> f64 {
-        if score >= self.thresholds.greed {
-            // 极度贪婪
-            if annualized >= self.settings.annualized_target_high {
-                self.sell_ratio.extreme_greed_target_high
-            } else if annualized >= self.settings.annualized_target_low {
-                self.sell_ratio.extreme_greed_target_low
-            } else {
-                self.sell_ratio.extreme_greed_below_target
-            }
-        } else if score >= self.thresholds.neutral {
-            // 贪婪
-            if annualized >= self.settings.annualized_target_high {
-                self.sell_ratio.greed_target_high
-            } else if annualized >= self.settings.annualized_target_low {
-                self.sell_ratio.greed_target_low
-            } else {
-                0.0
-            }
-        } else if score >= self.thresholds.fear {
-            // 中性
-            if annualized >= self.settings.annualized_target_high {
-                self.sell_ratio.neutral_target_high
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
-    }
-
     /// 用 dot path 获取/设置配置值
     pub fn get_value(&self, key: &str) -> Option<String> {
         match key {
-            "settings.annualized_target_low" => {
-                Some(self.settings.annualized_target_low.to_string())
-            }
             "settings.annualized_target_high" => {
                 Some(self.settings.annualized_target_high.to_string())
             }
             "settings.min_holding_days" => Some(self.settings.min_holding_days.to_string()),
-            "settings.min_absolute_profit_days" => {
-                Some(self.settings.min_absolute_profit_days.to_string())
-            }
             "settings.max_contrarian_weight" => {
                 Some(self.settings.max_contrarian_weight.to_string())
             }
@@ -674,24 +595,6 @@ impl AppConfig {
             "thresholds.fear" => Some(self.thresholds.fear.to_string()),
             "thresholds.neutral" => Some(self.thresholds.neutral.to_string()),
             "thresholds.greed" => Some(self.thresholds.greed.to_string()),
-            "buy_ratio.extreme_fear" => Some(self.buy_ratio.extreme_fear.to_string()),
-            "buy_ratio.fear" => Some(self.buy_ratio.fear.to_string()),
-            "buy_ratio.neutral" => Some(self.buy_ratio.neutral.to_string()),
-            "buy_ratio.greed" => Some(self.buy_ratio.greed.to_string()),
-            "sell_ratio.extreme_greed_target_high" => {
-                Some(self.sell_ratio.extreme_greed_target_high.to_string())
-            }
-            "sell_ratio.extreme_greed_target_low" => {
-                Some(self.sell_ratio.extreme_greed_target_low.to_string())
-            }
-            "sell_ratio.extreme_greed_below_target" => {
-                Some(self.sell_ratio.extreme_greed_below_target.to_string())
-            }
-            "sell_ratio.greed_target_high" => Some(self.sell_ratio.greed_target_high.to_string()),
-            "sell_ratio.greed_target_low" => Some(self.sell_ratio.greed_target_low.to_string()),
-            "sell_ratio.neutral_target_high" => {
-                Some(self.sell_ratio.neutral_target_high.to_string())
-            }
             "api.fear_greed_url" => Some(self.api.fear_greed_url.clone()),
             "target_weight.extreme_fear" => Some(self.target_weight.extreme_fear.to_string()),
             "target_weight.fear" => Some(self.target_weight.fear.to_string()),
@@ -722,16 +625,10 @@ impl AppConfig {
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
-            "settings.annualized_target_low" => {
-                self.settings.annualized_target_low = value.parse()?
-            }
             "settings.annualized_target_high" => {
                 self.settings.annualized_target_high = value.parse()?
             }
             "settings.min_holding_days" => self.settings.min_holding_days = value.parse()?,
-            "settings.min_absolute_profit_days" => {
-                self.settings.min_absolute_profit_days = value.parse()?
-            }
             "settings.max_contrarian_weight" => {
                 self.settings.max_contrarian_weight = value.parse()?
             }
@@ -743,24 +640,6 @@ impl AppConfig {
             "thresholds.fear" => self.thresholds.fear = value.parse()?,
             "thresholds.neutral" => self.thresholds.neutral = value.parse()?,
             "thresholds.greed" => self.thresholds.greed = value.parse()?,
-            "buy_ratio.extreme_fear" => self.buy_ratio.extreme_fear = value.parse()?,
-            "buy_ratio.fear" => self.buy_ratio.fear = value.parse()?,
-            "buy_ratio.neutral" => self.buy_ratio.neutral = value.parse()?,
-            "buy_ratio.greed" => self.buy_ratio.greed = value.parse()?,
-            "sell_ratio.extreme_greed_target_high" => {
-                self.sell_ratio.extreme_greed_target_high = value.parse()?
-            }
-            "sell_ratio.extreme_greed_target_low" => {
-                self.sell_ratio.extreme_greed_target_low = value.parse()?
-            }
-            "sell_ratio.extreme_greed_below_target" => {
-                self.sell_ratio.extreme_greed_below_target = value.parse()?
-            }
-            "sell_ratio.greed_target_high" => self.sell_ratio.greed_target_high = value.parse()?,
-            "sell_ratio.greed_target_low" => self.sell_ratio.greed_target_low = value.parse()?,
-            "sell_ratio.neutral_target_high" => {
-                self.sell_ratio.neutral_target_high = value.parse()?
-            }
             "api.fear_greed_url" => self.api.fear_greed_url = value.to_string(),
             "target_weight.extreme_fear" => self.target_weight.extreme_fear = value.parse()?,
             "target_weight.fear" => self.target_weight.fear = value.parse()?,
@@ -794,7 +673,7 @@ impl AppConfig {
                 } else {
                     let p = RiskProfile::parse(v).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "未知风险档位: {}（可选 steady/balanced/aggressive/custom 或 稳健/平衡/进取）",
+                            "未知风险档位: {}（可选 none/steady/balanced/aggressive/custom 或 无档位/稳健/平衡/进取）",
                             value
                         )
                     })?;
@@ -898,7 +777,26 @@ mod tests {
         assert_eq!(RiskProfile::parse("平衡"), Some(RiskProfile::Balanced));
         assert_eq!(RiskProfile::parse("进取"), Some(RiskProfile::Aggressive));
         assert_eq!(RiskProfile::parse("aggressive"), Some(RiskProfile::Aggressive));
+        assert_eq!(RiskProfile::parse("none"), Some(RiskProfile::Base));
+        assert_eq!(RiskProfile::parse("无档位"), Some(RiskProfile::Base));
+        assert_eq!(RiskProfile::parse("raw"), Some(RiskProfile::Base));
         assert_eq!(RiskProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn 无档位保持曲线原样且摆幅最大() {
+        let mut c = cfg();
+        c.apply_profile(RiskProfile::Base);
+        assert_eq!(c.profile.name, "none");
+        assert_eq!(c.profile_label(), "无档位");
+        assert!(c.profile.core_blend.abs() < 1e-12);
+        // 曲线原样：中性锚 = target_weight.neutral，而非向满仓收缩后的值
+        assert!((c.target_weight_for(50.0) - c.target_weight.neutral).abs() < 1e-9);
+        // 摆幅 = 极端区间权重差，无档位时最大
+        let swing =
+            c.target_weight_for(0.0) - c.target_weight_for(100.0);
+        assert!((swing - (85.0 - 35.0)).abs() < 1e-9, "无档位摆幅应为曲线原样: {}", swing);
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -924,6 +822,26 @@ mod tests {
         assert_eq!(c.profile_label(), "自定义");
         assert_eq!(c.profile.core_blend, 0.0);
         assert!(c.target_weight_for(50.0) < before, "取消档位后应回到原始曲线");
+    }
+
+    #[test]
+    fn config命令可设置无档位预设() {
+        let mut c = cfg();
+        c.apply_profile(RiskProfile::Steady);
+        let before = c.target_weight_for(50.0);
+        c.set_value("profile", "none").unwrap();
+        assert_eq!(c.profile.name, "none");
+        assert_eq!(c.profile_label(), "无档位");
+        assert!(c.profile.core_blend.abs() < 1e-12);
+        assert!(
+            c.target_weight_for(50.0) < before,
+            "无档位应回到曲线原样（更低的中性仓位）"
+        );
+        // 中文别名同样可达
+        c.set_value("profile", "无档位").unwrap();
+        assert_eq!(c.profile.name, "none");
+        // get_value 应回显档位标签
+        assert_eq!(c.get_value("profile").unwrap(), "无档位");
     }
 
     #[test]
@@ -966,7 +884,9 @@ mod tests {
     }
 
     #[test]
-    fn 旧配置缺少新字段仍可加载() {
+    fn 旧格式配置仍可加载_缺失字段回落默认值() {
+        // 含已删除的旧框架键（buy_ratio/sell_ratio/annualized_target_low 等）：
+        // serde 忽略未知字段，老配置文件无需迁移即可继续使用
         let old = r#"
 [settings]
 annualized_target_low = 10.0
