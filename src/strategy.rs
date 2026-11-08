@@ -354,6 +354,8 @@ pub struct LegItem {
     pub asset_name: String,
     pub amount: f64,
     pub note: Option<String>,
+    /// 该标的最早买入至今的持有天数（卖出费用估算用；买入腿为 None）
+    pub holding_days: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -388,6 +390,25 @@ impl RebalancePlan {
 
     pub fn has_action(&self) -> bool {
         self.total_buy > 0.0 || self.total_sell > 0.0
+    }
+
+    /// 按当前费率估算本次调仓的总费用（买入费 + 卖出费 + 阶梯赎回费）。
+    ///
+    /// 赎回费按各标的**最早买入日**估算持有天数，因此长期定投账户会低估
+    /// 近期买入份额的赎回费——只作为量级参考，不做精确对账。
+    pub fn estimated_fees(&self, costs: &crate::config::Costs) -> f64 {
+        let mut total = 0.0;
+        for leg in &self.legs {
+            for item in &leg.items {
+                if item.amount > 0.0 {
+                    total += item.amount * costs.buy_rate();
+                } else if item.amount < 0.0 {
+                    let days = item.holding_days.unwrap_or(0);
+                    total += -item.amount * costs.total_sell_rate(days);
+                }
+            }
+        }
+        total
     }
 }
 
@@ -462,29 +483,26 @@ pub fn calculate_rebalance_plan(
                     diff, min_hold
                 ));
             } else {
-                // 优先减仓绝对收益最高者，锁定利润
-                let mut ranked: Vec<&&Position> = sellable.clone();
-                ranked.sort_by(|a, b| {
-                    b.absolute_return()
-                        .unwrap_or(0.0)
-                        .partial_cmp(&a.absolute_return().unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                // 腿内等比例卖出：只对已过最短持有期的标的按**市值占比**分摊，
+                // 不按浮盈排序——"优先卖盈利最多的"是处置效应，长期会系统性砍掉赢家。
+                let sellable_mv: f64 = sellable.iter().map(|p| p.market_value_or_cost()).sum();
                 let mut remaining = diff;
-                for p in ranked {
-                    if remaining <= 0.0 {
-                        break;
-                    }
-                    let mv = p.market_value_or_cost();
-                    let take = remaining.min(mv);
-                    if take > 0.0 {
-                        plan.items.push(LegItem {
-                            asset_code: p.asset_code.clone(),
-                            asset_name: p.asset_name.clone(),
-                            amount: -take,
-                            note: Some(format!("持有{}天", holding_days(p, today))),
-                        });
-                        remaining -= take;
+                if sellable_mv > 0.0 {
+                    let ratio = (diff / sellable_mv).min(1.0);
+                    for p in &sellable {
+                        let mv = p.market_value_or_cost();
+                        let take = (mv * ratio).min(remaining);
+                        if take > 0.0 {
+                            let days = holding_days(p, today);
+                            plan.items.push(LegItem {
+                                asset_code: p.asset_code.clone(),
+                                asset_name: p.asset_name.clone(),
+                                amount: -take,
+                                note: Some(format!("持有{}天", days)),
+                                holding_days: Some(days),
+                            });
+                            remaining -= take;
+                        }
                     }
                 }
                 let sold = diff - remaining.max(0.0);
@@ -547,6 +565,91 @@ pub fn calculate_rebalance_plan(
     }
 }
 
+/// 生成月度定投计划：**只买不卖**，各腿买入金额之和 = 月投入（费用前）。
+///
+/// 分配规则：
+/// - 有新钱先补低配腿，按缺口占比重分配；
+/// - 所有腿都达标后，剩余金额按目标权重分配（维持配置，而不是追高）。
+pub fn calculate_monthly_plan(
+    config: &AppConfig,
+    score: f64,
+    cash_balance: f64,
+    positions: &[Position],
+    monthly: f64,
+) -> RebalancePlan {
+    let categories = ["us_stocks", "cn_stocks", "counter_cyclical"];
+    let (tu, tc, tcc) = config.asset_target_weights(score);
+    let leg_target = [tu, tc, tcc];
+    let risk_w = config.target_weight_for(score) / 100.0;
+    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum();
+    // 新钱到账后的总资产口径
+    let total = cash_balance + holdings + monthly;
+
+    let mut legs: Vec<LegPlan> = Vec::new();
+    let mut deficits = Vec::new();
+    let mut deficit_sum = 0.0;
+
+    for (idx, cat) in categories.iter().enumerate() {
+        let members: Vec<&Position> = positions.iter().filter(|p| p.category == *cat).collect();
+        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum();
+        let target_value = total * leg_target[idx];
+        let current_weight = if total > 0.0 { current / total * 100.0 } else { 0.0 };
+        let deficit = (target_value - current).max(0.0);
+        deficit_sum += deficit;
+        deficits.push(deficit);
+        legs.push(LegPlan {
+            category: cat.to_string(),
+            category_cn: category_cn(cat).to_string(),
+            target_weight: leg_target[idx] * 100.0,
+            current_weight,
+            drift_pp: current_weight - leg_target[idx] * 100.0,
+            amount: 0.0,
+            hold_reason: None,
+            items: Vec::new(),
+        });
+    }
+
+    let mut total_buy = 0.0;
+    for (idx, leg) in legs.iter_mut().enumerate() {
+        let amount = if monthly <= 0.0 {
+            0.0
+        } else if deficit_sum >= monthly {
+            monthly * deficits[idx] / deficit_sum
+        } else {
+            // 缺口全部补齐，剩余按目标权重分配
+            let share = if risk_w > 0.0 { leg_target[idx] / risk_w } else { 0.0 };
+            deficits[idx] + (monthly - deficit_sum) * share
+        };
+        leg.amount = amount;
+        total_buy += amount;
+
+        if amount <= 0.0 {
+            leg.hold_reason = Some("本月无需买入".to_string());
+            continue;
+        }
+        if deficits[idx] <= 0.0 {
+            leg.hold_reason = Some("已达标，按目标权重分配新钱".to_string());
+        }
+        let members: Vec<&Position> = positions
+            .iter()
+            .filter(|p| p.category == leg.category)
+            .collect();
+        leg.items = split_within_leg(&members, amount, config.settings.max_contrarian_weight);
+    }
+
+    RebalancePlan {
+        target_risk_weight: risk_w * 100.0,
+        current_risk_weight: if total > 0.0 { holdings / total * 100.0 } else { 0.0 },
+        total_assets: total,
+        cash_balance,
+        band_pp: config.rebalance.band_pp,
+        legs,
+        total_sell: 0.0,
+        total_buy,
+        cash_constrained: false,
+    }
+}
+
 fn holding_days(p: &Position, today: NaiveDate) -> i64 {
     NaiveDate::parse_from_str(&p.first_buy_date, "%Y-%m-%d")
         .ok()
@@ -594,6 +697,7 @@ fn split_within_leg(members: &[&Position], amount: f64, max_weight: f64) -> Vec<
             asset_name: p.asset_name.clone(),
             amount: if sum > 0.0 { amount * (w / sum) } else { amount / pool.len() as f64 },
             note: None,
+            holding_days: None,
         })
         .collect()
 }
@@ -656,18 +760,115 @@ mod tests {
     }
 
     #[test]
-    fn 极度贪婪应减仓且优先卖出收益最高者() {
+    fn 极度贪婪应减仓且按市值等比例卖出() {
         let c = AppConfig::default_config();
         // 满仓风险资产，极度贪婪目标仅 35%
         let positions = vec![
-            pos("A", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2020-01-01"), // +100%
-            pos("B", "纳指联接", "us_stocks", 1000.0, 1.0, 1.1, "2020-01-01"), // +10%
+            pos("A", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2020-01-01"), // 市值 2000, +100%
+            pos("B", "纳指联接", "us_stocks", 1000.0, 1.0, 1.1, "2020-01-01"), // 市值 1100, +10%
         ];
         let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
         assert!(p.total_sell > 0.0);
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
-        assert!(!us.items.is_empty());
-        assert_eq!(us.items[0].asset_code, "A", "应先卖绝对收益最高的标的");
+        assert_eq!(us.items.len(), 2, "两只都应被卖出，而不是只砍赢家: {:?}", us.items);
+        // 卖出金额应与市值成比例（2000 : 1100）
+        let a = us.items.iter().find(|i| i.asset_code == "A").unwrap();
+        let b = us.items.iter().find(|i| i.asset_code == "B").unwrap();
+        let ratio = (-a.amount) / (-b.amount);
+        assert!(
+            (ratio - 2000.0 / 1100.0).abs() < 0.02,
+            "应按市值等比例卖出，实际比例 {:.3}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn 浮盈差异大时仍按市值比例卖出() {
+        let mut c = AppConfig::default_config();
+        c.rebalance.band_pp = 0.0;
+        c.rebalance.min_holding_days_for_sell = 0;
+        // 同为美股，A 翻三倍、B 只涨 5%，目标权重把美股压到低配
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 1000.0, 1.0, 3.0, "2020-01-01"), // 3000
+            pos("B", "标普ETF", "us_stocks", 1000.0, 1.0, 1.05, "2020-01-01"), // 1050
+        ];
+        let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
+        let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
+        let a = us.items.iter().find(|i| i.asset_code == "A").unwrap();
+        let b = us.items.iter().find(|i| i.asset_code == "B").unwrap();
+        let ratio = (-a.amount) / (-b.amount);
+        assert!(
+            (ratio - 3000.0 / 1050.0).abs() < 0.02,
+            "收益率差距不应影响卖出比例，实际 {:.3}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn 未满最短持有期的标的不参与等比例卖出() {
+        let mut c = AppConfig::default_config();
+        c.rebalance.min_holding_days_for_sell = 30;
+        let positions = vec![
+            pos("OLD", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2020-01-01"),
+            pos("NEW", "纳指联接", "us_stocks", 1000.0, 1.0, 2.0, "2026-07-30"),
+        ];
+        let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
+        let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
+        assert_eq!(us.items.len(), 1);
+        assert_eq!(us.items[0].asset_code, "OLD");
+        assert!(us.items[0].holding_days.unwrap() >= 30);
+    }
+
+    #[test]
+    fn 费用估算包含买入费与阶梯赎回费() {
+        let c = AppConfig::default_config();
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2020-01-01"),
+            pos("B", "红利ETF", "cn_stocks", 100.0, 1.0, 1.0, "2026-07-15"),
+        ];
+        let p = calculate_rebalance_plan(&c, 90.0, 5_000.0, &positions, today());
+        let fees = p.estimated_fees(&c.costs);
+        assert!(fees > 0.0, "有交易就应有费用估算");
+        // 买入费 0.12%、A 已持有多年（免赎回费，只剩卖出 0.05%）
+        let expected_buy = p.total_buy * 0.0012;
+        let expected_sell_a = 2000.0f64.min(p.total_sell) * 0.0005;
+        assert!(
+            (fees - (expected_buy + expected_sell_a)).abs() < 1.0,
+            "费用 {:.2} 与预期 {:.2} 不符",
+            fees,
+            expected_buy + expected_sell_a
+        );
+    }
+
+    #[test]
+    fn 定投计划各腿金额之和等于月投入() {
+        let c = AppConfig::default_config();
+        let positions = vec![
+            pos("QQQ", "纳指ETF", "us_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
+            pos("DIV", "红利ETF", "cn_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
+        ];
+        let p = calculate_monthly_plan(&c, 50.0, 1_000.0, &positions, 3_000.0);
+        let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
+        assert!((sum - 3000.0).abs() < 0.01, "各腿之和应等于月投入: {}", sum);
+        assert!(p.legs.iter().all(|l| l.amount >= 0.0), "定投只买不卖");
+        assert_eq!(p.total_sell, 0.0);
+        assert!((p.total_buy - 3000.0).abs() < 0.01);
+        // 低配腿应分到更多钱
+        let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
+        let cc = p.legs.iter().find(|l| l.category == "counter_cyclical").unwrap();
+        assert!(us.amount > cc.amount);
+    }
+
+    #[test]
+    fn 定投在所有腿达标后按目标权重分配() {
+        let c = AppConfig::default_config();
+        // 极度贪婪时目标仅 35%，现金充裕 → 所有腿都无需补缺
+        let positions = vec![pos(
+            "QQQ", "纳指ETF", "us_stocks", 40_000.0, 1.0, 1.0, "2020-01-01",
+        )];
+        let p = calculate_monthly_plan(&c, 90.0, 1_000_000.0, &positions, 3_000.0);
+        let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
+        assert!((sum - 3000.0).abs() < 0.01, "各腿之和应等于月投入: {}", sum);
     }
 
     #[test]
