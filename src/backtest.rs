@@ -250,6 +250,10 @@ pub enum Anchor {
 pub struct SignalConfig {
     /// 移动平均窗口（月）。1 = 不平滑（旧行为）
     pub smooth_months: usize,
+    /// 信号产生到实际成交的滞后（月）。>=1 才不会用"未公布的月末情绪
+    /// 按同一月末净值同刻成交"。实盘主链路已迁至 `audit.rs` 的 T+lag 日频模型，
+    /// 这里的滞后仅用于让 legacy 长周期演示不再隐含前视偏差。
+    pub execution_lag_months: usize,
     pub anchor: Anchor,
     /// 趋势均线窗口（月）
     pub trend_months: usize,
@@ -265,6 +269,7 @@ impl Default for SignalConfig {
     fn default() -> Self {
         Self {
             smooth_months: 3,
+            execution_lag_months: 1,
             anchor: Anchor::SentimentOnly,
             trend_months: 12,
             trend_on_weight: 95.0,
@@ -397,13 +402,20 @@ pub struct BacktestResult {
     pub xirr: f64,
     /// 简单年化，仅为与旧版口径对照
     pub naive_annualized: f64,
+    /// 主口径：剔除资金流影响的复合净值最大回撤
     pub max_drawdown: f64,
+    /// 对照口径：含外部注资的账户总资产曲线最大回撤（旧版唯一口径）
+    pub max_drawdown_account: f64,
     pub risk: RiskMetrics,
     pub total_fees: f64,
     pub cash_interest: f64,
     pub trades: Vec<Trade>,
     pub buy_count: usize,
     pub sell_count: usize,
+    /// 注资月发生的成交（并非择时信号驱动）
+    pub inflow_driven_trades: usize,
+    /// 无注资月发生的成交（纯信号驱动）
+    pub signal_driven_trades: usize,
     pub monthly: Vec<Monthly>,
     pub trades_per_year: f64,
 }
@@ -547,6 +559,12 @@ pub fn run(
     let owned: Vec<MonthRow> = data.iter().map(|r| (*r).clone()).collect();
     let signals = smooth_fgi(&owned, signal_cfg.smooth_months);
     let target_ws = compute_target_risk_weights(config, &owned, &signals, signal_cfg);
+    // 执行滞后：第 i 月只能按 i-lag 月已产生的信号成交，不再"用月末情绪
+    // 按同一月末净值同刻成交"。lag>=1 是消除前视偏差的最低要求。
+    let lag = signal_cfg.execution_lag_months;
+    let effective_ws: Vec<f64> = (0..target_ws.len())
+        .map(|i| target_ws[i.saturating_sub(lag)])
+        .collect();
 
     let costs = &config.costs;
     let band = config.rebalance.band_pp;
@@ -600,7 +618,7 @@ pub fn run(
                 config,
                 row,
                 config.sleeve_split(),
-                target_ws[i],
+                effective_ws[i],
                 &zone,
                 band,
                 min_trade,
@@ -657,7 +675,7 @@ pub fn run(
             period_return,
             risk_weight: if total > 0.0 { risk_value / total * 100.0 } else { 0.0 },
             target_risk_weight: match engine {
-                Engine::TargetWeight => target_ws[i] * 100.0,
+                Engine::TargetWeight => effective_ws[i] * 100.0,
                 _ => 100.0,
             },
         });
@@ -759,7 +777,18 @@ fn finalize(
     let xirr = metrics::xirr(&st.flows).unwrap_or(naive);
 
     let values: Vec<f64> = monthly.iter().map(|m| m.total_value).collect();
-    let max_dd = metrics::max_drawdown(&values);
+    let max_dd_account = metrics::max_drawdown(&values);
+    // 主口径改用剔除资金流影响的复合净值：含注资的账户曲线会被新资金抬高
+    // 峰值、系统性低估回撤（旧版把这条曲线当作唯一口径）。
+    let mut equity = Vec::with_capacity(monthly.len());
+    let mut unit = 1.0_f64;
+    for (i, m) in monthly.iter().enumerate() {
+        if i > 0 {
+            unit *= 1.0 + m.period_return;
+        }
+        equity.push(unit);
+    }
+    let max_dd = metrics::max_drawdown(&equity);
     let returns: Vec<f64> = monthly.iter().skip(1).map(|m| m.period_return).collect();
     let risk = metrics::risk_metrics(
         &returns,
@@ -776,6 +805,19 @@ fn finalize(
     } else {
         0.0
     };
+    // 区分「年度注资带来的被动买入」与「纯信号驱动的择时交易」。
+    // 旧版把两者混在一起算频次，导致 3.4 次/年被误读为策略换手。
+    let inflow_months: std::collections::HashSet<(i32, u32)> = monthly
+        .iter()
+        .filter(|m| m.inflow > 0.0)
+        .map(|m| (m.date.year(), m.date.month()))
+        .collect();
+    let inflow_driven = st
+        .trades
+        .iter()
+        .filter(|t| inflow_months.contains(&(t.date.year(), t.date.month())))
+        .count();
+    let signal_driven = st.trades.len() - inflow_driven;
 
     BacktestResult {
         name: engine.label().to_string(),
@@ -786,12 +828,15 @@ fn finalize(
         xirr,
         naive_annualized: naive,
         max_drawdown: max_dd,
+        max_drawdown_account: max_dd_account,
         risk,
         total_fees: st.fees,
         cash_interest: st.interest,
         trades: st.trades,
         buy_count,
         sell_count,
+        inflow_driven_trades: inflow_driven,
+        signal_driven_trades: signal_driven,
         monthly,
         trades_per_year,
     }
@@ -814,7 +859,9 @@ pub fn print_report(r: &BacktestResult) {
     println!("    年化(简单口径):           {:>10.2}%", r.naive_annualized * 100.0);
     println!();
     println!("  【风险】");
-    println!("    最大回撤:                 {:>10.2}%", r.max_drawdown * 100.0);
+    println!("    最大回撤(剔除资金流/主口径): {:>8.2}%", r.max_drawdown * 100.0);
+    println!("    最大回撤(含注资/旧口径):    {:>8.2}%", r.max_drawdown_account * 100.0);
+    println!("    （注：月频采样仍不含月内低点，日频口径见 `mns backtest`）");
     println!("    年化波动:                 {:>10.2}%", r.risk.volatility * 100.0);
     println!("    Sharpe:                   {:>10.2}", r.risk.sharpe);
     println!("    Sortino:                  {:>10.2}", r.risk.sortino);
@@ -832,6 +879,10 @@ pub fn print_report(r: &BacktestResult) {
     println!(
         "    买入 {:>3} 次 | 卖出 {:>3} 次 | 合计 {:>3} 次 | 年均 {:.1} 次",
         r.buy_count, r.sell_count, r.trades.len(), r.trades_per_year
+    );
+    println!(
+        "    其中：注资驱动 {} 笔 / 纯信号驱动 {} 笔（策略换手只看后者）",
+        r.inflow_driven_trades, r.signal_driven_trades
     );
 
     let mut by_leg: HashMap<usize, (usize, f64)> = HashMap::new();
@@ -992,26 +1043,44 @@ pub fn print_comparison(results: &[BacktestResult]) {
 pub fn print_profile_comparison(results: &[BacktestResult]) {
     println!();
     println!("=================================================================");
-    println!("   风险档位对比（同一数据、同一成本模型）");
+    println!("   档位对比：常驻仓位 / 年换手 / 预期回撤（同一数据、同一成本模型）");
     println!("=================================================================");
+    println!();
+    println!("  说明：4 个档位本质是「常驻仓位地板」(core_blend)，不是风险等级。");
+    println!("        档位越高＝底仓越高、择时摆幅越小，回撤未必更低；请按三维指标选档。");
     println!();
     let mut table = Table::new();
     table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("档位"),
+        Cell::new("常驻仓位"),
         Cell::new("年化XIRR"),
-        Cell::new("最大回撤"),
+        Cell::new("最大回撤(主口径)"),
         Cell::new("Calmar"),
-        Cell::new("年均交易"),
+        Cell::new("纯信号笔/年"),
+        Cell::new("总笔/年"),
         Cell::new("费用"),
     ]);
     for r in results {
         let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        let core = r.monthly.iter().map(|m| m.target_risk_weight).sum::<f64>()
+            / r.monthly.len().max(1) as f64;
+        let years = match (r.monthly.first(), r.monthly.last()) {
+            (Some(a), Some(b)) => (b.date - a.date).num_days() as f64 / 365.0,
+            _ => 0.0,
+        };
+        let signal_per_year = if years > 0.0 {
+            r.signal_driven_trades as f64 / years
+        } else {
+            0.0
+        };
         table.add_row(vec![
             Cell::new(&r.name),
+            Cell::new(format!("{:.1}%", core)),
             Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
             Cell::new(format!("{:.2}%", r.max_drawdown * 100.0)),
             Cell::new(format!("{:.2}", r.risk.calmar)),
+            Cell::new(format!("{:.1}", signal_per_year)),
             Cell::new(format!("{:.1}", r.trades_per_year)),
             Cell::new(format!("¥{:.0}", r.total_fees)),
         ]);
@@ -1136,7 +1205,14 @@ mod tests {
 
     #[test]
     fn 阶梯赎回费应按批次持有天数分别计算() {
-        let costs = crate::config::Costs::default();
+        // 显式构造旧阶梯，让本测试只验证 FIFO 分批计费机制，
+        // 不与生产默认成本参数耦合（默认值已改为实盘 007605 真实规则）。
+        let costs = crate::config::Costs {
+            buy_fee_pct: 0.12,
+            sell_fee_pct: 0.05,
+            cash_annual_yield: 2.0,
+            redemption_tiers: vec![(7, 1.5), (30, 0.75), (365, 0.5), (730, 0.25)],
+        };
         let mut leg = Leg::default();
         leg.buy(100.0, 1.0, d(2020, 1, 1)); // 持有 1827 天 → 免赎回费
         leg.buy(100.0, 1.0, d(2024, 12, 29)); // 持有 3 天 → 落入 <7 天惩罚档 1.5%
@@ -1284,24 +1360,40 @@ mod tests {
     }
 
     #[test]
-    fn 交易频率应符合中长线约束() {
-        // 用户可接受每月2-3次，即年均约36次以内
+    fn 交易频次应区分注资驱动与信号驱动并暴露与真实预算的错配() {
+        // 旧断言 <=36 次/年 而实测 3.4 次/年，上限宽松 10 倍，不具约束力；
+        // 且把年度注资的被动买入也算进"策略换手"。这里改为验证分解正确性，
+        // 并把与用户真实 10-20 次/年的错配固化为回归断言。
         let rows = load_main();
         let bt = BacktestConfig::default();
         let cfg = AppConfig::default_config();
         let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        assert_eq!(
+            r.inflow_driven_trades + r.signal_driven_trades,
+            r.trades.len(),
+            "两类和应等于总笔数"
+        );
+        assert!(r.trades_per_year <= 36.0, "保留上限兜底");
+        let years = (r.monthly.last().unwrap().date - r.monthly.first().unwrap().date)
+            .num_days() as f64 / 365.0;
+        let signal_per_year = r.signal_driven_trades as f64 / years;
         assert!(
-            r.trades_per_year <= 36.0,
-            "年均交易 {:.1} 次超出中长线约束",
-            r.trades_per_year
+            signal_per_year < cfg.backtest.annual_trade_budget_min as f64,
+            "纯信号交易 {:.2} 次/年应显著低于用户预算下限 {} 次/年；若信号口径已与实盘对齐请更新本断言",
+            signal_per_year,
+            cfg.backtest.annual_trade_budget_min
         );
     }
+
     #[test]
     fn 对照_趋势锚点与情绪锚点() {
+        // 原为无断言的打印型测试，SKILL.md 曾引用其输出（10.2~14.8 次/年）
+        // 论证实盘信号设计，但那用的是默认配置、与生效配置下 3.4 次/年差 3-4 倍。
+        // 改为带断言的回归测试：验证平滑降噪的单调性，不再作为文档数据来源。
         let cfg = AppConfig::default_config();
         let rows = load_main();
         let bt = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
-        println!("\n{:<22} {:>9} {:>9} {:>8} {:>8} {:>9}", "信号模式", "XIRR", "回撤", "Sharpe", "Calmar", "年均交易");
+        let mut results = Vec::new();
         for (name, sc) in [
             ("情绪锚(平滑1月)", SignalConfig { smooth_months: 1, ..SignalConfig::default() }),
             ("情绪锚(平滑3月)", SignalConfig::default()),
@@ -1310,13 +1402,25 @@ mod tests {
             ("趋势锚(倾斜0)", SignalConfig { tilt_pp: 0.0, ..SignalConfig::trend_tilt() }),
         ] {
             let r = run(&cfg, &bt, &sc, Engine::TargetWeight, &rows);
-            println!("{:<22} {:>8.2}% {:>8.2}% {:>8.2} {:>8.2} {:>9.1}",
-                name, r.xirr*100.0, r.max_drawdown*100.0, r.risk.sharpe, r.risk.calmar, r.trades_per_year);
+            assert!(r.xirr.is_finite(), "{name} 的 XIRR 应有限");
+            assert!(r.max_drawdown >= 0.0 && r.max_drawdown <= 1.0, "{name} 回撤应合法");
+            results.push((name, r));
         }
-        for (name, e) in [("买入持有+年度再平衡", Engine::BuyHoldRebalanced), ("买入持有", Engine::BuyHold)] {
-            let r = run(&cfg, &bt, &SignalConfig::default(), e, &rows);
-            println!("{:<22} {:>8.2}% {:>8.2}% {:>8.2} {:>8.2} {:>9.1}",
-                name, r.xirr*100.0, r.max_drawdown*100.0, r.risk.sharpe, r.risk.calmar, r.trades_per_year);
-        }
+        // 平滑窗口增大不应增加交易频次（1月 >= 3月 >= 6月）
+        assert!(
+            results[0].1.trades_per_year >= results[1].1.trades_per_year
+                && results[1].1.trades_per_year >= results[2].1.trades_per_year,
+            "平滑窗口增大应单调降低换手: {:.1}/{:.1}/{:.1}",
+            results[0].1.trades_per_year,
+            results[1].1.trades_per_year,
+            results[2].1.trades_per_year
+        );
+        // 趋势锚与情绪锚必须是两个不同的策略
+        assert!(
+            (results[1].1.xirr - results[3].1.xirr).abs() > 1e-6,
+            "趋势锚与情绪锚不应产出完全相同的结果"
+        );
+        // 双口径回撤都应存在且有限
+        assert!(results[1].1.max_drawdown_account.is_finite());
     }
 }

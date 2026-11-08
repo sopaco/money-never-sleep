@@ -25,6 +25,193 @@ pub struct AppConfig {
     /// `core_blend=0`（老配置缺字段）完全等价旧行为。
     #[serde(default)]
     pub profile: ProfileConfig,
+    /// 实盘审计（账户镜像、统计检验、数据新鲜度）设置
+    #[serde(default)]
+    pub backtest: BacktestSettings,
+    /// 按真实交易通道拆分的成本与结算参数
+    #[serde(default)]
+    pub channels: ChannelCosts,
+}
+
+/// 决策周期。实盘与回测必须共用同一取值，禁止两条链路各用一套信号。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionInterval {
+    /// 每个交易日决策（`decision_weekday=0` 的现状，区间切换约 19 次/年）
+    Daily,
+    /// 每周固定决策日，与 `rebalance.decision_weekday` 配合
+    #[default]
+    Weekly,
+    /// 每月最后一个交易日决策
+    Monthly,
+}
+
+/// 实盘审计设置。这里的参数决定"验证的是谁"，与策略参数同等重要。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestSettings {
+    /// 实盘日频数据集路径（相对仓库根或绝对路径）
+    #[serde(default = "BacktestSettings::default_data_path")]
+    pub data_path: String,
+    /// 数据集落后超过该天数即判定失效，回测输出醒目告警
+    #[serde(default = "BacktestSettings::default_sla")]
+    pub freshness_sla_days: u32,
+    /// 账户期初资金（真实入场时的本金，非回测假设的 10 万）
+    #[serde(default = "BacktestSettings::default_initial_cash")]
+    pub initial_cash: f64,
+    /// 真实入场日（YYYY-MM-DD）
+    #[serde(default = "BacktestSettings::default_entry_date")]
+    pub entry_date: String,
+    /// 年度交易预算下限/上限，用于把日频信号压缩为可执行建议
+    #[serde(default = "BacktestSettings::default_budget_min")]
+    pub annual_trade_budget_min: u32,
+    #[serde(default = "BacktestSettings::default_budget_max")]
+    pub annual_trade_budget_max: u32,
+    /// 决策周期：实盘与回测共用
+    #[serde(default)]
+    pub decision_interval: DecisionInterval,
+    /// 信号计算日 → 实际成交日的滞后（自然日）。>0 才不会出现"月末同刻成交"
+    #[serde(default = "BacktestSettings::default_execution_lag")]
+    pub execution_lag_days: u32,
+    /// 信号时序置换检验次数
+    #[serde(default = "BacktestSettings::default_permutations")]
+    pub permutation_iterations: usize,
+    /// 真实信号需进入随机分布前 N 百分位才判定择时有贡献
+    #[serde(default = "BacktestSettings::default_significance")]
+    pub significance_percentile: f64,
+}
+
+impl BacktestSettings {
+    fn default_data_path() -> String {
+        ".agents/skills/mns-backtest/data/live_daily.csv".to_string()
+    }
+    fn default_sla() -> u32 {
+        30
+    }
+    fn default_initial_cash() -> f64 {
+        10_000.0
+    }
+    fn default_entry_date() -> String {
+        "2026-07-16".to_string()
+    }
+    fn default_budget_min() -> u32 {
+        10
+    }
+    fn default_budget_max() -> u32 {
+        20
+    }
+    fn default_execution_lag() -> u32 {
+        1
+    }
+    fn default_permutations() -> usize {
+        300
+    }
+    fn default_significance() -> f64 {
+        80.0
+    }
+}
+
+impl Default for BacktestSettings {
+    fn default() -> Self {
+        Self {
+            data_path: Self::default_data_path(),
+            freshness_sla_days: Self::default_sla(),
+            initial_cash: Self::default_initial_cash(),
+            entry_date: Self::default_entry_date(),
+            annual_trade_budget_min: Self::default_budget_min(),
+            annual_trade_budget_max: Self::default_budget_max(),
+            decision_interval: DecisionInterval::default(),
+            execution_lag_days: Self::default_execution_lag(),
+            permutation_iterations: Self::default_permutations(),
+            significance_percentile: Self::default_significance(),
+        }
+    }
+}
+
+/// 单一交易通道的成本与结算约束。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSpec {
+    /// 申购/买入费率（%）
+    pub buy_fee_pct: f64,
+    /// 固定卖出成本（%，佣金或过户费）
+    pub sell_fee_pct: f64,
+    /// 阶梯赎回费：(持有天数上界, 费率%)，取第一个满足 days < 上界 的档位。
+    /// 空数组表示场内 ETF 无赎回费。
+    pub redemption_tiers: Vec<(i64, f64)>,
+    /// 卖出款可用所需自然日（T+n）。到账前记在途资金，不得用于同期买入。
+    pub settlement_days: u32,
+    /// 单日单腿申购上限（元）。0 = 无限额。QDII 外汇额度限购是真实约束。
+    pub daily_subscription_cap: f64,
+    /// 买入滑点/溢价（%）。场外按净值成交为 0；场内 ETF 含折溢价。
+    pub slippage_pct: f64,
+    /// **仅用于代理标的换算**：用 ETF/指数净值代理场外联接基金时的年化跟踪损耗（%）。
+    /// 实盘基金净值本身已包含跟踪误差，实盘链路不得再扣，避免重复计费。
+    pub proxy_tracking_error_pct: f64,
+}
+
+impl ChannelSpec {
+    pub fn redemption_rate(&self, holding_days: i64) -> f64 {
+        for (limit, rate) in &self.redemption_tiers {
+            if holding_days < *limit {
+                return rate / 100.0;
+            }
+        }
+        0.0
+    }
+    pub fn total_sell_rate(&self, holding_days: i64) -> f64 {
+        self.sell_fee_pct / 100.0 + self.redemption_rate(holding_days)
+    }
+    pub fn buy_rate(&self) -> f64 {
+        self.buy_fee_pct / 100.0
+    }
+}
+
+/// 三类真实通道。旧的 `Costs` 把场外申购费 + 场外阶梯赎回费 + 场内即时到账
+/// 混在一起，不对应任何真实交易通道；实盘审计统一走这里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelCosts {
+    /// 场外 QDII 纳指联接（018966 / 539001）
+    pub qdii_feeder: ChannelSpec,
+    /// 场外 A 股 ETF 联接（007605 / 020341）
+    pub cn_feeder: ChannelSpec,
+    /// 场内 ETF（仅旧长周期代理数据集使用）
+    pub on_exchange_etf: ChannelSpec,
+}
+
+impl Default for ChannelCosts {
+    fn default() -> Self {
+        // 赎回阶梯按 007605 实际规则：<7日 1.5% / 7–365日 0.5% /
+        // 365–730日 0.25% / ≥730日 0（NeoData 核实），旧模型的 7–30日 0.75% 一档不存在。
+        let feed_tiers = vec![(7, 1.5), (365, 0.5), (730, 0.25)];
+        Self {
+            qdii_feeder: ChannelSpec {
+                buy_fee_pct: 0.12,
+                sell_fee_pct: 0.0,
+                redemption_tiers: feed_tiers.clone(),
+                settlement_days: 7,      // QDII 赎回款 T+5~T+7
+                daily_subscription_cap: 520.0, // 部分平台纳指100 每日总限额
+                slippage_pct: 0.0,
+                proxy_tracking_error_pct: 1.2,
+            },
+            cn_feeder: ChannelSpec {
+                buy_fee_pct: 0.12,
+                sell_fee_pct: 0.0,
+                redemption_tiers: feed_tiers,
+                settlement_days: 3,
+                daily_subscription_cap: 0.0,
+                slippage_pct: 0.0,
+                proxy_tracking_error_pct: 1.1,
+            },
+            on_exchange_etf: ChannelSpec {
+                buy_fee_pct: 0.02,
+                sell_fee_pct: 0.02,
+                redemption_tiers: vec![],
+                settlement_days: 1,
+                daily_subscription_cap: 0.0,
+                slippage_pct: 0.05,
+                proxy_tracking_error_pct: 0.3,
+            },
+        }
+    }
 }
 
 /// 目标仓位曲线的过渡方式。
@@ -171,8 +358,9 @@ pub struct Cashflow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rebalance {
-    /// 偏离带（百分点）。实际权重与目标偏离不超过该值则不动作，
-    /// 这是把交易频率压到"每月2-3次或更低"的主要机制。
+    /// 偏离带（百分点）。实际权重与目标偏离不超过该值则不动作。
+    /// 实测：band=6pp 在 2016-2025 代理数据上约 3.4 笔/年（其中近三成只是年度注资），
+    /// 与用户真实 10–20 次/年相差 3–6 倍；这里不再声称能把频次压到"每月 2-3 次"。
     pub band_pp: f64,
     /// 单笔最小交易金额，避免产生无意义碎单
     pub min_trade_amount: f64,
@@ -226,7 +414,9 @@ pub struct Costs {
     pub sell_fee_pct: f64,
     /// 闲置现金年化收益（货币基金）。旧回测假设为 0，系统性低估持有现金的表现。
     pub cash_annual_yield: f64,
-    /// 阶梯赎回费：(持有天数上界, 费率%)，取第一个满足 days < 上界 的档位
+    /// 阶梯赎回费：(持有天数上界, 费率%)，取第一个满足 days < 上界 的档位。
+    /// 按实盘 007605 真实规则：<7日 1.5% / 7–365日 0.5% / 365–730日 0.25% / ≥730日 0。
+    /// 旧版多出的「7–30 日 0.75%」一档无对应基金，已删除。
     pub redemption_tiers: Vec<(i64, f64)>,
 }
 
@@ -234,10 +424,10 @@ impl Default for Costs {
     fn default() -> Self {
         Self {
             buy_fee_pct: 0.12,
-            sell_fee_pct: 0.05,
-            cash_annual_yield: 2.0,
-            // 国内基金常见阶梯：<7天惩罚性1.5%，<30天0.75%，<365天0.5%，<730天0.25%
-            redemption_tiers: vec![(7, 1.5), (30, 0.75), (365, 0.5), (730, 0.25)],
+            sell_fee_pct: 0.0, // 场外基金按净值申赎，无场内佣金/过户费
+            // 2026 年货币基金实际收益约 1.3%；旧版 2.0% 使 XIRR 高估约 0.20pp
+            cash_annual_yield: 1.3,
+            redemption_tiers: vec![(7, 1.5), (365, 0.5), (730, 0.25)],
         }
     }
 }
@@ -350,6 +540,8 @@ impl AppConfig {
             costs: Costs::default(),
             cashflow: Cashflow::default(),
             profile: ProfileConfig::default(),
+            backtest: BacktestSettings::default(),
+            channels: ChannelCosts::default(),
         }
     }
 
@@ -468,6 +660,40 @@ impl AppConfig {
                 "costs.cash_annual_yield 不能为负: {}",
                 self.costs.cash_annual_yield
             );
+        }
+        let b = &self.backtest;
+        if b.freshness_sla_days == 0 {
+            anyhow::bail!("backtest.freshness_sla_days 必须大于 0");
+        }
+        if b.initial_cash <= 0.0 {
+            anyhow::bail!("backtest.initial_cash 必须大于 0: {}", b.initial_cash);
+        }
+        if b.annual_trade_budget_min > b.annual_trade_budget_max {
+            anyhow::bail!(
+                "backtest.annual_trade_budget_min({}) 不能大于 max({})",
+                b.annual_trade_budget_min,
+                b.annual_trade_budget_max
+            );
+        }
+        if b.execution_lag_days == 0 {
+            anyhow::bail!(
+                "backtest.execution_lag_days 至少为 1；0 会退回「用未公布信号按当日净值同刻成交」的前视假设"
+            );
+        }
+        if b.permutation_iterations < 100 {
+            anyhow::bail!(
+                "backtest.permutation_iterations 至少 100 次，否则置换检验分位数不可靠: {}",
+                b.permutation_iterations
+            );
+        }
+        if !(0.0..=100.0).contains(&b.significance_percentile) {
+            anyhow::bail!(
+                "backtest.significance_percentile 应在 0-100 之间: {}",
+                b.significance_percentile
+            );
+        }
+        if chrono::NaiveDate::parse_from_str(&b.entry_date, "%Y-%m-%d").is_err() {
+            anyhow::bail!("backtest.entry_date 必须为 YYYY-MM-DD: {}", b.entry_date);
         }
         Ok(())
     }
@@ -619,6 +845,28 @@ impl AppConfig {
             "cashflow.monthly" => Some(self.cashflow.monthly.to_string()),
             "profile" => Some(self.profile_label().to_string()),
             "profile.core_blend" => Some(self.profile.core_blend.to_string()),
+            "backtest.data_path" => Some(self.backtest.data_path.clone()),
+            "backtest.freshness_sla_days" => Some(self.backtest.freshness_sla_days.to_string()),
+            "backtest.initial_cash" => Some(self.backtest.initial_cash.to_string()),
+            "backtest.entry_date" => Some(self.backtest.entry_date.clone()),
+            "backtest.annual_trade_budget_min" => {
+                Some(self.backtest.annual_trade_budget_min.to_string())
+            }
+            "backtest.annual_trade_budget_max" => {
+                Some(self.backtest.annual_trade_budget_max.to_string())
+            }
+            "backtest.decision_interval" => Some(match self.backtest.decision_interval {
+                DecisionInterval::Daily => "daily".to_string(),
+                DecisionInterval::Weekly => "weekly".to_string(),
+                DecisionInterval::Monthly => "monthly".to_string(),
+            }),
+            "backtest.execution_lag_days" => Some(self.backtest.execution_lag_days.to_string()),
+            "backtest.permutation_iterations" => {
+                Some(self.backtest.permutation_iterations.to_string())
+            }
+            "backtest.significance_percentile" => {
+                Some(self.backtest.significance_percentile.to_string())
+            }
             _ => None,
         }
     }
@@ -684,6 +932,35 @@ impl AppConfig {
                 self.profile.core_blend = value.parse()?;
                 self.profile.name = "custom".to_string();
             }
+            "backtest.data_path" => self.backtest.data_path = value.to_string(),
+            "backtest.freshness_sla_days" => self.backtest.freshness_sla_days = value.parse()?,
+            "backtest.initial_cash" => self.backtest.initial_cash = value.parse()?,
+            "backtest.entry_date" => self.backtest.entry_date = value.to_string(),
+            "backtest.annual_trade_budget_min" => {
+                self.backtest.annual_trade_budget_min = value.parse()?;
+            }
+            "backtest.annual_trade_budget_max" => {
+                self.backtest.annual_trade_budget_max = value.parse()?;
+            }
+            "backtest.decision_interval" => {
+                self.backtest.decision_interval =
+                    match value.trim().to_ascii_lowercase().as_str() {
+                        "daily" | "每日" => DecisionInterval::Daily,
+                        "weekly" | "每周" => DecisionInterval::Weekly,
+                        "monthly" | "每月" => DecisionInterval::Monthly,
+                        other => anyhow::bail!(
+                            "未知决策周期: {}（可选 daily/weekly/monthly）",
+                            other
+                        ),
+                    };
+            }
+            "backtest.execution_lag_days" => self.backtest.execution_lag_days = value.parse()?,
+            "backtest.permutation_iterations" => {
+                self.backtest.permutation_iterations = value.parse()?;
+            }
+            "backtest.significance_percentile" => {
+                self.backtest.significance_percentile = value.parse()?;
+            }
             _ => anyhow::bail!("未知的配置项: {}", key),
         }
         Ok(())
@@ -746,29 +1023,55 @@ mod tests {
         assert!((us / (us + cn + cc) - 0.55).abs() < 1e-9);
     }
 
+    /// 阶梯机制的通用测试用显式构造的旧阶梯，与默认值解耦。
+    fn legacy_costs() -> Costs {
+        Costs {
+            buy_fee_pct: 0.12,
+            sell_fee_pct: 0.05,
+            cash_annual_yield: 2.0,
+            redemption_tiers: vec![(7, 1.5), (30, 0.75), (365, 0.5), (730, 0.25)],
+        }
+    }
+
     #[test]
     fn 阶梯赎回费按持有天数取档() {
-        let c = cfg();
-        assert!((c.costs.redemption_rate(3) - 0.015).abs() < 1e-9, "<7天 1.5%");
-        assert!((c.costs.redemption_rate(20) - 0.0075).abs() < 1e-9, "<30天 0.75%");
-        assert!((c.costs.redemption_rate(200) - 0.005).abs() < 1e-9, "<365天 0.5%");
-        assert!((c.costs.redemption_rate(500) - 0.0025).abs() < 1e-9, "<730天 0.25%");
-        assert_eq!(c.costs.redemption_rate(1000), 0.0, "长期持有免赎回费");
+        let c = legacy_costs();
+        assert!((c.redemption_rate(3) - 0.015).abs() < 1e-9, "<7天 1.5%");
+        assert!((c.redemption_rate(20) - 0.0075).abs() < 1e-9, "<30天 0.75%");
+        assert!((c.redemption_rate(200) - 0.005).abs() < 1e-9, "<365天 0.5%");
+        assert!((c.redemption_rate(500) - 0.0025).abs() < 1e-9, "<730天 0.25%");
+        assert_eq!(c.redemption_rate(1000), 0.0, "长期持有免赎回费");
+    }
+
+    #[test]
+    fn 默认赎回阶梯对应实盘基金真实规则() {
+        // 007605 实际阶梯：<7日 1.5% / 7–365日 0.5% / 365–730日 0.25% / ≥730日 0。
+        // 旧默认多出的「7–30 日 0.75%」一档无对应基金，已删除。
+        let c = Costs::default();
+        assert!((c.redemption_rate(3) - 0.015).abs() < 1e-9);
+        assert!((c.redemption_rate(20) - 0.005).abs() < 1e-9, "7-30日应为 0.5%，不再是 0.75%");
+        assert!((c.redemption_rate(200) - 0.005).abs() < 1e-9);
+        assert!((c.redemption_rate(500) - 0.0025).abs() < 1e-9);
+        assert_eq!(c.redemption_rate(1000), 0.0);
+        assert_eq!(c.sell_fee_pct, 0.0, "场外基金按净值申赎，无场内佣金/过户费");
     }
 
     #[test]
     fn 卖出总费率叠加固定成本与赎回费() {
-        let c = cfg();
+        let c = legacy_costs();
         let expect = 0.05 / 100.0 + 0.015;
-        assert!((c.costs.total_sell_rate(3) - expect).abs() < 1e-12);
+        assert!((c.total_sell_rate(3) - expect).abs() < 1e-12);
     }
 
     #[test]
     fn 现金按年化收益增长() {
-        let c = cfg();
-        assert_eq!(c.costs.cash_growth(0), 1.0);
-        let one_year = c.costs.cash_growth(365);
+        let c = legacy_costs();
+        assert_eq!(c.cash_growth(0), 1.0);
+        let one_year = c.cash_growth(365);
         assert!((one_year - 1.02).abs() < 1e-9, "2%年化: {}", one_year);
+        // 默认改为 2026 年货币基金实际量级 1.3%（旧 2.0% 使 XIRR 高估约 0.20pp）
+        assert_eq!(Costs::default().cash_annual_yield, 1.3);
+        assert!((Costs::default().cash_growth(365) - 1.013).abs() < 1e-9);
     }
 
     #[test]
@@ -922,7 +1225,7 @@ fear_greed_url = "https://example.com"
         let c: AppConfig = toml::from_str(old).expect("旧配置应能解析");
         assert!(c.validate().is_ok());
         assert_eq!(c.target_weight.neutral, 60.0, "应回落到默认曲线");
-        assert_eq!(c.costs.cash_annual_yield, 2.0);
+        assert_eq!(c.costs.cash_annual_yield, 1.3);
         assert_eq!(c.rebalance.signal_smooth_days, 7, "旧配置回落到默认平滑窗口");
         assert_eq!(c.rebalance.zone_confirm_days, 3, "旧配置回落到默认确认天数");
         assert_eq!(c.rebalance.decision_weekday, 5, "旧配置回落到默认决策日(周五)");

@@ -1,0 +1,67 @@
+{
+  "generated_at": "2026-11-08T17:16:08+08:00",
+  "method": "point-in-time as-of join; FGI strictly before trade date; NAV on or before",
+  "sources": {
+    "nav": "eastmoney fundmobapi FundMNHisNetList (JZZZL chained total-return index)",
+    "fgi": "CNN Fear & Greed graphdata (daily, ~1y history)"
+  },
+  "legs": {
+    "018966": {
+      "name": "汇添富纳斯达克100ETF联接",
+      "leg": "us_stocks",
+      "weight": 0.5,
+      "channel": "qdii_feeder",
+      "nav_first": "2023-08-03",
+      "nav_last": "2026-11-05",
+      "nav_observations": 790
+    },
+    "539001": {
+      "name": "建信纳斯达克100指数(QDII)",
+      "leg": "us_stocks",
+      "weight": 0.5,
+      "channel": "qdii_feeder",
+      "nav_first": "2010-09-16",
+      "nav_last": "2026-11-05",
+      "nav_observations": 3611
+    },
+    "007605": {
+      "name": "嘉实沪深300红利低波动ETF联接A",
+      "leg": "cn_stocks",
+      "weight": 1.0,
+      "channel": "cn_feeder",
+      "nav_first": "2019-12-16",
+      "nav_last": "2026-11-06",
+      "nav_observations": 1673
+    },
+    "020341": {
+      "name": "工银黄金ETF联接E",
+      "leg": "counter_cyclical",
+      "weight": 1.0,
+      "channel": "cn_feeder",
+      "nav_first": "2024-01-11",
+      "nav_last": "2026-11-06",
+      "nav_observations": 682
+    }
+  },
+  "fgi_range": [
+    "2025-11-10",
+    "2026-11-07"
+  ],
+  "fgi_observations": 250,
+  "calendar_range": [
+    "2024-01-11",
+    "2026-11-06"
+  ],
+  "calendar_observations": 682,
+  "strategy_ready_range": [
+    "2025-11-11",
+    "2026-11-06"
+  ],
+  "strategy_ready_observations": 240,
+  "limitations": [
+    "CNN 仅提供约一年日频 FGI，故策略可验证区间不足 36 个月；更长历史的 holdout/压力段须使用代理数据并单独标注。",
+    "四只基金成立时间不同，共同起点由最晚成立的 020341 决定。",
+    "QDII 净值披露滞后，缺口按前值延续；这是实盘可知信息的真实约束，非插值。",
+    "月度 2016-2025 代理序列仍保留为长周期参考，标的与指数均不同于实盘，不得用于实盘结论。"
+  ]
+}

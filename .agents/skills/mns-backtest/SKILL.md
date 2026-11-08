@@ -11,100 +11,113 @@ description: |
 
 # MNS 逆向投资策略回测 Skill
 
+> 2026-11-08 整改后版本。旧的 2016–2025 月频代理对比已降级为 `mns backtest legacy`，
+> **其结论不可迁移到实盘**：标的、指数、通道、信号口径、注资假设均与真实账户不同。
+> 评估依据见 `docs/backtest-validation-review-2026-11-08.md` 与 `docs/remediation-2026-11-08.md`。
+
 ## 操作步骤
 
-### 1. 构建
+### 1. 构建与数据
 
 ```bash
 cargo build --release
+mns backtest update-data      # 重建两层日频数据集；需 Python 3 与网络
 ```
 
-### 2. 运行回测
+`update-data` 会同时刷新实盘层与长周期层，并输出数据新鲜度 SLA 校验结果。
+数据集落后超过 `backtest.freshness_sla_days`（默认 30 天）时，`mns backtest` 会输出醒目告警。
+
+### 2. 运行
 
 ```bash
-# 默认行为：当前配置（情绪锚/趋势锚两种信号）对比买入持有、买入持有+年度再平衡基准，
-# 再输出风险档位三档并列与年频/月频注资对比
-mns backtest
-
-# 使用自定义配置文件
-mns backtest --config path/to/config.toml
-
-# 多配置文件对比
-mns backtest --compare config1.toml,config2.toml
-
-# 查看可调参数说明（含当前默认值）
-mns config params
+mns backtest                 # 默认：完整实盘审计
+mns backtest mirror          # 只看账户镜像（严格执行 vs 实际执行）
+mns backtest validate-full   # 只看统计检验，可加 --iterations 500
+mns backtest legacy          # 已降级：旧月频代理对比（--config / --compare 仅在此生效）
+mns config params            # 全部可调参数（含 [backtest] / [channels]）
 ```
+
+默认审计链路依次输出：数据与口径 → 策略有效性对照（含信号时序置换检验）→
+最近 36 月连续复利 holdout → 牛熊分段 → 滚动多折 walk-forward → 账户镜像 → 边界声明。
 
 ### 3. 参数调优
 
-查看当前配置：
 ```bash
 mns config
+mns config backtest.decision_interval weekly
+mns config rebalance.band_pp 6
 ```
 
-修改单个参数：
-```bash
-mns config target_weight.neutral 50
-mns config thresholds.fear 40
-```
+生效配置始终来自 `~/.mns/config.toml`。`.agents/skills/mns-backtest/data/config_*.toml`
+七个文件是**参考预设，不会被任何命令自动加载**；只能通过 `mns backtest legacy --config <路径>`
+显式指定。它们只含 `[target_weight]` / `[rebalance]` 等参数，不含 `[backtest]` / `[channels]`，
+缺省部分会回落到 `AppConfig::default_config()`。
 
-使用预设配置文件（位于 `.agents/skills/mns-backtest/data/`）：
+⚠️ 实盘建议与默认回测共用 `[target_weight]` + `[rebalance]` + `[backtest.decision_interval]`，
+不允许两条链路各设一套信号后互相引用结论。
 
-| 配置文件 | 特点 |
-|---------|------|
-| `config_defensive.toml` | 防御配置（低回撤，更长持仓，与 `AppConfig::default_config()` 的 `target_weight` 曲线一致——**是当前默认**） |
-| `config_balanced.toml` | 均衡配置（三资产等权，风险权重曲线更平缓） |
-| `config_circuit_breaker.toml` | 熔断抄底（极度恐慌区间风险权重更高、偏离带更宽） |
-| `config_swing.toml` | 波段操作（偏离带更窄，交易更频繁） |
-| `config_extreme_contrarian.toml` | 极致逆向（风险权重区间跨度最大） |
-| `config_value.toml` | 价值导向（阈值更极端，只在真正的极端行情动仓） |
-| `config_historical_aggressive.toml` | 历史激进配置（⚠️ 过拟合风险，仅供研究参考） |
+## 数据说明（两层，不可混用）
 
-```bash
-mns backtest --config .agents/skills/mns-backtest/data/config_defensive.toml
-```
+两层数据集均由 point-in-time as-of 对齐生成：每一行的 FGI 取**严格早于**该交易日的
+最后一条已公布值（CNN 美股收盘后计算，北京时间次日才可得），净值取不晚于当日的
+最后一条已披露值（QDII 净值 T+1/T+2 披露，缺口沿用前值）。因此不存在
+「用当日情绪按当日净值同刻成交」的前视偏差。
 
-⚠️ **重要**：驱动回测与 `mns report` 实盘建议的是 `[target_weight]`（风险资产目标权重曲线，
-见 `src/config.rs` 的 `TargetWeight`）+ `[rebalance]`（偏离带）。上述 7 个预设文件都只包含
-这两类及相关的有效参数，全部直接生效。
+| 数据集 | 区间 | 标的 | 用途 |
+|---|---|---|---|
+| `live_daily.csv` | 2024-01-11 ~ 今（682 行） | 实盘四只场外基金 018966 / 539001 / 007605 / 020341 的真实全收益指数 + 单位净值 | 账户镜像、实盘结论 |
+| `long_daily.csv` | 2016-01-04 ~ 今（2637 行） | 三腿长历史代理：539001 / H30269 中证红利低波**价格指数** / 518880 黄金 ETF | 穿越牛熊的稳健性检验 |
 
-## 数据说明
+生成脚本分别为 `build_live_dataset.py` 与 `build_long_dataset.py`，元数据为
+同目录下的 `*_meta.json`（含抓取时间、各腿起止、口径限制、牛熊分段定义）。
 
-回测使用嵌入式数据（`include_str!` 编译进二进制，见 `src/backtest.rs` 顶部）：
+**长周期层必须代理的原因**：实盘四只基金中最晚成立的 020341 只有 2024-01 起的净值，
+共同区间仅 34 个月且只有单一 regime。为覆盖 2016 年至今的四段牛熊，只能改用可比标的。
+由此产生的口径差异必须在结论中声明：
 
-- `monthly_total_return.csv` — 主序列：多资产月度全收益数据（纳指/红利低波/人民币金价，含分红，2016-2025）
-- `monthly_total_return_holdout.csv` — 独立 holdout 区块，从未参与调参，`mns backtest validate` 用它做最终检验
-- `fgi_2016_2020.csv` / `fgi_2020_2025.csv` — 恐贪指数原始数据，经 `build_dataset.py` 加工进上述月度序列，不会被 `include_str!` 直接编译进二进制
+- 纳指腿用 539001 单只代表（018966 成立于 2023-08，无法回溯到 2016）
+- 红利腿用 H30269 价格指数，而实盘 007605 跟踪的是 930740 沪深300红利低波；
+  后者 2018-12 才有数据。价格指数不含股息，会低估该腿绝对收益，但策略与基准
+  同口径，**相对**比较仍成立
+- 黄金腿用场内 ETF 518880 价格，实盘 020341 是其场外联接 E 份额
+- FGI 来自 `whit3rabbit/fear-greed-data` 合并存档（2011 起日频），2021-02 前后
+  存在整数/浮点**精度**断点，非数值断点
 
-**注意**：数据更新需要修改 CSV 文件（必要时先跑 `build_dataset.py` 重新生成月度序列）并重新
-`cargo build --release`。
+未覆盖 2000-2002 互联网泡沫与 2008 型多年熊市，这两段仍属未经检验区间。
+
+旧的 `monthly_total_return.csv` / `monthly_total_return_holdout.csv` 仍由
+`build_dataset.py` 生成，但只服务 `legacy` 命令，标的是 270042 / 510880 / 518880，
+信号是 3 月平滑 + 月末决策，不得用于实盘决策。
 
 ## 核心逻辑文件
 
-- `src/backtest.rs` — 回测引擎；核心函数是 `run()`（单次回测，按 `Engine` 枚举选择目标仓位/买入持有等
-  引擎）、`print_report()`、`print_comparison()`；CLI 入口在 `src/main.rs` 的 `cmd_backtest` /
-  `cmd_backtest_validate`，对应 `mns backtest [--config/--compare]` / `mns backtest validate`；
-  可调参数清单在 `cmd_config_params`（`mns config params`）
-- `src/strategy.rs` — 实盘策略核心：`calculate_rebalance_plan`（`target_weight` 驱动，`mns report` 与
-  `Engine::TargetWeight` 回测同源）
-- `src/config.rs` — 参数结构定义，`AppConfig::default_config()` 是当前防御配置默认值（`target_weight`
-  曲线与 `config_defensive.toml` 一致）
+- `src/audit.rs` — **主验证链路**：`build_signal_series()` 直接调用 `signal::compute`
+  （同源 7 天平滑 + 3 天确认 + 决策日）；`run_audit()` 实现 T+lag 执行、按通道 T+n
+  结算、在途资金不可复用、每日限购、双口径回撤；`run_actual()` 用真实交易流水
+  净额回放账户；`run_validation_suite()` 跑四个对照与 ≥300 次置换检验；
+  `run_regimes()` / `run_walk_forward()` 做牛熊分段与滚动多折验证
+- `src/live_data.rs` — 两层数据集的加载、校验、新鲜度 SLA、滚动更新与统一 `BarSeries` 转换
+- `src/config.rs` — `[backtest]` 审计设置与 `[channels]` 按通道成本；实盘赎回阶梯按
+  007605 真实规则（<7日 1.5% / 7–365日 0.5% / 365–730日 0.25% / ≥730日 0）
+- `src/backtest.rs` — 已降级的月频代理引擎；保留双口径回撤、执行滞后与注资/信号
+  驱动交易分解，仅供长周期参考
+- `src/signal.rs` — 实盘决策信号；实盘与回测共用同一函数
 
 ## 解读结果
 
-运行后输出对比表（年化收益、总收益率、最大回撤、买卖次数），关注：
+0. **先看置换检验判定**。真实信号若未进入随机时序分布前 `significance_percentile`
+   （默认 80）分位，报告明确写「择时无显著贡献」，此时收益差异主要由平均风险仓位
+   解释，不应据此宣称择时 alpha。旧版文档曾引用打印型测试输出的
+   「14.8→10.2 次/年」论证平滑设计有效——那组数字来自**非生效配置**且使用月频信号，
+   与生效配置下 3.4 次/年差 3–4 倍，已删除，不得再作为证据。
+1. **看牛熊分段而非只看全区间**。全区间结论容易被单一长牛主导；分段表把
+   2018Q4 / 2020 / 2022 / 2023-2025 牛市 / 2026 回调拆开，检验「低回撤」卖点是否
+   只在牛市里换来跑输。
+2. **看 walk-forward 的改善幅度**。折数更优不等于有价值；报告同时给出平均年化
+   改善，低于 0.5pp/年即不建议据此调参。
+3. **看账户镜像**。严格执行与真实流水的净值差、费用差、受阻次数（QDII 限购 /
+   在途资金未到账）才是可执行的反馈。实盘层只有 34 个月共同区间，结论强度有限。
+4. **口径披露**。日报（`mns report`）与回测同源信号，但长周期层是代理标的；
+   报告末尾的【口径披露】列明这一差异。
 
-0. **实盘信号处理**（`src/signal.rs`，2026-11 起）：`mns report` 的决策分数不再是当日原始恐贪
-   值，而是 `[rebalance]` 下三个参数驱动：`signal_smooth_days`（7 日均值平滑）、`zone_confirm_days`
-   （区间切换需连续 N 天确认，防 whipsaw）、`decision_weekday`（0=每天，1-7=周一..周日，默认 5=周
-   五，非决策日 `mns report` 出观察版、`--decide` 强制决策版）。对照回测里 `smooth_months` 1→3→6
-   的对比行（XIRR 8.57%→9.79%→9.91%，交易 14.8→10.2 次/年）可见平滑降噪方向是对的。
-
-1. **vs 买入持有**：策略年化是否接近基准——历史区间内通常是**跑输**买入持有的，工具的价值主张仅在
-   Calmar（风险调整后）成立，且该优势在 `mns backtest validate` 的样本外验证里并不稳健，务必一并看
-   walk-forward、bootstrap、holdout 三段输出，不要只看 `mns backtest` 默认展示的样本内数字
-2. **最大回撤**：回撤越低说明策略防御性越强
-3. **调整 `[target_weight]`**：中性区间权重设低会明显降低仓位波动
-
-策略价值在于**纪律性**而非超额收益——帮助克服情绪化决策，在极端市场（恐慌/贪婪）时强制执行买卖信号。
+策略可验证的价值是**纪律性的仓位约束**，不是择时 alpha。本工具不构成投资建议。

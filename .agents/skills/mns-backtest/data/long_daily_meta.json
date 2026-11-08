@@ -1,0 +1,85 @@
+{
+  "generated_at": "2026-11-08T17:15:18+08:00",
+  "purpose": "穿越牛熊的策略稳健性检验；不得用于实盘收益预测或账户镜像",
+  "method": "point-in-time as-of join; FGI strictly before trade date; prices on or before",
+  "calendar_range": [
+    "2016-01-04",
+    "2026-11-06"
+  ],
+  "calendar_observations": 2637,
+  "strategy_ready_range": [
+    "2016-01-04",
+    "2026-11-06"
+  ],
+  "strategy_ready_observations": 2637,
+  "sources": {
+    "fgi": "https://raw.githubusercontent.com/whit3rabbit/fear-greed-data/main/fear-greed.csv",
+    "fgi_range": [
+      "2011-01-03",
+      "2026-11-06"
+    ],
+    "fgi_observations": 3963,
+    "fgi_precision_break": "2021-02-01：之前为第三方冻结存档（整数分值），之后为 CNN 端点再生成（浮点）",
+    "quotes": "eastmoney push2his kline (fqt=1) / fundmobapi JZZZL chained total return"
+  },
+  "legs": {
+    "us_stocks": {
+      "proxy": "539001 建信纳斯达克100指数(QDII) 人民币份额 全收益净值指数",
+      "live": "018966 + 539001 各半",
+      "caveat": "长周期层用 539001 单只代表纳指腿；018966 成立于 2023-08，无法回溯到 2016。",
+      "first": "2010-09-16",
+      "last": "2026-11-05",
+      "observations": 3611
+    },
+    "cn_stocks": {
+      "proxy": "H30269 中证红利低波动价格指数（不含股息）",
+      "live": "007605 嘉实沪深300红利低波动ETF联接A（跟踪 930740）",
+      "caveat": "实盘跟踪的 930740 仅 2018-12 起有数据；此处改用 H30269 以满足 2016 起点。指数不同且为价格指数，绝对收益低估股息，但与基准同口径不影响相对比较。",
+      "first": "2016-01-04",
+      "last": "2026-11-06",
+      "observations": 2633
+    },
+    "counter_cyclical": {
+      "proxy": "518880 华安黄金ETF 场内前复权收盘价",
+      "live": "020341 工银黄金ETF联接E",
+      "caveat": "场外联接存在现金留存与跟踪误差；长周期层用场内 ETF 价格代理。",
+      "first": "2016-01-04",
+      "last": "2026-11-06",
+      "observations": 2633
+    }
+  },
+  "regimes": [
+    {
+      "name": "2018Q4 全球回调",
+      "from": "2018-10-01",
+      "to": "2018-12-31"
+    },
+    {
+      "name": "2020 疫情熔断",
+      "from": "2020-02-19",
+      "to": "2020-03-31"
+    },
+    {
+      "name": "2022 纳指熊市",
+      "from": "2022-01-01",
+      "to": "2022-12-31"
+    },
+    {
+      "name": "2023-2025 风险资产牛市",
+      "from": "2023-01-01",
+      "to": "2025-10-31"
+    },
+    {
+      "name": "2026 纳指与黄金同步回撤",
+      "from": "2026-01-01",
+      "to": "2026-11-06"
+    }
+  ],
+  "limitations": [
+    "三腿均为长历史代理，标的/指数/通道与实盘四只基金不同；实盘结论请使用 live_daily.csv。",
+    "红利腿 H30269 为价格指数，不含股息，绝对收益被低估；策略与基准同口径，相对比较仍有效。",
+    "实盘跟踪的 930740 指数仅 2018-12 起有数据，无法覆盖 2016 起点。",
+    "FGI 在 2021-02 前后存在整数/浮点精度断点，非数值断点。",
+    "未覆盖 2000-2002 互联网泡沫与 2008 型多年熊市；这两段仍属未经检验区间。"
+  ]
+}

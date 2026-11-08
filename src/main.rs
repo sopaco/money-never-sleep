@@ -1,7 +1,12 @@
+mod audit;
 mod backtest;
 mod cli;
 mod config;
 mod db;
+// 数据集模块含完整的 CSV 元数据契约与可复算轨迹（抓取日、各腿起止、stale 天数、
+// FGI 来源段等），部分字段供审计导出使用、当前打印层未全部消费。
+#[allow(dead_code)]
+mod live_data;
 mod market;
 mod metrics;
 mod models;
@@ -62,7 +67,13 @@ async fn main() -> Result<()> {
             config,
             compare,
         } => match action {
-            None => cmd_backtest(config, compare)?,
+            None => cmd_backtest_audit(config)?,
+            Some(BacktestAction::Mirror) => cmd_backtest_mirror(config)?,
+            Some(BacktestAction::UpdateData) => cmd_backtest_update_data()?,
+            Some(BacktestAction::ValidateFull { iterations }) => {
+                cmd_backtest_validate_full(config, iterations)?
+            }
+            Some(BacktestAction::Legacy) => cmd_backtest_legacy(config, compare)?,
             Some(BacktestAction::Validate { iterations, block }) => {
                 cmd_backtest_validate(iterations, block)?
             }
@@ -745,7 +756,9 @@ async fn cmd_sentiment() -> Result<()> {
 /// 卖出费按 30 天持有期估算（实际可能更低或更高），只用于报告量级参考。
 fn month_activity(db: &db::Database, config: &AppConfig) -> Result<report::MonthActivity> {
     let txs = db.list_transactions(500)?;
-    let prefix = chrono::Local::now().format("%Y-%m").to_string();
+    let now = chrono::Local::now();
+    let prefix = now.format("%Y-%m").to_string();
+    let year_prefix = now.format("%Y").to_string();
     let mut activity = report::MonthActivity::default();
     for tx in txs.iter().filter(|t| t.tx_date.starts_with(&prefix)) {
         activity.trades += 1;
@@ -756,6 +769,11 @@ fn month_activity(db: &db::Database, config: &AppConfig) -> Result<report::Month
             amount * config.costs.total_sell_rate(30)
         };
     }
+    // 年度交易预算披露：把日频信号压缩为可执行建议，避免逐日跟单突破 10-20 次/年
+    activity.year_trades = txs
+        .iter()
+        .filter(|t| t.tx_date.starts_with(&year_prefix))
+        .count();
     Ok(activity)
 }
 
@@ -1154,12 +1172,131 @@ fn cmd_history(limit: i64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<()> {
+fn load_audit_config(path: Option<String>) -> Result<AppConfig> {
+    match path {
+        Some(p) => AppConfig::load_from_path(&p),
+        None => AppConfig::load(),
+    }
+}
+
+/// 默认 `mns backtest`：完整实盘审计链路。
+fn cmd_backtest_audit(config_path: Option<String>) -> Result<()> {
+    cmd_backtest_validate_full(config_path, None)
+}
+
+/// 账户镜像：严格执行策略 vs 数据库真实交易流水。
+fn cmd_backtest_mirror(config_path: Option<String>) -> Result<()> {
+    let config = load_audit_config(config_path)?;
+    let live = live_data::LiveDataset::load(&config)?;
+    let long = live_data::LongDataset::load(&config)?;
+    audit::print_data_banner(&config, &live, &long);
+    run_mirror(&config, &live)
+}
+
+fn run_mirror(config: &AppConfig, live: &live_data::LiveDataset) -> Result<()> {
+    let entry = chrono::NaiveDate::parse_from_str(&config.backtest.entry_date, "%Y-%m-%d")
+        .context("backtest.entry_date 解析失败")?;
+    let start_idx = live.days.partition_point(|d| d.date < entry);
+    if start_idx >= live.days.len() {
+        anyhow::bail!("实盘数据集未覆盖入场日 {}", entry);
+    }
+    let bars = live.to_bars(start_idx);
+    let sig = audit::build_signal_series(config, &bars.bars);
+    let mut opt = audit::AuditOptions::spanning("严格执行策略", &bars, config);
+    opt.initial_cash = config.backtest.initial_cash;
+    let strict = audit::run_audit(config, &bars, &sig, &opt)?;
+    let db = db::Database::open()?;
+    let actual = audit::run_actual(config, &bars, &db)?;
+    audit::print_mirror(&strict, &actual, config);
+    Ok(())
+}
+
+/// 重建两层日频数据集。
+fn cmd_backtest_update_data() -> Result<()> {
+    let config = load_audit_config(None)?;
+    println!("正在重建实盘与长周期日频数据集（需要网络与 Python 3）...");
+    let text = live_data::LiveDataset::update_all(&config)?;
+    println!("{text}");
+    let live = live_data::LiveDataset::load(&config)?;
+    let long = live_data::LongDataset::load(&config)?;
+    if let Ok(f) = live.freshness(config.backtest.freshness_sla_days) {
+        println!("实盘层  {}", f.banner());
+    }
+    if let Ok(f) = long.freshness(config.backtest.freshness_sla_days) {
+        println!("长周期层 {}", f.banner());
+    }
+    Ok(())
+}
+
+/// 完整有效性检验 + 牛熊分段 + 多折 walk-forward + holdout + 账户镜像。
+fn cmd_backtest_validate_full(config_path: Option<String>, iterations: Option<usize>) -> Result<()> {
+    let mut config = load_audit_config(config_path)?;
+    if let Some(n) = iterations {
+        config.backtest.permutation_iterations = n;
+    }
+    let live = live_data::LiveDataset::load(&config)?;
+    let long = live_data::LongDataset::load(&config)?;
+    audit::print_data_banner(&config, &live, &long);
+
+    // ── 长周期代理层：穿越牛熊的策略有效性 ──
+    let long_bars = long.to_bars();
+    let sig = audit::build_signal_series(&config, &long_bars.bars);
+    let mut opt = audit::AuditOptions::spanning("情绪信号（实盘同源）", &long_bars, &config);
+    // 长周期对照统一本金，便于与买入持有同尺度比较（实盘镜像仍用真实 1 万本金）
+    opt.initial_cash = 100_000.0;
+    println!("\n  长周期层统一本金 ¥100,000（仅用于相对比较）；账户镜像使用真实本金 ¥{:.0}",
+        config.backtest.initial_cash);
+
+    let suite = audit::run_validation_suite(&config, &long_bars, &sig, &opt)?;
+    audit::print_validation_suite(&suite, &config);
+
+    // holdout：末尾连续 36 个月，与主序列共用同一复利净值，不再各自归一化
+    let end = long_bars.bars.len() - 1;
+    let hold_from = long_bars.bars[end].date - chrono::Duration::days(365 * 3);
+    let hs = long_bars.bars.partition_point(|b| b.date < hold_from);
+    let mut ho = opt.clone();
+    ho.start_idx = hs;
+    ho.end_idx = end;
+    ho.name = "最近 36 月 holdout".to_string();
+    let hold_real = audit::run_audit(&config, &long_bars, &sig, &ho)?;
+    let mut ho_bh = ho.clone();
+    ho_bh.name = "holdout 买入持有".to_string();
+    ho_bh.variant = audit::SignalVariant::Constant(1.0);
+    ho_bh.buy_and_hold = true;
+    let hold_bh = audit::run_audit(&config, &long_bars, &sig, &ho_bh)?;
+    audit::print_result_table(&[&hold_real, &hold_bh], "holdout ≥36 月（连续复利，代理层）");
+
+    let regimes = long.meta.regimes.clone();
+    if !regimes.is_empty() {
+        let rows = audit::run_regimes(&config, &long_bars, &sig, &opt, &regimes);
+        audit::print_regimes(&rows);
+    }
+    let folds = audit::run_walk_forward(&config, &long_bars, &sig, &opt);
+    if !folds.is_empty() {
+        audit::print_folds(&folds, &config);
+    }
+
+    // ── 实盘层：账户镜像 ──
+    run_mirror(&config, &live)?;
+
+    println!("\n═══ 边界声明 ═══════════════════════════════════════════════════════");
+    for c in &long_bars.caveats {
+        println!("  · {c}");
+    }
+    println!("  · 本报告为工程与方法验证，不构成投资建议。");
+    Ok(())
+}
+
+fn cmd_backtest_legacy(config_path: Option<String>, compare: Option<String>) -> Result<()> {
     use backtest::{BacktestConfig, Engine, SignalConfig, print_comparison, print_report};
 
     println!("=================================================================");
-    println!("   MNS 逆向投资策略回测");
+    println!("   MNS 逆向投资策略回测【已降级：长周期代理演示】");
     println!("=================================================================");
+    println!("⚠️  本命令使用 2016-01~2025-04 的月频代理数据（270042/510880/518880），");
+    println!("    信号为 3 月平滑 + 月末决策，与实盘 7 天平滑 + 日频决策不是同一策略；");
+    println!("    假设 10 万起步 + 每年 5 万注资，与真实账户（1 万、无后续注资）不符。");
+    println!("    结果仅用于长周期参考，不得用于实盘决策。实盘请用 `mns backtest`。");
     println!();
 
     let rows = backtest::load_main();
@@ -1562,10 +1699,13 @@ fn cmd_config_params() -> Result<()> {
     println!("    target_weight.greed            贪婪     (默认: 45)");
     println!("    target_weight.extreme_greed    极度贪婪 (默认: 35)");
     println!();
-    println!("  【再平衡】");
+    println!("  【再平衡与信号】（实盘与回测共用，不允许两条链路各设一套）");
     println!("    rebalance.band_pp                    偏离带(百分点)，越大交易越少 (默认: 4)");
     println!("    rebalance.min_trade_amount           最小交易金额 (默认: 500)");
-    println!("    rebalance.min_holding_days_for_sell  卖出最短持有天数，规避惩罚性赎回费 (默认: 30)");
+    println!("    rebalance.min_holding_days_for_sell  卖出最短持有天数 (默认: 30)");
+    println!("    rebalance.signal_smooth_days         决策信号平滑天数 (默认: 7)");
+    println!("    rebalance.zone_confirm_days          区间切换确认天数 (默认: 3)");
+    println!("    rebalance.decision_weekday           决策日 0=每天 / 1-7=周一..周日 (默认: 5)");
     println!();
     println!("  【风险档位与现金流】");
     println!("    profile                     无档位/稳健/平衡/进取/custom（core_blend 0/0.4/0.6/0.8；档位抬高常驻仓位，不降低风险）");
@@ -1574,9 +1714,22 @@ fn cmd_config_params() -> Result<()> {
     println!();
     println!("  【成本与现金】");
     println!("    costs.buy_fee_pct           买入费率% (默认: 0.12)");
-    println!("    costs.sell_fee_pct          卖出固定费率% (默认: 0.05)");
-    println!("    costs.cash_annual_yield     闲置现金年化% (默认: 2.0)");
-    println!("    (阶梯赎回费需直接编辑 config.toml 的 costs.redemption_tiers)");
+    println!("    costs.sell_fee_pct          卖出固定费率%，场外基金为 0 (默认: 0.0)");
+    println!("    costs.cash_annual_yield     闲置现金年化% (默认: 1.3)");
+    println!("    (阶梯赎回费与按通道结算参数需直接编辑 config.toml 的 [costs] / [channels])");
+    println!();
+    println!("  【实盘审计】`mns backtest` 默认链路");
+    println!("    backtest.data_path                   实盘日频数据集路径");
+    println!("    backtest.freshness_sla_days          数据新鲜度 SLA 天数 (默认: 30)");
+    println!("    backtest.initial_cash                账户期初本金 (默认: 10000)");
+    println!("    backtest.entry_date                  真实入场日 YYYY-MM-DD");
+    println!("    backtest.annual_trade_budget_min/max 年度交易预算 (默认: 10 / 20)");
+    println!("    backtest.decision_interval           daily / weekly / monthly (默认: weekly)");
+    println!("    backtest.execution_lag_days          信号到成交的滞后天数，须 >=1 (默认: 1)");
+    println!("    backtest.permutation_iterations      置换检验次数，须 >=100 (默认: 300)");
+    println!("    backtest.significance_percentile     择时显著性分位门槛 (默认: 80)");
+    println!("    [channels.*] qdii_feeder / cn_feeder / on_exchange_etf 各自的费率、");
+    println!("                 赎回阶梯、T+n 结算、每日限购、滑点与代理跟踪损耗");
     println!();
     println!("  【情绪阈值】决定区间划分");
     println!("    thresholds.extreme_fear    极度恐慌阈值 (默认: 30)");
@@ -1591,10 +1744,11 @@ fn cmd_config_params() -> Result<()> {
     println!("    settings.annualized_target_high  年化收益 ≥ 此值(%)时绿色标记 (默认: 15)");
     println!();
     println!("用法示例:");
-    println!("  mns backtest                           # 四种策略对比（同一数据与成本模型）");
-    println!("  mns backtest validate                  # 样本外验证 + bootstrap 分布");
-    println!("  mns backtest --config my.toml           # 使用指定配置文件回测");
-    println!("  mns backtest --compare a.toml,b.toml    # 对比多个配置");
+    println!("  mns backtest                           # 实盘审计：有效性检验 + 牛熊分段 + 账户镜像");
+    println!("  mns backtest mirror                    # 只看严格执行 vs 实际执行");
+    println!("  mns backtest update-data               # 重建两层日频数据集（含新鲜度校验）");
+    println!("  mns backtest validate-full             # 只看统计检验（可 --iterations 覆盖次数）");
+    println!("  mns backtest legacy                    # 已降级：2016-2025 月频代理对比，不可用于实盘");
     println!("  mns config rebalance.band_pp 6          # 放宽偏离带以减少交易");
     Ok(())
 }
