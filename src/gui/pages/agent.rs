@@ -249,6 +249,11 @@ fn timeline_card(shell: &AppShell) -> Div {
             .v_flex()
             .h(px(320.))
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
+            // GPUI does not isolate nested scroll containers by default. Let
+            // the timeline handle the gesture first, then keep it away from
+            // the outer page so both regions never move together.
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .children(rows),
     )
 }

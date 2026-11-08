@@ -789,12 +789,12 @@ fn spawn_agent_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedRece
             let _ = cx.update(|cx| {
                 let view = cx.global::<GuiState>().view.clone();
                 if let Some(view) = view {
-                    view.update(cx, |shell, cx| {
-                        shell.apply_agent_event(event, cx);
-                        if let Some(tray) = cx.global::<GuiState>().tray.clone() {
-                            let _ = tray.refresh_menu(cx);
-                        }
-                    });
+                    view.update(cx, |shell, cx| shell.apply_agent_event(event, cx));
+                    // `build_tray_menu` reads the view. Refresh only after the
+                    // update lease ends, otherwise it re-enters `AppShell`.
+                    if let Some(tray) = cx.global::<GuiState>().tray.clone() {
+                        let _ = tray.refresh_menu(cx);
+                    }
                 }
             });
         }

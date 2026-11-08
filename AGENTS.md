@@ -8,7 +8,8 @@
 
 - **Type**: Personal CLI investment tool (Rust)
 - **Binary**: `target/release/mns.exe` (Windows) / `target/release/mns` (Linux/macOS)
-- **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`
+- **Installed CLI**: `/Applications/MNS.app/Contents/MacOS/mns` — the DMG ships the CLI inside the app bundle at the same version as the GUI. When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
+- **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
 - **Stack**: Rust edition 2024, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
 
 ## Standard Workflow

@@ -11,7 +11,7 @@
 //!   a bounded grace period by dropping the connection (kills the child).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -198,7 +198,75 @@ fn emit_entry(events: &EventTx, kind: EntryKind, text: impl Into<String>) {
     let _ = events.send(AgentEvent::Entry(TimelineEntry::new(kind, text)));
 }
 
-fn launch_config(settings: &AgentSettings) -> AcpAgentConfig {
+/// Absolute path of the mns CLI that ships with this app.
+///
+/// The bundle puts `mns` beside `mns-gui`, so the directory of the running
+/// executable is authoritative. That is the whole point: an agent started by
+/// this GUI should call one known path, not search the filesystem. The
+/// installed-bundle fallback covers `cargo run`, where the GUI lives under
+/// `target/debug` and may not have a sibling CLI.
+fn cli_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "mns.exe" } else { "mns" };
+
+    if let Some(from_env) = std::env::var_os("MNS_BIN") {
+        let candidate = PathBuf::from(from_env);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        let sibling = dir.join(name);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        for root in roots {
+            let candidate = root.join("MNS.app/Contents/MacOS").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Environment handed to the external agent.
+///
+/// Two variables, both aimed at the same failure: an agent that does not know
+/// where the CLI is will search for it, and may end up reading the SQLite file
+/// instead. `MNS_BIN` names the binary, and prepending its directory to `PATH`
+/// makes a bare `mns` resolve to the shipped version rather than a stale copy
+/// installed elsewhere.
+fn agent_env(cli: &Path, existing_path: &str) -> Vec<(String, String)> {
+    let mut vars = vec![("MNS_BIN".to_owned(), cli.display().to_string())];
+
+    if let Some(dir) = cli.parent() {
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let dir = dir.display();
+        let path = if existing_path.is_empty() {
+            dir.to_string()
+        } else {
+            format!("{dir}{separator}{existing_path}")
+        };
+        vars.push(("PATH".to_owned(), path));
+    }
+
+    vars
+}
+
+fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig {
     let base = if settings.agent_cli.trim().is_empty() {
         detect_agent_cli()
     } else {
@@ -211,13 +279,21 @@ fn launch_config(settings: &AgentSettings) -> AcpAgentConfig {
         args.push("acp".to_owned());
     }
 
-    if base.chars().any(char::is_whitespace) {
+    let config = if base.chars().any(char::is_whitespace) {
         // Tolerate a command string such as `npx opencode`.
         let mut parts = base.split_whitespace();
         let command = parts.next().unwrap_or("opencode");
         AcpAgentConfig::new(command).args(parts).args(args)
     } else {
         AcpAgentConfig::new(base).args(args)
+    };
+
+    match cli {
+        Some(cli) => {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            config.envs(agent_env(cli, &existing))
+        }
+        None => config,
     }
 }
 
@@ -232,12 +308,37 @@ fn resolve_cwd(settings: &AgentSettings) -> PathBuf {
 
 /// Inject the autonomy contract into the single prompt. This is what keeps the
 /// interaction goal-driven rather than chat-driven.
-fn compose_goal(goal: &str, cwd: &std::path::Path) -> String {
+///
+/// The CLI path is part of the contract, not an afterthought. Without it the
+/// agent burns its first turns on `find`, `ls /private/tmp` and reading
+/// `Info.plist`; worse, it may decide the database file is the data source and
+/// query `~/.mns/mns.db` with sqlite3. Naming the binary and forbidding the
+/// storage layer keeps the agent on the one supported interface.
+fn compose_goal(goal: &str, cwd: &Path, cli: Option<&Path>) -> String {
+    let cli_rule = match cli {
+        Some(cli) => {
+            let cli = cli.display();
+            format!(
+                "- 数据入口只有 mns CLI，绝对路径 `{cli}`，已随本应用安装。\
+                 账户、持仓、绩效、报告、定投计划一律通过它读取，例如 `{cli} portfolio`、\
+                 `{cli} today`、`{cli} --help`。不要用 find / mdfind / ls 搜索 mns，\
+                 也不要依赖 PATH 上的同名命令——那可能是旧版本。\n\
+                 - 不要绕过 CLI 访问底层存储：禁止用 sqlite3 打开 `~/.mns/mns.db`，\
+                 禁止解析 `~/.mns/config.toml` 的内部结构，禁止阅读 mns 源码。\
+                 CLI 没有提供的数据，说明它不该由你获取。"
+            )
+        }
+        None => "- 未检测到随应用安装的 mns CLI。任务若需要账户数据，请停止并告知用户，\
+                 不要自行搜索文件系统，也不要改用其他数据源。"
+            .to_owned(),
+    };
+
     format!(
         "{goal}\n\n---\n【MNS 桌面端执行约定】\n\
          - 这是一个自主执行任务：请自行拆解步骤、连续调用所需工具，直到目标达成或确认无法继续；\
          不要逐步向用户提问，也不要等待用户补充信息。\n\
          - 工作目录：{cwd}\n\
+         {cli_rule}\n\
          - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
          - 模型、推理端点与凭据由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
          MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
@@ -263,7 +364,8 @@ async fn run_session(
         return;
     }
 
-    let config = launch_config(&settings);
+    let cli = cli_path();
+    let config = launch_config(&settings, cli.as_deref());
     emit_entry(
         &events,
         EntryKind::System,
@@ -273,9 +375,23 @@ async fn run_session(
             config.arguments().join(" ")
         ),
     );
+    // Surface the injected path in the timeline: if an agent still goes looking
+    // for the binary, the user can see whether it was told where it lives.
+    match &cli {
+        Some(path) => emit_entry(
+            &events,
+            EntryKind::System,
+            format!("mns CLI：{}", path.display()),
+        ),
+        None => emit_entry(
+            &events,
+            EntryKind::System,
+            "未检测到 mns CLI：本次任务不提供账户数据入口",
+        ),
+    }
 
     let agent = AcpAgent::new(config);
-    let prompt_text = compose_goal(&goal, &cwd);
+    let prompt_text = compose_goal(&goal, &cwd, cli.as_deref());
 
     let events_for_updates = events.clone();
     let events_for_permissions = events.clone();
@@ -413,6 +529,20 @@ async fn run_session(
     }
 }
 
+/// Does this command reach into the mns storage layer instead of the CLI?
+///
+/// Deliberately narrow: it needs both a SQLite client (or the database file
+/// name) and a `.mns` path. A broad "no sqlite3" rule would break unrelated
+/// work in the agent's own workspace, and a broad "no .mns" rule would break
+/// nothing useful but look arbitrary. This pair is exactly the observed
+/// violation: `sqlite3 file:/Users/…/.mns/mns.db?mode=ro "SELECT …"`.
+fn touches_cli_storage(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let sqlite = lower.contains("sqlite3") || lower.contains("mns.db");
+    let inside_dot_mns = lower.contains(".mns/") || lower.contains(".mns\\");
+    sqlite && inside_dot_mns
+}
+
 /// Decide an ACP permission request. Auto-approved by default; otherwise
 /// suspend on a oneshot until the UI answers (or the turn is cancelled).
 async fn permission_outcome(
@@ -429,6 +559,31 @@ async fn permission_outcome(
         .clone()
         .or_else(|| request.tool_call.fields.name.clone())
         .unwrap_or_else(|| "工具调用".to_owned());
+
+    // The prompt tells the agent to use the CLI; this is what enforces it when
+    // the agent ignores that. Rejecting here is visible in the timeline, so the
+    // user sees why a step was refused rather than watching it fail silently.
+    if touches_cli_storage(&title) {
+        emit_entry(
+            events,
+            EntryKind::Error,
+            format!("已拒绝直接访问 mns 存储：{title}。账户数据只能通过 mns CLI 读取。"),
+        );
+        let deny = request
+            .options
+            .iter()
+            .find(|option| {
+                matches!(
+                    option.kind,
+                    PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
+                )
+            })
+            .map(|option| option.option_id.0.to_string());
+        return match deny {
+            Some(id) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+            None => RequestPermissionOutcome::Cancelled,
+        };
+    }
 
     let allow = request
         .options
@@ -822,7 +977,7 @@ mod tests {
             agent_cli: "/opt/bin/opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings);
+        let config = launch_config(&settings, None);
         assert_eq!(config.command(), std::path::Path::new("/opt/bin/opencode"));
         assert_eq!(config.arguments(), ["acp"]);
     }
@@ -838,7 +993,7 @@ mod tests {
             ],
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings);
+        let config = launch_config(&settings, None);
         assert_eq!(
             config.arguments(),
             ["--log-level", "warn", "acp"],
@@ -852,20 +1007,89 @@ mod tests {
             agent_cli: "npx opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings);
+        let config = launch_config(&settings, None);
         assert_eq!(config.command(), std::path::Path::new("npx"));
         assert_eq!(config.arguments(), ["opencode", "acp"]);
     }
 
     #[test]
+    fn launch_config_injects_the_cli_path_and_prepends_path() {
+        let settings = AgentSettings {
+            agent_cli: "opencode".to_owned(),
+            ..AgentSettings::default()
+        };
+        let cli = Path::new("/Applications/MNS.app/Contents/MacOS/mns");
+        let config = launch_config(&settings, Some(cli));
+
+        assert_eq!(
+            config.environment().get("MNS_BIN").map(String::as_str),
+            Some("/Applications/MNS.app/Contents/MacOS/mns")
+        );
+        let path = config
+            .environment()
+            .get("PATH")
+            .expect("the agent must receive PATH");
+        assert!(
+            path.starts_with("/Applications/MNS.app/Contents/MacOS:"),
+            "the bundle directory must come first so a bare `mns` resolves to it, got {path}"
+        );
+    }
+
+    #[test]
+    fn agent_env_keeps_the_original_path_after_the_bundle() {
+        let vars = agent_env(Path::new("/tmp/bin/mns"), "/usr/bin:/bin");
+        assert_eq!(vars[0].0, "MNS_BIN");
+        assert_eq!(vars[0].1, "/tmp/bin/mns");
+        assert_eq!(vars[1].0, "PATH");
+        assert_eq!(vars[1].1, "/tmp/bin:/usr/bin:/bin");
+
+        let empty = agent_env(Path::new("/tmp/bin/mns"), "");
+        assert_eq!(empty[1].1, "/tmp/bin", "an empty PATH must not gain a separator");
+    }
+
+    #[test]
     fn goal_prompt_carries_the_autonomy_contract() {
-        let prompt = compose_goal("检查数据", std::path::Path::new("/work"));
+        let prompt = compose_goal(
+            "检查数据",
+            Path::new("/work"),
+            Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+        );
         assert!(prompt.starts_with("检查数据"));
         assert!(prompt.contains("不要逐步向用户提问"));
         assert!(prompt.contains("连续调用所需工具"));
         assert!(prompt.contains("MNS 不提供 URL 或 API Key"));
         assert!(prompt.contains("/work"));
         assert!(prompt.contains("不要执行下单、交易"));
+    }
+
+    #[test]
+    fn goal_prompt_names_the_cli_and_forbids_the_storage_layer() {
+        let prompt = compose_goal(
+            "生成今日报告",
+            Path::new("/work"),
+            Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+        );
+        assert!(
+            prompt.contains("/Applications/MNS.app/Contents/MacOS/mns"),
+            "the agent must be told the absolute path instead of searching for it"
+        );
+        assert!(prompt.contains("不要用 find"), "search commands are ruled out");
+        assert!(
+            prompt.contains("sqlite3") && prompt.contains("~/.mns/mns.db"),
+            "reading the database directly must be named as forbidden"
+        );
+        assert!(prompt.contains("禁止阅读 mns 源码"));
+    }
+
+    #[test]
+    fn goal_prompt_without_a_cli_forbids_guessing() {
+        let prompt = compose_goal("生成今日报告", Path::new("/work"), None);
+        assert!(prompt.contains("未检测到随应用安装的 mns CLI"));
+        assert!(prompt.contains("不要自行搜索文件系统"));
+        assert!(
+            !prompt.contains("sqlite3"),
+            "no path is offered, so there is no storage rule to state"
+        );
     }
 
     #[test]
@@ -993,6 +1217,26 @@ mod tests {
                 .get("call-2")
                 .is_some_and(|state| state.reported),
             "the terminal state is remembered as a tombstone"
+        );
+    }
+
+    #[test]
+    fn storage_access_is_detected_without_blanket_bans() {
+        assert!(touches_cli_storage(
+            "sqlite3 file:/Users/x/.mns/mns.db?mode=ro&immutable=1"
+        ));
+        assert!(touches_cli_storage("sqlite3 ~/.mns/mns.db"));
+        assert!(
+            !touches_cli_storage("/Applications/MNS.app/Contents/MacOS/mns portfolio"),
+            "the CLI itself must never be treated as storage access"
+        );
+        assert!(
+            !touches_cli_storage("sqlite3 /tmp/other.db"),
+            "an unrelated database in the workspace is out of scope"
+        );
+        assert!(
+            !touches_cli_storage("ls ~/.mns"),
+            "listing the directory is not a storage read"
         );
     }
 

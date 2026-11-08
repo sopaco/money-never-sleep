@@ -45,6 +45,17 @@ agent_created: true
 
 多数周的正确答案是「不操作」。详细触发器、卖出专章、不动作清单与节奏见 `references/buy-sell-playbook.md`。
 
+## 二进制定位
+
+CLI 有两种合法来源，按序取第一个：
+
+1. 已安装应用包：`/Applications/MNS.app/Contents/MacOS/mns` —— 用户机上的正常情况，CLI 与 GUI 同版本发布
+2. 仓库构建产物：`target/release/mns` —— 仅限在本仓库内开发时
+
+不要用 `~/mns`，也不要默认信任 PATH 上的 `mns`：本机 PATH 命中过 `~/QuickBins/mns`（0.7.0），而应用包已是 0.8.0，两份口径不同，读出来的账户数据无法与 GUI 对上。定位后先跑 `--version`，与 `Cargo.toml` 的 `version` 对齐再继续。`scripts/collect_state.sh` 已按同一顺序解析，优先用它而不是手拼命令。
+
+只经 CLI 取数：禁止用 `sqlite3` 打开 `~/.mns/mns.db`、禁止解析 `~/.mns/config.toml` 的内部结构、禁止读源码。数据库 schema、表名与字段是实现细节，不是可依赖的接口；CLI 没有提供的数据说明它不该由 agent 获取。GUI 启动外部 agent 时会在权限层直接拒绝这类调用。
+
 ## 工作流
 
 0. **判定触发器**：先确认属于 A / B / C / 复盘中的哪一类。信息不足时先向用户提问，不要用命令代替提问。
