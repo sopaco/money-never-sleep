@@ -1,21 +1,10 @@
-mod audit;
-mod backtest;
-mod cli;
-mod config;
-mod db;
-mod guardrail;
-// 数据集模块含完整的 CSV 元数据契约与可复算轨迹（抓取日、各腿起止、stale 天数、
-// FGI 来源段等），部分字段供审计导出使用、当前打印层未全部消费。
-#[allow(dead_code)]
-mod live_data;
-mod market;
-mod metrics;
-mod models;
-mod quote;
-mod report;
-mod sentiment;
-mod signal;
-mod strategy;
+// The engine is a library so the GUI can call it directly instead of parsing
+// CLI output. This binary keeps only argument parsing and terminal rendering.
+#[allow(unused_imports)]
+use money_never_sleep::{
+    audit, backtest, cli, config, db, guardrail, live_data, market, metrics, models, quote, report,
+    sentiment, signal, strategy,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -146,7 +135,9 @@ fn cmd_init(force: bool) -> Result<()> {
         config.profile_label(),
         config.effective_neutral_weight()
     );
-    println!("  档位语义: 档位抬高常驻仓位并收窄择时摆幅（不降低风险）；追求最小回撤可选 none（曲线原样）");
+    println!(
+        "  档位语义: 档位抬高常驻仓位并收窄择时摆幅（不降低风险）；追求最小回撤可选 none（曲线原样）"
+    );
     Ok(())
 }
 
@@ -198,7 +189,7 @@ fn print_profile_switch_preview(old: &AppConfig, new: &AppConfig) {
             return Ok(());
         };
         // split_last 的 rest 是切片；signal::compute 需要 Vec（不含"今天"的升序历史）
-        let rest: crate::signal::ScoreHistory = history[..history.len() - 1].to_vec();
+        let rest: money_never_sleep::signal::ScoreHistory = history[..history.len() - 1].to_vec();
         let today = chrono::Local::now().date_naive();
         let signal = signal::compute(new, latest, &rest, today);
         let cash = db.get_cash_balance()?;
@@ -336,7 +327,8 @@ fn cmd_cash_withdraw(amount: f64, note: Option<String>) -> Result<()> {
         anyhow::bail!(
             "出金超过现金余额（当前 ¥{:.2}，要取出 ¥{:.2}）。若资金在持仓里，\
              请先用 mns sell 落账再取",
-            balance, amount
+            balance,
+            amount
         );
     }
     db.set_cash_balance(balance - amount)?;
@@ -446,8 +438,11 @@ fn cmd_performance() -> Result<()> {
     let cash = db.get_cash_balance()?;
     let today = chrono::Local::now().date_naive();
     // 终值与账户概览同口径（无现价时退回成本）
-    let holdings_value: f64 =
-        positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let holdings_value: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     let terminal = cash + holdings_value;
 
     println!("═════════════════════════════════════════════════");
@@ -535,8 +530,13 @@ fn cmd_performance() -> Result<()> {
         println!("  回测数据集为空，无法生成参考值");
     } else {
         let bt = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
-        let bt_result =
-            backtest::run(&config, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let bt_result = backtest::run(
+            &config,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         let dd_str = match &actual_dd {
             Some(s) => format!("{:.2}%", s.max_dd * 100.0),
             None => "暂无数据".to_string(),
@@ -561,16 +561,19 @@ fn cmd_performance() -> Result<()> {
         );
         if curve_days >= 90 {
             match &actual_dd {
-                Some(s) if s.max_dd <= bt_result.max_drawdown + 1e-9 => println!(
-                    "  判定: 在策略预期内（实际回撤未超回测口径）"
-                ),
-                Some(_) => println!(
-                    "  判定: 偏离预期——实际回撤超过回测口径，建议核对执行纪律与数据记录"
-                ),
+                Some(s) if s.max_dd <= bt_result.max_drawdown + 1e-9 => {
+                    println!("  判定: 在策略预期内（实际回撤未超回测口径）")
+                }
+                Some(_) => {
+                    println!("  判定: 偏离预期——实际回撤超过回测口径，建议核对执行纪律与数据记录")
+                }
                 None => println!("  判定: 数据不足（无快照序列）"),
             }
         } else {
-            println!("  （追踪 {} 天 < 90 天，对照仅供参考，不做判定）", curve_days);
+            println!(
+                "  （追踪 {} 天 < 90 天，对照仅供参考，不做判定）",
+                curve_days
+            );
         }
         println!("  （回测为历史区间模拟，实际环境可能不同；不做统计显著性声明）");
     }
@@ -619,7 +622,7 @@ fn cmd_performance() -> Result<()> {
     ];
     let mut all_ready = true;
     for (cat, name) in legs {
-        let members: Vec<&crate::models::Position> =
+        let members: Vec<&money_never_sleep::models::Position> =
             positions.iter().filter(|p| p.category == cat).collect();
         if members.is_empty() {
             println!("  · {}: —（无持仓）", name);
@@ -641,7 +644,12 @@ fn cmd_performance() -> Result<()> {
         match best_start {
             Some(lo) => {
                 let days = best_days.max(0);
-                println!("  · {}: {}/365 天（{} 起）", name, days, lo.format("%Y-%m-%d"));
+                println!(
+                    "  · {}: {}/365 天（{} 起）",
+                    name,
+                    days,
+                    lo.format("%Y-%m-%d")
+                );
                 if days < 365 {
                     all_ready = false;
                 }
@@ -866,15 +874,13 @@ async fn cmd_report_inner(
     let data = match sentiment::fetch_fear_greed_data(url).await {
         Ok(d) => d,
         Err(err) => {
-            let snap = db
-                .latest_fear_greed_snapshot()?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "恐贪指数获取失败（{}），且本地无历史快照可回退——\
+            let snap = db.latest_fear_greed_snapshot()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "恐贪指数获取失败（{}），且本地无历史快照可回退——\
                          请检查网络后重试",
-                        err
-                    )
-                })?;
+                    err
+                )
+            })?;
             degraded = Some(((today - snap.date).num_days(), snap.date));
             sentiment::FearGreedData {
                 score: snap.score.round().clamp(0.0, 100.0) as u8,
@@ -967,7 +973,10 @@ async fn cmd_report_inner(
             data.score, today_zone, signal.effective_score, signal.effective_zone
         );
         println!("信号说明: {}", display_note);
-        println!("今日报告类型: {} 平滑 (样本 {}/{})", signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days);
+        println!(
+            "今日报告类型: {} 平滑 (样本 {}/{})",
+            signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days
+        );
     }
 
     let cash = db.get_cash_balance()?;
@@ -975,8 +984,11 @@ async fn cmd_report_inner(
 
     // C3 每日总资产快照：当日终态（同日重跑覆盖），实际回撤/收益曲线的数据源。
     // fear_score 记当日决策分数（降级时即降级所用的分数）；字段与账户概览同口径。
-    let holdings_value: f64 =
-        positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let holdings_value: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     db.upsert_portfolio_snapshot(
         today,
         cash,
@@ -1125,7 +1137,10 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
         }
         println!("  {}（¥{:.0}）", leg.category_cn, leg.amount);
         for item in &leg.items {
-            println!("    {} {}  ¥{:.0}", item.asset_code, item.asset_name, item.amount);
+            println!(
+                "    {} {}  ¥{:.0}",
+                item.asset_code, item.asset_name, item.amount
+            );
         }
     }
 
@@ -1267,7 +1282,10 @@ fn cmd_backtest_update_data() -> Result<()> {
 }
 
 /// 完整有效性检验 + 牛熊分段 + 多折 walk-forward + holdout + 账户镜像。
-fn cmd_backtest_validate_full(config_path: Option<String>, iterations: Option<usize>) -> Result<()> {
+fn cmd_backtest_validate_full(
+    config_path: Option<String>,
+    iterations: Option<usize>,
+) -> Result<()> {
     let mut config = load_audit_config(config_path)?;
     if let Some(n) = iterations {
         config.backtest.permutation_iterations = n;
@@ -1282,8 +1300,10 @@ fn cmd_backtest_validate_full(config_path: Option<String>, iterations: Option<us
     let mut opt = audit::AuditOptions::spanning("情绪信号（实盘同源）", &long_bars, &config);
     // 长周期对照统一本金，便于与买入持有同尺度比较（实盘镜像仍用真实 1 万本金）
     opt.initial_cash = 100_000.0;
-    println!("\n  长周期层统一本金 ¥100,000（仅用于相对比较）；账户镜像使用真实本金 ¥{:.0}",
-        config.backtest.initial_cash);
+    println!(
+        "\n  长周期层统一本金 ¥100,000（仅用于相对比较）；账户镜像使用真实本金 ¥{:.0}",
+        config.backtest.initial_cash
+    );
 
     let suite = audit::run_validation_suite(&config, &long_bars, &sig, &opt)?;
     audit::print_validation_suite(&suite, &config);
@@ -1302,7 +1322,10 @@ fn cmd_backtest_validate_full(config_path: Option<String>, iterations: Option<us
     ho_bh.variant = audit::SignalVariant::Constant(1.0);
     ho_bh.buy_and_hold = true;
     let hold_bh = audit::run_audit(&config, &long_bars, &sig, &ho_bh)?;
-    audit::print_result_table(&[&hold_real, &hold_bh], "holdout ≥36 月（连续复利，代理层）");
+    audit::print_result_table(
+        &[&hold_real, &hold_bh],
+        "holdout ≥36 月（连续复利，代理层）",
+    );
 
     let regimes = long.meta.regimes.clone();
     if !regimes.is_empty() {
@@ -1367,11 +1390,22 @@ fn cmd_backtest_asset(config_path: Option<String>, dataset: &str) -> Result<()> 
     if let Ok(f) = ds.freshness(config.backtest.freshness_sla_days) {
         println!("  数据 {}", f.banner());
     }
-    println!("  区间 {} ~ {}，{} 个交易日",
-        bars.bars.first().map(|b| b.date.to_string()).unwrap_or_default(),
-        bars.bars.last().map(|b| b.date.to_string()).unwrap_or_default(),
-        bars.bars.len());
-    println!("  标的 {}；通道 场内 ETF T+1；本金 ¥100,000，无外部注资", bars.label);
+    println!(
+        "  区间 {} ~ {}，{} 个交易日",
+        bars.bars
+            .first()
+            .map(|b| b.date.to_string())
+            .unwrap_or_default(),
+        bars.bars
+            .last()
+            .map(|b| b.date.to_string())
+            .unwrap_or_default(),
+        bars.bars.len()
+    );
+    println!(
+        "  标的 {}；通道 场内 ETF T+1；本金 ¥100,000，无外部注资",
+        bars.label
+    );
     println!("  口径 与 `mns backtest` 完全一致：7 天平滑 + 3 天确认 + 周频决策、");
     println!("       T+1 执行、同一成本模型、同一日频净值与回撤口径");
     println!("  ⚠ 单资产对照实验，结论不可迁移到三资产实盘配置；不构成投资建议");
@@ -1418,18 +1452,31 @@ fn cmd_backtest_asset(config_path: Option<String>, dataset: &str) -> Result<()> 
     println!("\n═══ 数据诊断 ═══════════════════════════════════════════════════════");
     let num = |k: &str| ds.meta.diagnostics.get(k).and_then(|v| v.as_f64());
     if let (Some(tot), Some(ann), Some(dd)) = (
-        num("price_total_return_pct"), num("price_annualized_pct"), num("price_max_drawdown_pct")) {
+        num("price_total_return_pct"),
+        num("price_annualized_pct"),
+        num("price_max_drawdown_pct"),
+    ) {
         println!("  标的全期 {tot:+.2}% / 年化 {ann:+.2}% / 日频最大回撤 {dd:.2}%");
     }
-    if let (Some(c), Some(n)) = (num("fgi_vs_forward_20d_corr"), num("fgi_vs_forward_20d_pairs")) {
+    if let (Some(c), Some(n)) = (
+        num("fgi_vs_forward_20d_corr"),
+        num("fgi_vs_forward_20d_pairs"),
+    ) {
         println!("  FGI 与 A 股未来 20 日收益相关系数 {c:.4}（n={:.0}）", n);
     }
-    if let Some(obj) = ds.meta.diagnostics.get("forward_20d_return_by_fgi_bucket")
-        .and_then(|v| v.as_object()) {
+    if let Some(obj) = ds
+        .meta
+        .diagnostics
+        .get("forward_20d_return_by_fgi_bucket")
+        .and_then(|v| v.as_object())
+    {
         println!("  各 FGI 分档的未来 20 日平均收益：");
         for k in ["<20", "20-40", "40-55", "55-75", ">=75"] {
             if let Some(v) = obj.get(k) {
-                let avg = v.get("avg_fwd_20d_pct").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+                let avg = v
+                    .get("avg_fwd_20d_pct")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(f64::NAN);
                 let n = v.get("samples").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 println!("    {k:>6}  n={n:>4.0}  {avg:+.3}%");
             }
@@ -1439,7 +1486,10 @@ fn cmd_backtest_asset(config_path: Option<String>, dataset: &str) -> Result<()> 
         println!("  各牛熊段买入持有：");
         for v in arr {
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
-            let r = v.get("buy_hold_pct").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+            let r = v
+                .get("buy_hold_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(f64::NAN);
             println!("    {name:<24} {r:+7.2}%");
         }
     }
@@ -1500,7 +1550,13 @@ fn cmd_backtest_legacy(config_path: Option<String>, compare: Option<String>) -> 
             results.push(r);
         }
         let base = AppConfig::load()?;
-        results.push(backtest::run(&base, &bt_config, &signal, Engine::BuyHold, &rows));
+        results.push(backtest::run(
+            &base,
+            &bt_config,
+            &signal,
+            Engine::BuyHold,
+            &rows,
+        ));
         for r in &results {
             print_report(r);
         }
@@ -1558,7 +1614,12 @@ fn cmd_backtest_legacy(config_path: Option<String>, compare: Option<String>) -> 
             c.apply_profile(p);
             c.target_weight.mode = mode;
             let mut r = backtest::run(&c, &bt_config, &signal, Engine::TargetWeight, &rows);
-            r.name = format!("{}·{}（中性 {:.0}%）", p.label(), mode_label, c.effective_neutral_weight());
+            r.name = format!(
+                "{}·{}（中性 {:.0}%）",
+                p.label(),
+                mode_label,
+                c.effective_neutral_weight()
+            );
             profile_results.push(r);
         }
     }
@@ -1595,11 +1656,15 @@ fn cmd_backtest_legacy(config_path: Option<String>, compare: Option<String>) -> 
 /// 若数据集不覆盖该年份则返回 None。
 fn year_window_stats(r: &backtest::BacktestResult, year: i32) -> Option<(f64, f64)> {
     use chrono::Datelike;
-    let months: Vec<&backtest::Monthly> = r.monthly.iter().filter(|m| m.date.year() == year).collect();
+    let months: Vec<&backtest::Monthly> =
+        r.monthly.iter().filter(|m| m.date.year() == year).collect();
     if months.is_empty() {
         return None;
     }
-    let compounded = months.iter().fold(1.0_f64, |acc, m| acc * (1.0 + m.period_return)) - 1.0;
+    let compounded = months
+        .iter()
+        .fold(1.0_f64, |acc, m| acc * (1.0 + m.period_return))
+        - 1.0;
     let mut peak = months[0].total_value;
     let mut max_dd = 0.0_f64;
     for m in &months {
@@ -1684,7 +1749,13 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     table
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_header(vec!["仓位缩放", "偏离带", "样本内年化", "样本内回撤", "Calmar"]);
+        .set_header(vec![
+            "仓位缩放",
+            "偏离带",
+            "样本内年化",
+            "样本内回撤",
+            "Calmar",
+        ]);
     for (scale, band, xirr, dd, calmar) in &grid {
         table.add_row(vec![
             Cell::new(format!("{:.2}x", scale)),
@@ -1708,7 +1779,8 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     tuned.target_weight.fear = (config.target_weight.fear * best_scale).min(100.0);
     tuned.target_weight.neutral = (config.target_weight.neutral * best_scale).min(100.0);
     tuned.target_weight.greed = (config.target_weight.greed * best_scale).min(100.0);
-    tuned.target_weight.extreme_greed = (config.target_weight.extreme_greed * best_scale).min(100.0);
+    tuned.target_weight.extreme_greed =
+        (config.target_weight.extreme_greed * best_scale).min(100.0);
     tuned.rebalance.band_pp = best_band;
 
     let oos_tuned = backtest::run(&tuned, &bt_oos, &signal, Engine::TargetWeight, oos);
@@ -1746,23 +1818,34 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     }
 
     // ── 2) 分块 bootstrap：给出分布而非单点 ──
-    println!("
-【Bootstrap 分布】{} 次重采样, 分块 {} 个月", iterations, block);
+    println!(
+        "
+【Bootstrap 分布】{} 次重采样, 分块 {} 个月",
+        iterations, block
+    );
     let bt_full = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
     let mut t3 = Table::new();
     t3.load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
         .set_header(vec![
-            "策略", "年化 P5", "年化 P50", "年化 P95", "回撤 P50", "回撤 P95",
+            "策略",
+            "年化 P5",
+            "年化 P50",
+            "年化 P95",
+            "回撤 P50",
+            "回撤 P95",
         ]);
     for (label, sc, engine) in [
-        ("目标仓位(趋势锚)", SignalConfig::trend_tilt(), Engine::TargetWeight),
+        (
+            "目标仓位(趋势锚)",
+            SignalConfig::trend_tilt(),
+            Engine::TargetWeight,
+        ),
         ("目标仓位(情绪锚)", signal, Engine::TargetWeight),
         ("买入持有", signal, Engine::BuyHold),
     ] {
         let r = backtest::run(&config, &bt_full, &sc, engine, &rows);
-        let samples =
-            metrics::block_bootstrap(&r.returns(), block, iterations, 12.0, 20260731);
+        let samples = metrics::block_bootstrap(&r.returns(), block, iterations, 12.0, 20260731);
         if samples.is_empty() {
             continue;
         }
@@ -1790,9 +1873,19 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     let mut t25 = Table::new();
     t25.load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_header(vec!["策略", "2018 年内收益", "2018 年内最大回撤", "2022 年内收益", "2022 年内最大回撤"]);
+        .set_header(vec![
+            "策略",
+            "2018 年内收益",
+            "2018 年内最大回撤",
+            "2022 年内收益",
+            "2022 年内最大回撤",
+        ]);
     for (label, sc, engine) in [
-        ("目标仓位(趋势锚)", SignalConfig::trend_tilt(), Engine::TargetWeight),
+        (
+            "目标仓位(趋势锚)",
+            SignalConfig::trend_tilt(),
+            Engine::TargetWeight,
+        ),
         ("目标仓位(情绪锚)", signal, Engine::TargetWeight),
         ("买入持有", signal, Engine::BuyHold),
     ] {
@@ -1801,10 +1894,26 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
         let y2022 = year_window_stats(&r, 2022);
         t25.add_row(vec![
             Cell::new(label),
-            Cell::new(y2018.map(|(ret, _)| format!("{:.2}%", ret * 100.0)).unwrap_or_else(|| "无数据".into())),
-            Cell::new(y2018.map(|(_, dd)| format!("{:.2}%", dd * 100.0)).unwrap_or_else(|| "无数据".into())),
-            Cell::new(y2022.map(|(ret, _)| format!("{:.2}%", ret * 100.0)).unwrap_or_else(|| "无数据".into())),
-            Cell::new(y2022.map(|(_, dd)| format!("{:.2}%", dd * 100.0)).unwrap_or_else(|| "无数据".into())),
+            Cell::new(
+                y2018
+                    .map(|(ret, _)| format!("{:.2}%", ret * 100.0))
+                    .unwrap_or_else(|| "无数据".into()),
+            ),
+            Cell::new(
+                y2018
+                    .map(|(_, dd)| format!("{:.2}%", dd * 100.0))
+                    .unwrap_or_else(|| "无数据".into()),
+            ),
+            Cell::new(
+                y2022
+                    .map(|(ret, _)| format!("{:.2}%", ret * 100.0))
+                    .unwrap_or_else(|| "无数据".into()),
+            ),
+            Cell::new(
+                y2022
+                    .map(|(_, dd)| format!("{:.2}%", dd * 100.0))
+                    .unwrap_or_else(|| "无数据".into()),
+            ),
         ]);
     }
     println!("{}", t25);
@@ -1830,7 +1939,11 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
             .apply_modifier(UTF8_ROUND_CORNERS)
             .set_header(vec!["策略", "区间收益", "最大回撤"]);
         for (label, sc, engine) in [
-            ("目标仓位(趋势锚)", SignalConfig::trend_tilt(), Engine::TargetWeight),
+            (
+                "目标仓位(趋势锚)",
+                SignalConfig::trend_tilt(),
+                Engine::TargetWeight,
+            ),
             ("目标仓位(情绪锚)", signal, Engine::TargetWeight),
             ("买入持有", signal, Engine::BuyHold),
         ] {
@@ -1873,7 +1986,9 @@ fn cmd_config_params() -> Result<()> {
     println!("    rebalance.decision_weekday           决策日 0=每天 / 1-7=周一..周日 (默认: 5)");
     println!();
     println!("  【风险档位与现金流】");
-    println!("    profile                     无档位/稳健/平衡/进取/custom（core_blend 0/0.4/0.6/0.8；档位抬高常驻仓位，不降低风险）");
+    println!(
+        "    profile                     无档位/稳健/平衡/进取/custom（core_blend 0/0.4/0.6/0.8；档位抬高常驻仓位，不降低风险）"
+    );
     println!("    target_weight.mode          阶梯 step 或线性 linear 过渡");
     println!("    cashflow.monthly            `mns plan` 默认月投入金额");
     println!();
@@ -1917,12 +2032,16 @@ fn cmd_config_params() -> Result<()> {
     println!("        详见 docs/guardrail-experiment-2026-11-08.md");
     println!();
     println!("用法示例:");
-    println!("  mns backtest                           # 实盘审计：有效性检验 + 牛熊分段 + 账户镜像");
+    println!(
+        "  mns backtest                           # 实盘审计：有效性检验 + 牛熊分段 + 账户镜像"
+    );
     println!("  mns backtest mirror                    # 只看严格执行 vs 实际执行");
     println!("  mns backtest asset --dataset hs300     # 单资产对照实验（含 A 股本地信号对照）");
     println!("  mns backtest update-data               # 重建三层日频数据集（含新鲜度校验）");
     println!("  mns backtest validate-full             # 只看统计检验（可 --iterations 覆盖次数）");
-    println!("  mns backtest legacy                    # 已降级：2016-2025 月频代理对比，不可用于实盘");
+    println!(
+        "  mns backtest legacy                    # 已降级：2016-2025 月频代理对比，不可用于实盘"
+    );
     println!("  mns guard                              # 查看当前是否处于买入冷静期");
     println!("  mns config rebalance.band_pp 6          # 放宽偏离带以减少交易");
     Ok(())
@@ -2047,7 +2166,10 @@ async fn cmd_analyze(symbol: &str) -> Result<()> {
 
     table.add_row(vec![Cell::new("股票代码"), Cell::new(&quote.symbol)]);
     table.add_row(vec![Cell::new("名称"), Cell::new(&quote.name)]);
-    table.add_row(vec![Cell::new("当前价格"), Cell::new(&format!("{:.2}", quote.price))]);
+    table.add_row(vec![
+        Cell::new("当前价格"),
+        Cell::new(&format!("{:.2}", quote.price)),
+    ]);
 
     let change_color = if quote.change >= 0.0 {
         Color::Green

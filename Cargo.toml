@@ -1,13 +1,38 @@
 [package]
 name = "money-never-sleep"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "AI-Powered Contrarian Investment Decision Assistant"
 license = "MIT"
 
+[lib]
+name = "money_never_sleep"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mns"
 path = "src/main.rs"
+
+# P0 desktop shell. Kept behind a feature so the CLI builds and tests exactly
+# as before: `cargo run --bin mns-gui --features gui`.
+[[bin]]
+name = "mns-gui"
+path = "src/bin/mns-gui.rs"
+required-features = ["gui"]
+
+# Headless verification of the ACP chain used by the GUI:
+#   cargo run --example agent_smoke --features agent
+[[example]]
+name = "agent_smoke"
+path = "examples/agent_smoke.rs"
+required-features = ["agent"]
+
+[features]
+default = []
+# ACP external-agent runtime. No inference endpoint / API key lives here.
+agent = ["dep:agent-client-protocol"]
+# GPUI Kit desktop + native tray. Implies the agent runtime.
+gui = ["agent", "dep:gpui-kit", "dep:gpui-tray"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -22,3 +47,13 @@ comfy-table = "7"
 dirs = "6"
 anyhow = "1"
 unicode-width = "0.2"
+
+# --- P0: external ACP agent -------------------------------------------------
+# `process` is required for AcpAgent (spawns the external CLI over stdio).
+agent-client-protocol = { version = "5.0", features = ["process"], optional = true }
+
+# --- P0: GPUI Kit desktop shell ---------------------------------------------
+# gpui-kit 0.9.0 pins gpui-pre =0.3.11; gpui-tray's `gpui-kit` backend allows
+# ^0.3.4, so Cargo unifies both on a single gpui-pre instance (shared types).
+gpui-kit = { version = "0.9.0", optional = true }
+gpui-tray = { version = "0.3.0", optional = true, default-features = false, features = ["gpui-kit", "menu-state"] }

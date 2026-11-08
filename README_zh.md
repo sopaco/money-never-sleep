@@ -138,5 +138,11 @@ python3 .agents/skills/mns-backtest/data/guardrail_experiment.py
 | [`.agents/skills/mns-advisor/SKILL.md`](.agents/skills/mns-advisor/SKILL.md) | 实盘买卖决策编排 Skill：三类触发器、AGENT 五步工作流、联网核验清单、CLI 契约与证据边界 |
 | [`.agents/skills/mns-advisor/references/buy-sell-playbook.md`](.agents/skills/mns-advisor/references/buy-sell-playbook.md) | 「何时买 / 何时卖 / 何时不动」的完整叙事与判定链 |
 | [`distribution/skills/mns-advisor.zip`](distribution/skills/mns-advisor.zip) | **通用分发版**（与本仓库版同名但不同内容）：假定 `mns` 已在 PATH、无源码、无数据集，只教 Agent 调用命令与解读输出；跨平台，含 macOS/Linux 的 bash 与 Windows 的 PowerShell 两版只读采集脚本。安装位置 `~/.workbuddy/skills/mns-advisor/` |
+| [`docs/gui-p0.md`](docs/gui-p0.md) | 桌面端 P0：GPUI Kit 窗口/托盘、ACP 外接 `opencode` 自主运行的验证结论、已知取舍与未验证边界 |
+| [`docs/gui-design.md`](docs/gui-design.md) | 桌面端视觉系统：色彩令牌、字号阶梯、情绪氛围映射、图标的三种用法与产物管线 |
+
+桌面端仍在 P0，入口为 `cargo run --bin mns-gui --features gui`；不启用该 feature 时 CLI 依赖与行为完全不变。外接 Agent 只需配置 CLI 路径，模型与凭据留在 `opencode` 自身配置中。
+
+界面语言见 [`docs/gui-design.md`](docs/gui-design.md)：红绿只表示盈亏，情绪沿蓝↔琥珀轴影响背景与装饰；图标不再与文字并排，而是作为角落水印或按钮徽记。应用图标与托盘图标由 `swift scripts/make-icons.swift` 从 `assets/app_icon.png` 一次生成（`.icns` / `.ico` / PNG / 裸 RGBA）。
 
 当前验收状态：`cargo test` 116 passed / 0 failed / 3 ignored，`cargo check` 0 warning；三层数据集末日均 2026-11-06。
