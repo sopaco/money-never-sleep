@@ -92,6 +92,23 @@ pub enum Commands {
         decide: bool,
     },
 
+    /// 一键：先更新价格，再生成今日报告（价格失败也继续）
+    Today {
+        /// 非决策日仍强制生成决策版报告
+        #[arg(long)]
+        decide: bool,
+        /// 只输出结论与报告路径，不打印价格明细
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// 定投计划：每月买什么、买多少（只买不卖）
+    Plan {
+        /// 每月投入金额（省略则读取 cashflow.monthly）
+        #[arg(long)]
+        monthly: Option<f64>,
+    },
+
     /// 查看交易历史
     History {
         /// 显示条数

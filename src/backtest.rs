@@ -196,10 +196,20 @@ impl Leg {
 
 // ───────────────────────── 回测配置 ─────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InflowFreq {
+    /// 每年 3 月后首个月一次性注资（旧行为）
+    #[default]
+    Annual,
+    /// 每月注资，年额均分到 12 个月
+    Monthly,
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestConfig {
     pub initial_cash: f64,
     pub annual_inflow: f64,
+    pub inflow_freq: InflowFreq,
     pub start_date: NaiveDate,
     pub end_date: NaiveDate,
 }
@@ -209,6 +219,7 @@ impl Default for BacktestConfig {
         Self {
             initial_cash: 100_000.0,
             annual_inflow: 50_000.0,
+            inflow_freq: InflowFreq::Annual,
             start_date: NaiveDate::from_ymd_opt(2016, 1, 1).unwrap(),
             end_date: NaiveDate::from_ymd_opt(2025, 4, 30).unwrap(),
         }
@@ -221,6 +232,7 @@ impl BacktestConfig {
         Self {
             initial_cash,
             annual_inflow,
+            inflow_freq: InflowFreq::Annual,
             start_date: rows.first().map(|r| r.date).unwrap_or_default(),
             end_date: rows.last().map(|r| r.date).unwrap_or_default(),
         }
@@ -591,15 +603,26 @@ pub fn run(
             st.cash = grown;
         }
 
-        // 2) 年度注资（每年3月末之后的首个月）
+        // 2) 注资：年频（每年3月末之后的首个月）或月频（年额/12）
         let mut inflow = 0.0;
-        if row.date.year() > st.last_inflow_year && row.date.month() >= 3 && i > 0 {
-            st.cash += bt.annual_inflow;
-            st.total_inflow += bt.annual_inflow;
-            st.last_inflow_year = row.date.year();
-            inflow = bt.annual_inflow;
-            st.flows.push(CashFlow { date: row.date, amount: -bt.annual_inflow });
-        } else if i == 0 {
+        if i > 0 {
+            let amount = match bt.inflow_freq {
+                InflowFreq::Annual
+                    if row.date.year() > st.last_inflow_year && row.date.month() >= 3 =>
+                {
+                    st.last_inflow_year = row.date.year();
+                    bt.annual_inflow
+                }
+                InflowFreq::Monthly => bt.annual_inflow / 12.0,
+                _ => 0.0,
+            };
+            if amount > 0.0 {
+                st.cash += amount;
+                st.total_inflow += amount;
+                inflow = amount;
+                st.flows.push(CashFlow { date: row.date, amount: -amount });
+            }
+        } else {
             st.last_inflow_year = row.date.year();
         }
 
@@ -1050,12 +1073,102 @@ pub fn print_comparison(results: &[BacktestResult]) {
     println!();
 }
 
+/// 风险档位对比：三档预设 + 买入持有基准，同一数据/成本/带宽。
+pub fn print_profile_comparison(results: &[BacktestResult]) {
+    println!();
+    println!("=================================================================");
+    println!("   风险档位对比（同一数据、同一成本模型）");
+    println!("=================================================================");
+    println!();
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table.set_header(vec![
+        Cell::new("档位"),
+        Cell::new("年化XIRR"),
+        Cell::new("最大回撤"),
+        Cell::new("Calmar"),
+        Cell::new("年均交易"),
+        Cell::new("费用"),
+    ]);
+    for r in results {
+        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        table.add_row(vec![
+            Cell::new(&r.name),
+            Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
+            Cell::new(format!("{:.2}%", r.max_drawdown * 100.0)),
+            Cell::new(format!("{:.2}", r.risk.calmar)),
+            Cell::new(format!("{:.1}", r.trades_per_year)),
+            Cell::new(format!("¥{:.0}", r.total_fees)),
+        ]);
+    }
+    println!("{}", table);
+    println!();
+}
+
+/// 注资频率对比：年频 vs 月频（其余条件完全相同）。
+pub fn print_inflow_comparison(results: &[BacktestResult]) {
+    println!();
+    println!("=================================================================");
+    println!("   注资频率对比（同一策略/数据/成本，年额均分）");
+    println!("=================================================================");
+    println!();
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table.set_header(vec![
+        Cell::new("注资方式"),
+        Cell::new("年化XIRR"),
+        Cell::new("最大回撤"),
+        Cell::new("Calmar"),
+        Cell::new("年均交易"),
+        Cell::new("费用"),
+    ]);
+    for r in results {
+        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        table.add_row(vec![
+            Cell::new(&r.name),
+            Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
+            Cell::new(format!("{:.2}%", r.max_drawdown * 100.0)),
+            Cell::new(format!("{:.2}", r.risk.calmar)),
+            Cell::new(format!("{:.1}", r.trades_per_year)),
+            Cell::new(format!("¥{:.0}", r.total_fees)),
+        ]);
+    }
+    println!("{}", table);
+    println!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn 趋势锚的目标仓位不受风险档位影响() {
+        use crate::config::{AppConfig, RiskProfile};
+
+        let rows = load_main();
+        let signals = vec![50.0; rows.len()];
+        let cfg = SignalConfig::trend_tilt();
+
+        let base = AppConfig::default_config();
+        let mut profiled = base.clone();
+        profiled.apply_profile(RiskProfile::Aggressive);
+
+        let a = compute_target_risk_weights(&base, &rows, &signals, &cfg);
+        let b = compute_target_risk_weights(&profiled, &rows, &signals, &cfg);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-12, "TrendTilt 不应受 profile 影响");
+        }
+
+        // 情绪锚则应受 profile 影响
+        let senti = SignalConfig::default();
+        let c = compute_target_risk_weights(&base, &rows, &signals, &senti);
+        let d = compute_target_risk_weights(&profiled, &rows, &signals, &senti);
+        assert!(c.iter().zip(&d).any(|(x, y)| (x - y).abs() > 1e-6));
     }
 
     #[test]

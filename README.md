@@ -130,12 +130,23 @@ mns cash set 100000
 # Daily usage
 mns add QQQ "Nasdaq 100" us_stocks
 mns buy QQQ 50 380.00
-mns update-prices
+mns today           # One-shot: refresh prices + report (continues if prices fail)
 mns report          # Decision report on config'd weekday, otherwise observation-only
 mns report --decide # Force a decision report on any day
-mns backtest          # Compare 4 strategies (same data & cost model)
+mns plan --monthly 3000  # Monthly DCA plan (buys only)
+mns config profile balanced  # Risk profile: steady / balanced / aggressive
+mns backtest          # Strategy comparison + 3 profiles + inflow frequency
 mns backtest validate # Out-of-sample validation + bootstrap + holdout
 ```
+
+### Risk profiles
+
+`steady` / `balanced` / `aggressive` shrink the target-weight curve toward
+full investment (`core_blend` 0.4 / 0.6 / 0.8); they do **not** rewrite your
+curve anchors. A profile is a risk-preference knob, not alpha: the strategy
+still does not guarantee beating buy-and-hold out of sample. Old configs
+without the field default to `core_blend = 0`, i.e. exactly the previous
+behavior.
 
 ---
 

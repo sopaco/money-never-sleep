@@ -49,6 +49,8 @@ async fn main() -> Result<()> {
         Commands::Remove { code } => cmd_remove(&code)?,
         Commands::Sentiment => cmd_sentiment().await?,
         Commands::Report { decide } => cmd_report(decide).await?,
+        Commands::Today { decide, quiet } => cmd_today(decide, quiet).await?,
+        Commands::Plan { monthly } => cmd_plan(monthly)?,
         Commands::History { limit } => cmd_history(limit)?,
         Commands::Backtest { action } => match action {
             None => cmd_backtest(None, None)?,
@@ -104,7 +106,8 @@ fn cmd_init(force: bool) -> Result<()> {
             .with_context(|| format!("删除数据库失败: {}", db_path.display()))?;
     }
 
-    let config = AppConfig::default_config();
+    let mut config = AppConfig::default_config();
+    config.apply_profile(config::RiskProfile::Balanced);
     config.save()?;
 
     let db = db::Database::open()?;
@@ -118,6 +121,11 @@ fn cmd_init(force: bool) -> Result<()> {
     println!("  配置文件: {}", config_path.display());
     println!("  数据库:   {}", db_path.display());
     println!("  报告目录: {}", report_dir);
+    println!(
+        "  风险档位: {}（中性目标 {:.0}%，用 `mns config profile <steady|balanced|aggressive>` 切换）",
+        config.profile_label(),
+        config.effective_neutral_weight()
+    );
     Ok(())
 }
 
@@ -346,18 +354,102 @@ async fn cmd_sentiment() -> Result<()> {
     Ok(())
 }
 
+/// 汇总本月已发生的交易笔数与按现行费率估算的费用。
+///
+/// 卖出费按 30 天持有期估算（实际可能更低或更高），只用于报告量级参考。
+fn month_activity(db: &db::Database, config: &AppConfig) -> Result<report::MonthActivity> {
+    let txs = db.list_transactions(500)?;
+    let prefix = chrono::Local::now().format("%Y-%m").to_string();
+    let mut activity = report::MonthActivity::default();
+    for tx in txs.iter().filter(|t| t.tx_date.starts_with(&prefix)) {
+        activity.trades += 1;
+        let amount = tx.amount.abs();
+        activity.estimated_fees += if tx.tx_type == "buy" {
+            amount * config.costs.buy_rate()
+        } else {
+            amount * config.costs.total_sell_rate(30)
+        };
+    }
+    Ok(activity)
+}
+
 async fn cmd_report(force_decide: bool) -> Result<()> {
+    // 与 `mns today` 同口径的价格时效：report 本身不刷价，直接读库里的 updated_at
+    let db = db::Database::open()?;
+    let age = price_age_days(&db.list_positions()?);
+    cmd_report_inner(force_decide, false, age).await
+}
+
+/// 一键：先刷新价格（失败也继续），再出报告。
+async fn cmd_today(decide: bool, quiet: bool) -> Result<()> {
+    let db = db::Database::open()?;
+    let positions = db.list_positions()?;
+    let mut update_err: Option<String> = None;
+
+    if positions.is_empty() {
+        if !quiet {
+            println!("没有资产，报告将只包含现金。");
+        }
+    } else {
+        if !quiet {
+            println!("正在更新 {} 个资产的价格...", positions.len());
+        }
+        match quote::update_all_prices(&positions).await {
+            Ok(updates) => {
+                if updates.is_empty() {
+                    update_err = Some("未获取到任何资产的最新价格".to_string());
+                }
+                for u in &updates {
+                    if let Err(e) = db.update_price(&u.asset_code, u.new_price) {
+                        update_err = Some(format!("{} 写库失败: {}", u.asset_code, e));
+                    }
+                }
+                if !quiet {
+                    println!("✓ 已更新 {} 个资产价格", updates.len());
+                }
+            }
+            Err(e) => update_err = Some(e.to_string()),
+        }
+    }
+
+    if let Some(err) = &update_err {
+        println!("⚠ 价格更新失败：{}（继续使用本地旧价）", err);
+    }
+
+    let age = price_age_days(&db.list_positions()?);
+    cmd_report_inner(decide, quiet, age).await
+}
+
+/// 本地价格距今最旧的天数（无持仓返回 None）。
+fn price_age_days(positions: &[models::Position]) -> Option<i64> {
+    let now = chrono::Local::now().naive_local();
+    positions
+        .iter()
+        .filter_map(|p| {
+            chrono::NaiveDateTime::parse_from_str(&p.updated_at, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| (now - dt).num_days().max(0))
+        })
+        .max()
+}
+
+async fn cmd_report_inner(
+    force_decide: bool,
+    quiet: bool,
+    price_age_days: Option<i64>,
+) -> Result<()> {
     let config = AppConfig::load()?;
     let db = db::Database::open()?;
 
-    println!("正在获取恐贪指数...");
+    if !quiet {
+        println!("正在获取恐贪指数...");
+    }
 
     // 使用配置的 API URL
     let url = &config.api.fear_greed_url;
     let data = sentiment::fetch_fear_greed_data(url).await?;
     let today_score = data.score as f64;
     let today_zone = config.sentiment_zone(today_score);
-
     // 保存快照（含历史数据）——先落库，再从本地表读历史做平滑
     db.save_fear_greed_snapshot(
         today_score,
@@ -374,12 +466,14 @@ async fn cmd_report(force_decide: bool) -> Result<()> {
     let history = db.recent_fear_greed_scores(90)?;
     let signal = signal::compute(&config, today_score, &history, today);
 
-    println!(
-        "恐贪指数: {} ({}) | 决策分数: {} ({})",
-        data.score, today_zone, signal.effective_score, signal.effective_zone
-    );
-    println!("信号说明: {}", signal.note);
-    println!("今日报告类型: {} 平滑 (样本 {}/{})", signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days);
+    if !quiet {
+        println!(
+            "恐贪指数: {} ({}) | 决策分数: {} ({})",
+            data.score, today_zone, signal.effective_score, signal.effective_zone
+        );
+        println!("信号说明: {}", signal.note);
+        println!("今日报告类型: {} 平滑 (样本 {}/{})", signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days);
+    }
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
@@ -401,6 +495,7 @@ async fn cmd_report(force_decide: bool) -> Result<()> {
             &positions,
             today,
         );
+        let activity = month_activity(&db, &config)?;
 
         report::generate_report(
             &config,
@@ -417,15 +512,110 @@ async fn cmd_report(force_decide: bool) -> Result<()> {
             &positions,
             &plan,
             &risk_warnings,
+            &activity,
+            price_age_days,
         )?
     } else {
         // 非决策日：只出观察报告，不给买卖建议
-        report::generate_observation_report(&config, &signal, cash, &positions)?
+        report::generate_observation_report(&config, &signal, cash, &positions, price_age_days)?
     };
 
     let filepath = report::save_report(&config, &report)?;
     println!("{}", report);
     println!("\n报告已保存至: {}", filepath);
+    Ok(())
+}
+
+fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
+    let config = AppConfig::load()?;
+    let db = db::Database::open()?;
+
+    let monthly = monthly_arg.unwrap_or(config.cashflow.monthly);
+    if monthly <= 0.0 {
+        anyhow::bail!(
+            "未设置月投入金额：用 `mns plan --monthly 3000` 或 `mns config cashflow.monthly 3000` 设置"
+        );
+    }
+
+    let history = db.recent_fear_greed_scores(90)?;
+    let latest = history
+        .last()
+        .map(|(_, s)| *s)
+        .ok_or_else(|| anyhow::anyhow!("本地没有恐贪快照，请先运行一次 `mns report`"))?;
+    let today = chrono::Local::now().date_naive();
+    let signal = signal::compute(&config, latest, &history, today);
+    let score = signal.effective_score;
+
+    let cash = db.get_cash_balance()?;
+    let positions = db.list_positions()?;
+    let plan = strategy::calculate_monthly_plan(&config, score, cash, &positions, monthly);
+
+    println!("=================================================================");
+    println!("   定投计划：每月 ¥{:.0}（只买不卖）", monthly);
+    println!("=================================================================");
+    println!();
+    println!(
+        "风险档位: {} | 决策分数 {:.1} | 目标风险仓位 {:.0}%（含本月新钱）",
+        config.profile_label(),
+        score,
+        plan.target_risk_weight
+    );
+    println!();
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
+    table.set_header(vec![
+        Cell::new("腿"),
+        Cell::new("目标权重"),
+        Cell::new("当前权重"),
+        Cell::new("偏离"),
+        Cell::new("本月买入"),
+    ]);
+    for leg in &plan.legs {
+        table.add_row(vec![
+            Cell::new(&leg.category_cn),
+            Cell::new(format!("{:.0}%", leg.target_weight)),
+            Cell::new(format!("{:.0}%", leg.current_weight)),
+            Cell::new(format!("{:+.1}pp", leg.drift_pp)),
+            Cell::new(format!("¥{:.0}", leg.amount)),
+        ]);
+    }
+    table.add_row(vec![
+        Cell::new("合计"),
+        Cell::new(""),
+        Cell::new(""),
+        Cell::new(""),
+        Cell::new(format!("¥{:.0}", plan.total_buy)),
+    ]);
+    println!("{}", table);
+    println!();
+
+    if plan.legs.iter().all(|l| l.items.is_empty()) {
+        println!("持仓池为空，先用 `mns add <代码> <名称> <类别>` 添加标的。");
+        return Ok(());
+    }
+
+    println!("标的分配:");
+    for leg in &plan.legs {
+        if leg.items.is_empty() {
+            continue;
+        }
+        println!("  {}（¥{:.0}）", leg.category_cn, leg.amount);
+        for item in &leg.items {
+            println!("    {} {}  ¥{:.0}", item.asset_code, item.asset_name, item.amount);
+        }
+    }
+
+    let fees = plan.estimated_fees(&config.costs);
+    println!();
+    println!(
+        "合计 ¥{:.0}（费用前）| 预计申购费约 ¥{:.0}（按现行费率估算）",
+        plan.total_buy, fees
+    );
+    println!("提示: 执行后用 `mns buy <代码> <份额> <价格>` 记录，未买完的钱留在现金里下月继续。");
+    println!("定投不产生收益 alpha，提升的是储蓄率与执行纪律。");
     Ok(())
 }
 
@@ -555,6 +745,41 @@ fn cmd_backtest(config_path: Option<String>, compare: Option<String>) -> Result<
     }
     print_comparison(&results);
 
+    // 风险档位三档并列 × 阶梯/线性过渡：同一数据/成本/带宽
+    let mut profile_results = Vec::new();
+    for p in config::RiskProfile::ALL {
+        for (mode, mode_label) in [
+            (config::WeightMode::Step, "阶梯"),
+            (config::WeightMode::Linear, "线性"),
+        ] {
+            let mut c = config.clone();
+            c.apply_profile(p);
+            c.target_weight.mode = mode;
+            let mut r = backtest::run(&c, &bt_config, &signal, Engine::TargetWeight, &rows);
+            r.name = format!("{}·{}（中性 {:.0}%）", p.label(), mode_label, c.effective_neutral_weight());
+            profile_results.push(r);
+        }
+    }
+    profile_results.push(backtest::run(
+        &config,
+        &bt_config,
+        &signal,
+        Engine::BuyHold,
+        &rows,
+    ));
+    backtest::print_profile_comparison(&profile_results);
+
+    // 定投频率：同样的年投入，年频 vs 月频
+    let mut annual_bt = bt_config.clone();
+    annual_bt.inflow_freq = backtest::InflowFreq::Annual;
+    let mut annual = backtest::run(&config, &annual_bt, &signal, Engine::TargetWeight, &rows);
+    annual.name = "年频注资（每年3月后）".to_string();
+    let mut monthly_bt = bt_config.clone();
+    monthly_bt.inflow_freq = backtest::InflowFreq::Monthly;
+    let mut monthly = backtest::run(&config, &monthly_bt, &signal, Engine::TargetWeight, &rows);
+    monthly.name = "月频定投（年额/12）".to_string();
+    backtest::print_inflow_comparison(&[annual, monthly]);
+
     println!("提示: 运行 `mns backtest validate` 查看样本外验证与收益分布。");
     println!();
     Ok(())
@@ -603,6 +828,15 @@ fn cmd_backtest_validate(iterations: usize, block: usize) -> Result<()> {
     println!("   样本外验证");
     println!("=================================================================");
     println!();
+
+    if config.profile.core_blend > 0.0 {
+        println!(
+            "[INFO] 风险档位 {} 已启用（core_blend {:.1}）：调参网格只缩放卫星曲线，档位收缩保持不变。",
+            config.profile_label(),
+            config.profile.core_blend
+        );
+        println!();
+    }
 
     // ── 1) walk-forward：前 60% 调参，后 40% 验证 ──
     let split = rows.len() * 60 / 100;
@@ -832,6 +1066,11 @@ fn cmd_backtest_params() -> Result<()> {
     println!("    rebalance.band_pp                    偏离带(百分点)，越大交易越少 (默认: 4)");
     println!("    rebalance.min_trade_amount           最小交易金额 (默认: 500)");
     println!("    rebalance.min_holding_days_for_sell  卖出最短持有天数，规避惩罚性赎回费 (默认: 30)");
+    println!();
+    println!("  【风险档位与现金流】");
+    println!("    profile                     稳健/平衡/进取/custom（一键套用 core_blend 0.4/0.6/0.8）");
+    println!("    target_weight.mode          阶梯 step 或线性 linear 过渡");
+    println!("    cashflow.monthly            `mns plan` 默认月投入金额");
     println!();
     println!("  【成本与现金】");
     println!("    costs.buy_fee_pct           买入费率% (默认: 0.12)");

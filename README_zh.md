@@ -106,11 +106,20 @@ mns cash set 100000
 # 日常使用
 mns add QQQ "纳指100" us_stocks
 mns buy QQQ 50 380.00
-mns update-prices
-mns report          # 生成今日操作建议
-mns backtest          # 四种策略对比（同一数据与成本模型）
+mns today           # 一键：更新价格 + 生成报告（价格失败也继续）
+mns report          # 只生成报告
+mns plan --monthly 3000  # 月度定投计划（只买不卖）
+mns config profile balanced  # 切换风险档位：steady / balanced / aggressive
+mns backtest          # 策略对比 + 三档位 + 注资频率对比
 mns backtest validate # 样本外验证 + bootstrap 收益分布 + holdout
 ```
+
+### 风险档位
+
+`steady` / `balanced` / `aggressive` 把目标仓位曲线向满仓收缩（内部 `core_blend`
+0.4 / 0.6 / 0.8），**不会改写你自己的曲线锚点**。档位是风险偏好旋钮，不是收益
+增强：策略仍不保证在样本外跑赢买入持有。老配置缺字段时 `core_blend = 0`，
+行为与改动前完全一致。
 
 ---
 

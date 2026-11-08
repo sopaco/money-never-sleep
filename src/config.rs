@@ -20,6 +20,101 @@ pub struct AppConfig {
     /// 交易成本与现金收益
     #[serde(default)]
     pub costs: Costs,
+    /// 现金流（定投计划）
+    #[serde(default)]
+    pub cashflow: Cashflow,
+    /// 风险档位。内部用 core_blend 把目标曲线向满仓收缩；
+    /// `core_blend=0`（老配置缺字段）完全等价旧行为。
+    #[serde(default)]
+    pub profile: ProfileConfig,
+}
+
+/// 目标仓位曲线的过渡方式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WeightMode {
+    /// 五档阶梯（旧行为）
+    #[default]
+    Step,
+    /// 阈值锚点之间线性插值
+    Linear,
+}
+
+/// 风险档位预设：不改变用户的曲线形状，只把曲线**向满仓收缩**的程度分三档。
+///
+/// 目标权重 = `core_blend × 100 + (1-core_blend) × 原曲线(score)`。
+/// `core_blend=0` 完全等价旧行为；越大则底仓越高、择时摆幅越小。
+/// 这是风险偏好旋钮，不是收益增强：主样本外仍不保证赢买入持有。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RiskProfile {
+    Steady,
+    Balanced,
+    Aggressive,
+}
+
+impl RiskProfile {
+    pub const ALL: [RiskProfile; 3] = [Self::Steady, Self::Balanced, Self::Aggressive];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "steady" | "conservative" | "稳健" => Some(Self::Steady),
+            "balanced" | "平衡" => Some(Self::Balanced),
+            "aggressive" | "进取" | "激进" => Some(Self::Aggressive),
+            "custom" | "自定义" => None,
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Steady => "steady",
+            Self::Balanced => "balanced",
+            Self::Aggressive => "aggressive",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Steady => "稳健",
+            Self::Balanced => "平衡",
+            Self::Aggressive => "进取",
+        }
+    }
+
+    /// 曲线向满仓收缩的权重（0~1）。
+    pub fn core_blend(self) -> f64 {
+        match self {
+            Self::Steady => 0.4,
+            Self::Balanced => 0.6,
+            Self::Aggressive => 0.8,
+        }
+    }
+}
+
+/// 风险档位的用户可见部分：名字 + 内部收缩权重。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileConfig {
+    /// steady / balanced / aggressive / custom
+    #[serde(default = "ProfileConfig::default_name")]
+    pub name: String,
+    /// 内部参数：目标权重向满仓收缩的权重，0 = 不改动原曲线
+    #[serde(default)]
+    pub core_blend: f64,
+}
+
+impl ProfileConfig {
+    fn default_name() -> String {
+        "custom".to_string()
+    }
+}
+
+impl Default for ProfileConfig {
+    fn default() -> Self {
+        Self {
+            name: Self::default_name(),
+            core_blend: 0.0,
+        }
+    }
 }
 
 /// 各情绪区间下"风险资产合计"的目标权重（占总资产百分比）。
@@ -27,13 +122,16 @@ pub struct AppConfig {
 /// 这是仓位管理的锚：策略始终对照"我应该持有多少风险资产"，
 /// 而非旧逻辑的"把手上现金花掉百分之几"。后者会导致弹药几何衰减
 /// （连续恐慌期越到后面越没钱买）与路径依赖（刚注资则买入金额被放大）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TargetWeight {
     pub extreme_fear: f64,
     pub fear: f64,
     pub neutral: f64,
     pub greed: f64,
     pub extreme_greed: f64,
+    /// 档位之间是阶梯还是线性过渡。旧配置缺省为 step。
+    #[serde(default)]
+    pub mode: WeightMode,
 }
 
 impl TargetWeight {
@@ -44,6 +142,7 @@ impl TargetWeight {
             neutral: 60.0,
             greed: 45.0,
             extreme_greed: 35.0,
+            mode: WeightMode::Step,
         }
     }
 }
@@ -52,6 +151,13 @@ impl Default for TargetWeight {
     fn default() -> Self {
         Self::default_curve()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Cashflow {
+    /// 每月定投金额（元）。`mns plan` 的默认值。
+    #[serde(default)]
+    pub monthly: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +311,25 @@ pub struct ApiConfig {
     pub fear_greed_url: String,
 }
 
+/// 在 4 个阈值锚点之间线性插值；低于首锚点取首值，高于末锚点取尾部值。
+fn interp_target(score: f64, pts: &[(f64, f64); 4], tail: f64) -> f64 {
+    if score <= pts[0].0 {
+        return pts[0].1;
+    }
+    if score >= pts[3].0 {
+        return tail;
+    }
+    for w in pts.windows(2) {
+        let (x0, y0) = w[0];
+        let (x1, y1) = w[1];
+        if score < x1 {
+            let t = if x1 > x0 { (score - x0) / (x1 - x0) } else { 0.0 };
+            return y0 + t * (y1 - y0);
+        }
+    }
+    tail
+}
+
 impl AppConfig {
     pub fn default_config() -> Self {
         // 防御配置 - 低回撤优先，逆向策略
@@ -249,6 +374,8 @@ impl AppConfig {
             target_weight: TargetWeight::default_curve(),
             rebalance: Rebalance::default(),
             costs: Costs::default(),
+            cashflow: Cashflow::default(),
+            profile: ProfileConfig::default(),
         }
     }
 
@@ -338,6 +465,12 @@ impl AppConfig {
         if self.rebalance.band_pp < 0.0 {
             anyhow::bail!("rebalance.band_pp 不能为负: {}", self.rebalance.band_pp);
         }
+        if !(0.0..=1.0).contains(&self.profile.core_blend) {
+            anyhow::bail!(
+                "profile.core_blend 必须在 0-1 之间: {}",
+                self.profile.core_blend
+            );
+        }
         if self.rebalance.signal_smooth_days > 60 {
             anyhow::bail!(
                 "rebalance.signal_smooth_days 过大（>60 天平滑已无意义）: {}",
@@ -395,7 +528,7 @@ impl AppConfig {
     /// 而非"应该花掉手上现金的多少"，因此无路径依赖、无弹药衰减。
     pub fn target_weight_for(&self, score: f64) -> f64 {
         let t = &self.target_weight;
-        if score < self.thresholds.extreme_fear {
+        let step = if score < self.thresholds.extreme_fear {
             t.extreme_fear
         } else if score < self.thresholds.fear {
             t.fear
@@ -405,7 +538,48 @@ impl AppConfig {
             t.greed
         } else {
             t.extreme_greed
-        }
+        };
+        let base = match t.mode {
+            WeightMode::Step => step,
+            WeightMode::Linear => {
+                // 锚点取在阈值上：阈值以下沿用该档权重，阈值之间线性过渡，
+                // 两端截断。这样极端区间语义不变，只消除阈值处的跳变。
+                let pts = [
+                    (self.thresholds.extreme_fear, t.extreme_fear),
+                    (self.thresholds.fear, t.fear),
+                    (self.thresholds.neutral, t.neutral),
+                    (self.thresholds.greed, t.greed),
+                ];
+                interp_target(score, &pts, t.extreme_greed)
+            }
+        };
+        // 风险档位：把曲线向满仓收缩（core_blend=0 时完全等价旧行为）
+        let blend = self.profile.core_blend.clamp(0.0, 1.0);
+        blend * 100.0 + (1.0 - blend) * base
+    }
+
+    /// 一键套用风险档位：只调整曲线向满仓的收缩程度，不改用户自己的曲线锚点、
+    /// 配置比例与成本。
+    pub fn apply_profile(&mut self, profile: RiskProfile) {
+        self.profile = ProfileConfig {
+            name: profile.id().to_string(),
+            core_blend: profile.core_blend(),
+        };
+    }
+
+    /// 报告展示用档位名。
+    pub fn profile_label(&self) -> &'static str {
+        RiskProfile::ALL
+            .iter()
+            .find(|p| p.id() == self.profile.name)
+            .map(|p| p.label())
+            .unwrap_or("自定义")
+    }
+
+    /// “中性”区间的实际目标仓位（已含档位收缩），用于展示。
+    pub fn effective_neutral_weight(&self) -> f64 {
+        let mid = (self.thresholds.fear + self.thresholds.neutral) / 2.0;
+        self.target_weight_for(mid)
     }
 
     /// 风险资产内部的三腿目标权重（归一化后占风险资产的比例）
@@ -535,6 +709,13 @@ impl AppConfig {
             "costs.buy_fee_pct" => Some(self.costs.buy_fee_pct.to_string()),
             "costs.sell_fee_pct" => Some(self.costs.sell_fee_pct.to_string()),
             "costs.cash_annual_yield" => Some(self.costs.cash_annual_yield.to_string()),
+            "target_weight.mode" => Some(match self.target_weight.mode {
+                WeightMode::Step => "step".to_string(),
+                WeightMode::Linear => "linear".to_string(),
+            }),
+            "cashflow.monthly" => Some(self.cashflow.monthly.to_string()),
+            "profile" => Some(self.profile_label().to_string()),
+            "profile.core_blend" => Some(self.profile.core_blend.to_string()),
             _ => None,
         }
     }
@@ -597,6 +778,33 @@ impl AppConfig {
             "costs.buy_fee_pct" => self.costs.buy_fee_pct = value.parse()?,
             "costs.sell_fee_pct" => self.costs.sell_fee_pct = value.parse()?,
             "costs.cash_annual_yield" => self.costs.cash_annual_yield = value.parse()?,
+            "cashflow.monthly" => self.cashflow.monthly = value.parse()?,
+            "target_weight.mode" => {
+                self.target_weight.mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "step" | "阶梯" => WeightMode::Step,
+                    "linear" | "线性" => WeightMode::Linear,
+                    other => anyhow::bail!("未知的过渡方式: {}（可选 step/linear）", other),
+                };
+                // 手工改曲线参数后档位标签不再可信；mode 不影响数值，保留 profile。
+            }
+            "profile" => {
+                let v = value.trim();
+                if v.eq_ignore_ascii_case("custom") || v == "自定义" {
+                    self.profile = ProfileConfig::default();
+                } else {
+                    let p = RiskProfile::parse(v).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "未知风险档位: {}（可选 steady/balanced/aggressive/custom 或 稳健/平衡/进取）",
+                            value
+                        )
+                    })?;
+                    self.apply_profile(p);
+                }
+            }
+            "profile.core_blend" => {
+                self.profile.core_blend = value.parse()?;
+                self.profile.name = "custom".to_string();
+            }
             _ => anyhow::bail!("未知的配置项: {}", key),
         }
         Ok(())
@@ -685,8 +893,80 @@ mod tests {
     }
 
     #[test]
-    fn 旧配置文件缺少新字段仍可加载() {
-        // 用户既有 config.toml 不含 target_weight/rebalance/costs
+    fn 风险档位可解析中英文别名() {
+        assert_eq!(RiskProfile::parse("steady"), Some(RiskProfile::Steady));
+        assert_eq!(RiskProfile::parse("平衡"), Some(RiskProfile::Balanced));
+        assert_eq!(RiskProfile::parse("进取"), Some(RiskProfile::Aggressive));
+        assert_eq!(RiskProfile::parse("aggressive"), Some(RiskProfile::Aggressive));
+        assert_eq!(RiskProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn 套用档位只改收缩权重不改用户曲线() {
+        let mut c = cfg();
+        let base = c.target_weight.clone();
+        for p in RiskProfile::ALL {
+            c.apply_profile(p);
+            assert_eq!(c.profile_label(), p.label());
+            assert_eq!(c.profile.name, p.id());
+            assert_eq!(c.profile.core_blend, p.core_blend());
+            assert_eq!(c.target_weight, base, "档位不应改写用户的曲线锚点");
+            assert!(c.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn 自定义档位显示自定义且不改曲线() {
+        let mut c = cfg();
+        c.apply_profile(RiskProfile::Balanced);
+        let before = c.target_weight_for(50.0);
+        c.set_value("profile", "custom").unwrap();
+        assert_eq!(c.profile_label(), "自定义");
+        assert_eq!(c.profile.core_blend, 0.0);
+        assert!(c.target_weight_for(50.0) < before, "取消档位后应回到原始曲线");
+    }
+
+    #[test]
+    fn 档位把曲线向满仓收缩() {
+        let mut c = cfg();
+        c.apply_profile(RiskProfile::Balanced); // core 0.6
+        // 默认曲线中性 60 → 60 + 0.6*(100-60) = 84
+        assert!((c.target_weight_for(50.0) - 84.0).abs() < 1e-9);
+        // 极端贪婪 35 → 35 + 0.6*65 = 74
+        assert!((c.target_weight_for(90.0) - 74.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 线性插值在阈值两侧连续() {
+        let mut c = cfg();
+        c.apply_profile(RiskProfile::Balanced);
+        c.target_weight.mode = WeightMode::Linear;
+        // 阈值 45 两侧
+        let lo = c.target_weight_for(44.9);
+        let hi = c.target_weight_for(45.1);
+        assert!((lo - hi).abs() < 0.5, "阈值处应连续: {} vs {}", lo, hi);
+        // 两端截断后的档位值（已含 core 0.6 收缩）
+        assert!((c.target_weight_for(10.0) - 94.0).abs() < 1e-9);
+        assert!((c.target_weight_for(90.0) - 74.0).abs() < 1e-9);
+        // 中段落在恐慌/中性两档之间
+        let mid = c.target_weight_for(50.0);
+        assert!(mid < 90.0 && mid > 84.0, "50 分应落在恐慌/中性之间: {}", mid);
+    }
+
+    #[test]
+    fn 线性插值在39_9与40_1之间连续() {
+        let mut c = cfg();
+        c.thresholds.extreme_fear = 40.0;
+        c.thresholds.fear = 50.0;
+        c.apply_profile(RiskProfile::Balanced);
+        c.target_weight.mode = WeightMode::Linear;
+        let lo = c.target_weight_for(39.9);
+        let hi = c.target_weight_for(40.1);
+        assert!((lo - hi).abs() < 0.5, "39.9 vs 40.1 应连续: {} vs {}", lo, hi);
+    }
+
+    #[test]
+    fn 旧配置缺少新字段仍可加载() {
         let old = r#"
 [settings]
 annualized_target_low = 10.0
@@ -726,5 +1006,9 @@ fear_greed_url = "https://example.com"
         assert_eq!(c.rebalance.signal_smooth_days, 7, "旧配置回落到默认平滑窗口");
         assert_eq!(c.rebalance.zone_confirm_days, 3, "旧配置回落到默认确认天数");
         assert_eq!(c.rebalance.decision_weekday, 5, "旧配置回落到默认决策日(周五)");
+        assert_eq!(c.target_weight.mode, WeightMode::Step, "旧配置回落到阶梯模式");
+        assert!(c.profile.core_blend.abs() < 1e-9, "旧配置缺字段应等价旧行为");
+        assert_eq!(c.profile.name, "custom");
+        assert_eq!(c.profile_label(), "自定义");
     }
 }
