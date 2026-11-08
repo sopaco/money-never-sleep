@@ -97,6 +97,12 @@ report` 和默认回测引擎没有任何效果）；若只想对比"旧框架"�
 
 运行后输出对比表（年化收益、总收益率、最大回撤、买卖次数），关注：
 
+0. **实盘信号处理**（`src/signal.rs`，2026-11 起）：`mns report` 的决策分数不再是当日原始恐贪
+   值，而是 `[rebalance]` 下三个参数驱动：`signal_smooth_days`（7 日均值平滑）、`zone_confirm_days`
+   （区间切换需连续 N 天确认，防 whipsaw）、`decision_weekday`（0=每天，1-7=周一..周日，默认 5=周
+   五，非决策日 `mns report` 出观察版、`--decide` 强制决策版）。对照回测里 `smooth_months` 1→3→6
+   的对比行（XIRR 8.57%→9.79%→9.91%，交易 14.8→10.2 次/年）可见平滑降噪方向是对的。
+
 1. **vs 买入持有**：策略年化是否接近基准——历史区间内通常是**跑输**买入持有的，工具的价值主张仅在
    Calmar（风险调整后）成立，且该优势在 `mns backtest validate` 的样本外验证里并不稳健，务必一并看
    walk-forward、bootstrap、holdout 三段输出，不要只看 `mns backtest` 默认展示的样本内数字

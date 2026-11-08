@@ -63,6 +63,23 @@ isn't available, so "bear-market protection" remains an under-tested claim. Run 
 validate` yourself to reproduce every number above — don't rely only on the in-sample
 trend-anchor numbers `mns backtest` shows by default.
 
+### 🌊 Daily Signal Smoothing (noise reduction for long-term investors)
+
+A daily Fear & Greed score is weekly-frequency noise driving a monthly-to-yearly portfolio.
+The live decision path therefore applies three filters (see `src/signal.rs`, configured under
+`[rebalance]` in `~/.mns/config.toml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `signal_smooth_days` | `7` | Decision score = mean of the last N daily scores (raw score is display-only) |
+| `zone_confirm_days` | `3` | A zone switch takes effect only after the smoothed score holds the new zone for N consecutive days; otherwise the previous zone stays |
+| `decision_weekday` | `5` | `mns report` outputs a full "decision report" only on that weekday (1=Mon…7=Sun, 0=daily); other days output an observation-only report; `mns report --decide` forces a decision report |
+
+In-sample comparison (monthly backtest, `mns backtest` comparison table): smoothing window 1 → 3 → 6 months
+changes XIRR 8.57% → 9.79% → 9.91%, Sharpe 0.87 → 1.01 → 1.09, trades/year 14.8 → 10.2 → 6.4 —
+longer smoothing means fewer trades and better risk-adjusted numbers. Daily snapshots are stored
+locally (`fear_greed_snapshots` in SQLite), so smoothing works offline and survives CNN API changes.
+
 ### 🔄 Buy/Sell Awareness
 Cash recovered from selling automatically counts toward buying budget, calculate sell first then buy, maximizing capital utilization.
 
@@ -114,7 +131,8 @@ mns cash set 100000
 mns add QQQ "Nasdaq 100" us_stocks
 mns buy QQQ 50 380.00
 mns update-prices
-mns report          # Generate today's action suggestions
+mns report          # Decision report on config'd weekday, otherwise observation-only
+mns report --decide # Force a decision report on any day
 mns backtest          # Compare 4 strategies (same data & cost model)
 mns backtest validate # Out-of-sample validation + bootstrap + holdout
 ```

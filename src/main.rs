@@ -8,6 +8,7 @@ mod models;
 mod quote;
 mod report;
 mod sentiment;
+mod signal;
 mod strategy;
 
 use anyhow::{Context, Result};
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
         Commands::Price { code, price } => cmd_price(&code, price)?,
         Commands::Remove { code } => cmd_remove(&code)?,
         Commands::Sentiment => cmd_sentiment().await?,
-        Commands::Report => cmd_report().await?,
+        Commands::Report { decide } => cmd_report(decide).await?,
         Commands::History { limit } => cmd_history(limit)?,
         Commands::Backtest { action } => match action {
             None => cmd_backtest(None, None)?,
@@ -345,7 +346,7 @@ async fn cmd_sentiment() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_report() -> Result<()> {
+async fn cmd_report(force_decide: bool) -> Result<()> {
     let config = AppConfig::load()?;
     let db = db::Database::open()?;
 
@@ -354,44 +355,73 @@ async fn cmd_report() -> Result<()> {
     // 使用配置的 API URL
     let url = &config.api.fear_greed_url;
     let data = sentiment::fetch_fear_greed_data(url).await?;
-    let score_f64 = data.score as f64;
-    let zone = config.sentiment_zone(score_f64);
+    let today_score = data.score as f64;
+    let today_zone = config.sentiment_zone(today_score);
 
-    // 保存快照（含历史数据）
+    // 保存快照（含历史数据）——先落库，再从本地表读历史做平滑
     db.save_fear_greed_snapshot(
-        score_f64,
-        zone,
+        today_score,
+        today_zone,
         data.previous_close,
         data.previous_1_week,
         data.previous_1_month,
         data.previous_1_year,
     )?;
 
-    println!("恐贪指数: {} ({})", data.score, zone);
+    // 决策信号：平滑 + 区间确认 + 决策日过滤（详见 src/signal.rs）；
+    // 当日原始值仅展示，不驱动仓位，避免周级噪声引起操作干扰
+    let today = chrono::Local::now().date_naive();
+    let history = db.recent_fear_greed_scores(90)?;
+    let signal = signal::compute(&config, today_score, &history, today);
+
+    println!(
+        "恐贪指数: {} ({}) | 决策分数: {} ({})",
+        data.score, today_zone, signal.effective_score, signal.effective_zone
+    );
+    println!("信号说明: {}", signal.note);
+    println!("今日报告类型: {} 平滑 (样本 {}/{})", signal.report_kind, signal.samples_used, config.rebalance.signal_smooth_days);
 
     let cash = db.get_cash_balance()?;
     let positions = db.list_positions()?;
+    let decide_today = signal.decision_day || force_decide;
 
-    // 策略计算：目标仓位 + 偏离带（与回测引擎同源）
-    let today = chrono::Local::now().date_naive();
-    let risk_warnings = strategy::check_risk_warnings(&config, score_f64, &positions);
-    let plan =
-        strategy::calculate_rebalance_plan(&config, score_f64, cash, &positions, today);
+    let report = if decide_today {
+        // 策略计算：目标仓位 + 偏离带（与回测引擎同源），用决策分数而非当日值
+        let decide_note = if force_decide && !signal.decision_day {
+            format!("{}（--decide 强制决策）", signal.note)
+        } else {
+            signal.note.clone()
+        };
+        let risk_warnings =
+            strategy::check_risk_warnings(&config, signal.effective_score, &positions);
+        let plan = strategy::calculate_rebalance_plan(
+            &config,
+            signal.effective_score,
+            cash,
+            &positions,
+            today,
+        );
 
-    // 生成报告
-    let report = report::generate_report(
-        &config,
-        score_f64,
-        zone,
-        data.previous_close,
-        data.previous_1_week,
-        data.previous_1_month,
-        data.previous_1_year,
-        cash,
-        &positions,
-        &plan,
-        &risk_warnings,
-    )?;
+        report::generate_report(
+            &config,
+            signal.effective_score,
+            &signal.effective_zone,
+            signal.raw_score,
+            &signal.raw_zone,
+            &decide_note,
+            data.previous_close,
+            data.previous_1_week,
+            data.previous_1_month,
+            data.previous_1_year,
+            cash,
+            &positions,
+            &plan,
+            &risk_warnings,
+        )?
+    } else {
+        // 非决策日：只出观察报告，不给买卖建议
+        report::generate_observation_report(&config, &signal, cash, &positions)?
+    };
 
     let filepath = report::save_report(&config, &report)?;
     println!("{}", report);

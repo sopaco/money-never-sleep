@@ -63,6 +63,18 @@ pub struct Rebalance {
     pub min_trade_amount: f64,
     /// 卖出最短持有天数：早于此天数不建议卖出，用于规避惩罚性赎回费
     pub min_holding_days_for_sell: i64,
+    /// 决策信号平滑窗口（天）：报告的决策分数 = 最近 N 天恐贪值均值，
+    /// 而非当日值。1 = 不平滑（旧行为）。见 `src/signal.rs`。
+    #[serde(default = "Rebalance::default_smooth_days")]
+    pub signal_smooth_days: u32,
+    /// 区间切换确认天数：平滑值需连续 N 天处于新区间才生效，
+    /// 未确认时沿用旧区间（防 whipsaw）。1 = 不确认。
+    #[serde(default = "Rebalance::default_zone_confirm_days")]
+    pub zone_confirm_days: u32,
+    /// 决策日（每周出决策版报告的日子）：0 = 每天决策；1..=7 = 周一..周日。
+    /// 非决策日 `mns report` 只出观察版，不产生买卖建议。
+    #[serde(default = "Rebalance::default_decision_weekday")]
+    pub decision_weekday: u32,
 }
 
 impl Default for Rebalance {
@@ -71,7 +83,23 @@ impl Default for Rebalance {
             band_pp: 4.0,
             min_trade_amount: 500.0,
             min_holding_days_for_sell: 30,
+            signal_smooth_days: Self::default_smooth_days(),
+            zone_confirm_days: Self::default_zone_confirm_days(),
+            decision_weekday: Self::default_decision_weekday(),
         }
+    }
+}
+
+impl Rebalance {
+    fn default_smooth_days() -> u32 {
+        7
+    }
+    fn default_zone_confirm_days() -> u32 {
+        3
+    }
+    /// 0 = 每天决策；5 = 每周五
+    fn default_decision_weekday() -> u32 {
+        5
     }
 }
 
@@ -310,6 +338,24 @@ impl AppConfig {
         if self.rebalance.band_pp < 0.0 {
             anyhow::bail!("rebalance.band_pp 不能为负: {}", self.rebalance.band_pp);
         }
+        if self.rebalance.signal_smooth_days > 60 {
+            anyhow::bail!(
+                "rebalance.signal_smooth_days 过大（>60 天平滑已无意义）: {}",
+                self.rebalance.signal_smooth_days
+            );
+        }
+        if self.rebalance.zone_confirm_days == 0 || self.rebalance.zone_confirm_days > 30 {
+            anyhow::bail!(
+                "rebalance.zone_confirm_days 应在 1-30 之间: {}",
+                self.rebalance.zone_confirm_days
+            );
+        }
+        if self.rebalance.decision_weekday > 7 {
+            anyhow::bail!(
+                "rebalance.decision_weekday 应为 0(每天) 或 1-7(周一..周日): {}",
+                self.rebalance.decision_weekday
+            );
+        }
         if self.costs.cash_annual_yield < 0.0 {
             anyhow::bail!(
                 "costs.cash_annual_yield 不能为负: {}",
@@ -483,6 +529,9 @@ impl AppConfig {
             "rebalance.min_holding_days_for_sell" => {
                 Some(self.rebalance.min_holding_days_for_sell.to_string())
             }
+            "rebalance.signal_smooth_days" => Some(self.rebalance.signal_smooth_days.to_string()),
+            "rebalance.zone_confirm_days" => Some(self.rebalance.zone_confirm_days.to_string()),
+            "rebalance.decision_weekday" => Some(self.rebalance.decision_weekday.to_string()),
             "costs.buy_fee_pct" => Some(self.costs.buy_fee_pct.to_string()),
             "costs.sell_fee_pct" => Some(self.costs.sell_fee_pct.to_string()),
             "costs.cash_annual_yield" => Some(self.costs.cash_annual_yield.to_string()),
@@ -540,8 +589,11 @@ impl AppConfig {
             "rebalance.band_pp" => self.rebalance.band_pp = value.parse()?,
             "rebalance.min_trade_amount" => self.rebalance.min_trade_amount = value.parse()?,
             "rebalance.min_holding_days_for_sell" => {
-                self.rebalance.min_holding_days_for_sell = value.parse()?
+                self.rebalance.min_holding_days_for_sell = value.parse()?;
             }
+            "rebalance.signal_smooth_days" => self.rebalance.signal_smooth_days = value.parse()?,
+            "rebalance.zone_confirm_days" => self.rebalance.zone_confirm_days = value.parse()?,
+            "rebalance.decision_weekday" => self.rebalance.decision_weekday = value.parse()?,
             "costs.buy_fee_pct" => self.costs.buy_fee_pct = value.parse()?,
             "costs.sell_fee_pct" => self.costs.sell_fee_pct = value.parse()?,
             "costs.cash_annual_yield" => self.costs.cash_annual_yield = value.parse()?,
@@ -671,5 +723,8 @@ fear_greed_url = "https://example.com"
         assert!(c.validate().is_ok());
         assert_eq!(c.target_weight.neutral, 60.0, "应回落到默认曲线");
         assert_eq!(c.costs.cash_annual_yield, 2.0);
+        assert_eq!(c.rebalance.signal_smooth_days, 7, "旧配置回落到默认平滑窗口");
+        assert_eq!(c.rebalance.zone_confirm_days, 3, "旧配置回落到默认确认天数");
+        assert_eq!(c.rebalance.decision_weekday, 5, "旧配置回落到默认决策日(周五)");
     }
 }

@@ -326,6 +326,35 @@ impl Database {
         Ok(txs)
     }
 
+    /// 读取最近 `days` 天的恐贪快照 (日期, 分数)，按日期**升序**。
+    ///
+    /// 供 `signal::compute` 做平滑与区间确认；同一天只保留最新一条
+    /// （写入端已按天 upsert）。
+    pub fn recent_fear_greed_scores(&self, days: i64) -> Result<Vec<(chrono::NaiveDate, f64)>> {
+        let cutoff = (Local::now().date_naive() - chrono::Duration::days(days.max(1)))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT snapshot_date, score FROM fear_greed_snapshots
+             WHERE snapshot_date > ? ORDER BY snapshot_date ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                let date_str: String = row.get(0)?;
+                let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                        0, rusqlite::types::Type::Text, Box::new(e),
+                    ))?;
+                let score: f64 = row.get(1)?;
+                Ok((date, score))
+            })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     // ── Fear & Greed Snapshots ────────────────────
 
     pub fn save_fear_greed_snapshot(
