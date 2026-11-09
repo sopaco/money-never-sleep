@@ -523,7 +523,7 @@ pub fn load_snapshot() -> Result<Snapshot> {
         min_holding_days: config.settings.min_holding_days,
         cash_annual_yield: config.costs.cash_annual_yield,
         buy_fee_pct: config.costs.buy_fee_pct,
-        report_dir: config.settings.report_output_dir.clone(),
+        report_dir: config.report_dir().display().to_string(),
         db_path: AppConfig::db_path()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
@@ -823,7 +823,8 @@ pub fn has_snapshot_today() -> Result<bool> {
 /// "打开今天已生成的报告" instead of regenerating it.
 pub fn today_report_path() -> Option<std::path::PathBuf> {
     let config = AppConfig::load().ok()?;
-    let path = std::path::Path::new(&config.settings.report_output_dir)
+    let path = config
+        .report_dir()
         .join(format!("{}.txt", Local::now().format("%Y-%m-%d")));
     path.exists().then_some(path)
 }

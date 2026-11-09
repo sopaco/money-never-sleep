@@ -123,13 +123,13 @@ fn cmd_init(force: bool) -> Result<()> {
     drop(db);
 
     // 创建报告输出目录
-    let report_dir = &config.settings.report_output_dir;
-    std::fs::create_dir_all(report_dir)?;
+    let report_dir = config.report_dir();
+    std::fs::create_dir_all(&report_dir)?;
 
     println!("✓ 初始化完成");
     println!("  配置文件: {}", config_path.display());
     println!("  数据库:   {}", db_path.display());
-    println!("  报告目录: {}", report_dir);
+    println!("  报告目录: {}", report_dir.display());
     println!(
         "  风险档位: {}（中性目标 {:.0}%，用 `mns config profile <none|steady|balanced|aggressive>` 切换）",
         config.profile_label(),

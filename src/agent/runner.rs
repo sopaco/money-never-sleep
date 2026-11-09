@@ -29,8 +29,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::{
-    AgentCommand, AgentEvent, AgentHandle, AgentSettings, EntryKind, PermissionChoice,
-    PermissionPolicy, PermissionPrompt, RunState, TimelineEntry, detect_agent_cli, settings_dir,
+    AgentCommand, AgentEvent, AgentHandle, AgentSettings, DecisionReport, EntryKind,
+    PermissionChoice, PermissionPolicy, PermissionPrompt, RunState, TimelineEntry,
+    detect_agent_cli,
 };
 
 type EventTx = UnboundedSender<AgentEvent>;
@@ -61,6 +62,9 @@ type Shared = Arc<Mutex<SessionShared>>;
 struct SessionHandle {
     shared: Shared,
     stop: Option<oneshot::Sender<()>>,
+    /// Follow-up prompts for the live ACP session. Dropping it ends the turn
+    /// loop; the connection then closes and the child process exits.
+    ask: Option<mpsc::UnboundedSender<String>>,
     task: JoinHandle<()>,
 }
 
@@ -90,7 +94,7 @@ pub(crate) fn start_runtime_impl() -> (AgentHandle, UnboundedReceiver<AgentEvent
 
                 while let Some(command) = command_rx.recv().await {
                     match command {
-                        AgentCommand::Start { goal, settings } => {
+                        AgentCommand::Start { goal, settings, .. } => {
                             if session.as_ref().is_some_and(|s| !s.task.is_finished()) {
                                 emit_entry(
                                     &event_tx,
@@ -101,16 +105,46 @@ pub(crate) fn start_runtime_impl() -> (AgentHandle, UnboundedReceiver<AgentEvent
                             }
                             let shared: Shared = Arc::new(Mutex::new(SessionShared::default()));
                             let (stop_tx, stop_rx) = oneshot::channel();
+                            let (ask_tx, ask_rx) = mpsc::unbounded_channel::<String>();
                             let events = event_tx.clone();
                             let task_shared = shared.clone();
                             let task = tokio::spawn(async move {
-                                run_session(goal, settings, events, task_shared, stop_rx).await;
+                                run_session(
+                                    goal, settings, events, task_shared, stop_rx, ask_rx,
+                                )
+                                .await;
                             });
                             session = Some(SessionHandle {
                                 shared,
                                 stop: Some(stop_tx),
+                                ask: Some(ask_tx),
                                 task,
                             });
+                        }
+                        AgentCommand::Ask { text } => {
+                            let Some(active) = session.as_ref() else {
+                                emit_entry(
+                                    &event_tx,
+                                    EntryKind::Error,
+                                    "当前没有会话，请先开始一个任务，再追问。",
+                                );
+                                continue;
+                            };
+                            if active.task.is_finished() {
+                                emit_entry(
+                                    &event_tx,
+                                    EntryKind::Error,
+                                    "上一个会话已结束，请重新开始一个任务。",
+                                );
+                                continue;
+                            }
+                            let delivered = active
+                                .ask
+                                .as_ref()
+                                .is_some_and(|ask| ask.send(text).is_ok());
+                            if !delivered {
+                                emit_entry(&event_tx, EntryKind::Error, "追问未能送达 Agent。");
+                            }
                         }
                         AgentCommand::Stop => {
                             if let Some(active) = session.as_mut() {
@@ -205,7 +239,7 @@ fn emit_entry(events: &EventTx, kind: EntryKind, text: impl Into<String>) {
 /// this GUI should call one known path, not search the filesystem. The
 /// installed-bundle fallback covers `cargo run`, where the GUI lives under
 /// `target/debug` and may not have a sibling CLI.
-fn cli_path() -> Option<PathBuf> {
+pub(crate) fn cli_path() -> Option<PathBuf> {
     let name = if cfg!(windows) { "mns.exe" } else { "mns" };
 
     if let Some(from_env) = std::env::var_os("MNS_BIN") {
@@ -299,11 +333,17 @@ fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig
 
 fn resolve_cwd(settings: &AgentSettings) -> PathBuf {
     let trimmed = settings.working_dir.trim();
-    if trimmed.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| settings_dir())
+    let cwd = if trimmed.is_empty() {
+        // 固定工作区，而不是 `std::env::current_dir()`。GUI 从 Finder 启动时
+        // cwd 是只读的 `/`，沿用它会让 agent 的每次写文件都报 os error 30。
+        crate::config::app_data_dir()
+            .join("agent")
+            .join("workspace")
     } else {
         PathBuf::from(trimmed)
-    }
+    };
+    let _ = std::fs::create_dir_all(&cwd);
+    cwd
 }
 
 /// Inject the autonomy contract into the single prompt. This is what keeps the
@@ -340,11 +380,39 @@ fn compose_goal(goal: &str, cwd: &Path, cli: Option<&Path>) -> String {
          - 工作目录：{cwd}\n\
          {cli_rule}\n\
          - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
+         - 工作目录可写，但不要另建记录或存档文件：最终结论只通过回答里的 mns-decision 块回传，由 MNS 统一保存与展示。\n\
          - 模型、推理端点与凭据由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
          MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
          - 完成后用中文输出：已完成事项、涉及的文件或命令、以及未完成或有风险的事项。",
         cwd = cwd.display()
     )
+}
+
+/// Pull the last ```mns-decision block out of an assistant message.
+///
+/// Fenced blocks are the only channel the agent has back to MNS. Requiring a
+/// labelled fence — rather than "any JSON in the prose" — keeps ordinary
+/// examples and tool output from being mistaken for a conclusion.
+fn extract_decision(text: &str) -> Option<DecisionReport> {
+    const FENCE: &str = "```mns-decision";
+    let mut found = None;
+    let mut rest = text;
+    while let Some(start) = rest.find(FENCE) {
+        let after = &rest[start + FENCE.len()..];
+        let after = after.trim_start_matches(['\r', '\n']);
+        let Some(end) = after.find("```") else {
+            break;
+        };
+        let body = after[..end].trim();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            found = Some(DecisionReport {
+                raw: body.to_owned(),
+                value,
+            });
+        }
+        rest = &after[end + 3..];
+    }
+    found
 }
 
 async fn run_session(
@@ -353,6 +421,7 @@ async fn run_session(
     events: EventTx,
     shared: Shared,
     mut stop_rx: oneshot::Receiver<()>,
+    ask_rx: mpsc::UnboundedReceiver<String>,
 ) {
     emit_state(&events, RunState::Starting, "正在启动外部 Agent…");
 
@@ -400,11 +469,24 @@ async fn run_session(
     let shared_for_foreground = shared.clone();
     let policy = settings.permission_policy;
     let mut translator = TimelineTranslator::default();
+    // The structured conclusion lives in the assistant's prose, so the whole
+    // message stream is accumulated per turn and parsed when the turn ends.
+    // Tool output and thinking are deliberately excluded: a `mns-decision`
+    // block echoed inside a tool result must not be mistaken for the answer.
+    let message_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let buffer_for_updates = message_buffer.clone();
 
     let connection_future = Client
         .v1()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update {
+                    if let ContentBlock::Text(text) = &chunk.content {
+                        if let Ok(mut guard) = buffer_for_updates.lock() {
+                            guard.push_str(&text.text);
+                        }
+                    }
+                }
                 for event in translator.translate(notification.update) {
                     let _ = events_for_updates.send(event);
                 }
@@ -450,40 +532,76 @@ async fn run_session(
                     .unwrap_or_else(|e| e.into_inner());
                 guard.session_id = Some(session_id.clone());
             }
-            emit_state(
-                &events_for_foreground,
-                RunState::Running,
-                "Agent 正在自主执行目标…",
-            );
+            let mut queue: Vec<String> = vec![prompt_text];
+            // The closure owns the receiver; binding it `mut` here is what
+            // allows the loop to wait for a follow-up after a turn ends.
+            let mut ask_rx = ask_rx;
 
-            let response = connection
-                .send_request(PromptRequest::new(
-                    session_id,
-                    vec![ContentBlock::Text(TextContent::new(prompt_text))],
-                ))
-                .block_task()
-                .await?;
+            loop {
+                let text = match queue.pop() {
+                    Some(text) => text,
+                    None => match ask_rx.recv().await {
+                        Some(text) => text,
+                        None => break,
+                    },
+                };
 
-            let reason = format!("{:?}", response.stop_reason);
-            let cancelled = matches!(
-                response.stop_reason,
-                agent_client_protocol::v1::schema::StopReason::Cancelled
-            );
-            emit_state(
-                &events_for_foreground,
+                if let Ok(mut guard) = message_buffer.lock() {
+                    guard.clear();
+                }
+                emit_state(
+                    &events_for_foreground,
+                    RunState::Running,
+                    "Agent 正在分析…",
+                );
+
+                let response = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new(text))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let reason = format!("{:?}", response.stop_reason);
+
+                // One turn can contain several blocks; the last valid one wins,
+                // which lets the agent revise its own conclusion while answering.
+                if let Some(report) = message_buffer
+                    .lock()
+                    .ok()
+                    .and_then(|guard| extract_decision(&guard))
+                {
+                    let _ = events_for_foreground.send(AgentEvent::Decision(report));
+                }
+
+                let cancelled = matches!(
+                    response.stop_reason,
+                    agent_client_protocol::v1::schema::StopReason::Cancelled
+                );
+                emit_state(
+                    &events_for_foreground,
+                    if cancelled {
+                        RunState::Cancelled
+                    } else {
+                        RunState::Finished
+                    },
+                    if cancelled {
+                        "本轮已取消"
+                    } else {
+                        "本轮结束，可以继续追问"
+                    },
+                );
+                let _ = events_for_foreground.send(AgentEvent::TurnFinished {
+                    stop_reason: reason,
+                });
                 if cancelled {
-                    RunState::Cancelled
-                } else {
-                    RunState::Finished
-                },
-                if cancelled {
-                    "任务已取消"
-                } else {
-                    "本轮执行结束"
-                },
-            );
+                    break;
+                }
+            }
+
             let _ = events_for_foreground.send(AgentEvent::Finished {
-                stop_reason: reason,
+                stop_reason: "会话结束".to_owned(),
             });
             Ok::<(), agent_client_protocol::Error>(())
         });
@@ -1060,6 +1178,8 @@ mod tests {
         assert!(prompt.contains("MNS 不提供 URL 或 API Key"));
         assert!(prompt.contains("/work"));
         assert!(prompt.contains("不要执行下单、交易"));
+        assert!(prompt.contains("工作目录可写"));
+        assert!(prompt.contains("mns-decision"));
     }
 
     #[test]
@@ -1241,6 +1361,33 @@ mod tests {
     }
 
     #[test]
+    fn decision_block_is_parsed_out_of_prose() {
+        let text = "分析如下：现金够用。\n\n```mns-decision\n{\"verdict\":\"hold\",\"headline\":\"今天不操作\"}\n```\n";
+        let report = extract_decision(text).expect("the fenced block must parse");
+        assert_eq!(report.verdict(), "hold");
+        assert_eq!(report.headline(), "今天不操作");
+    }
+
+    #[test]
+    fn an_unlabelled_or_invalid_block_is_ignored() {
+        assert!(extract_decision("没有任何代码块").is_none());
+        assert!(
+            extract_decision("```json\n{\"verdict\":\"hold\"}\n```").is_none(),
+            "only a mns-decision fence is a conclusion"
+        );
+        assert!(
+            extract_decision("```mns-decision\n{不是合法 JSON}\n```").is_none(),
+            "malformed JSON must not become a card"
+        );
+    }
+
+    #[test]
+    fn the_last_valid_decision_wins() {
+        let text = "```mns-decision\n{\"verdict\":\"wait\"}\n```\n修正：\n```mns-decision\n{\"verdict\":\"hold\"}\n```";
+        assert_eq!(extract_decision(text).unwrap().verdict(), "hold");
+    }
+
+    #[test]
     fn configured_working_dir_wins_over_the_launch_directory() {
         let settings = AgentSettings {
             working_dir: "/tmp/mns-agent-work".to_owned(),
@@ -1250,5 +1397,16 @@ mod tests {
             resolve_cwd(&settings),
             std::path::PathBuf::from("/tmp/mns-agent-work")
         );
+    }
+
+    #[test]
+    fn default_workspace_sits_in_writable_app_data() {
+        let cwd = resolve_cwd(&AgentSettings::default());
+        assert_eq!(
+            cwd,
+            crate::config::app_data_dir().join("agent").join("workspace")
+        );
+        assert!(cwd.is_dir(), "workspace must exist for the agent to write into");
+        assert_ne!(cwd, std::path::PathBuf::from("/"));
     }
 }

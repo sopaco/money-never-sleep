@@ -2,7 +2,6 @@ use anyhow::Result;
 use chrono::{Datelike, Local};
 use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use std::fs;
-use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -780,10 +779,12 @@ pub fn generate_observation_report(
 pub fn save_report(config: &AppConfig, content: &str) -> Result<String> {
     let now = Local::now();
     let date_str = now.format("%Y-%m-%d").to_string();
-    let output_dir = &config.settings.report_output_dir;
-    fs::create_dir_all(output_dir)?;
+    // 配置里的 `./reports` 必须解析成应用数据目录下的绝对路径。直接用原始
+    // 值会落到进程 cwd；GUI 从 Finder 启动时 cwd 是只读的 `/`，写入即失败。
+    let output_dir = config.report_dir();
+    fs::create_dir_all(&output_dir)?;
 
-    let filepath = Path::new(output_dir).join(format!("{}.txt", date_str));
+    let filepath = output_dir.join(format!("{}.txt", date_str));
     // 同日多次运行：追加而非覆盖。"先留档再决策"要求每次运行的快照都
     // 可回溯——如同日切换档位后重跑，两份报告应能对照（此前 fs::write
     // 会静默销毁更早的版本）。

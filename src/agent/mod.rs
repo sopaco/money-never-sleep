@@ -16,6 +16,9 @@
 //! can still gate sensitive actions, resolve permissions and stop at any time.
 
 mod runner;
+pub mod routine;
+
+pub(crate) use runner::cli_path;
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -70,6 +73,10 @@ pub struct AgentSettings {
     /// Session working directory. Empty means the launch directory.
     pub working_dir: String,
     pub permission_policy: PermissionPolicy,
+    /// Run the daily review unattended.
+    pub daily_review: bool,
+    /// Local time of the daily review, `HH:MM`.
+    pub daily_review_time: String,
 }
 
 impl Default for AgentSettings {
@@ -79,7 +86,52 @@ impl Default for AgentSettings {
             extra_args: Vec::new(),
             working_dir: String::new(),
             permission_policy: PermissionPolicy::Autonomous,
+            daily_review: false,
+            daily_review_time: "08:30".to_owned(),
         }
+    }
+}
+
+/// Where a turn came from. The daily review is not a user message: the UI shows
+/// it as a scheduled run, and the prompt is assembled by MNS rather than typed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GoalSource {
+    #[default]
+    Manual,
+    DailyReview,
+}
+
+/// A structured conclusion returned by the agent inside a ```mns-decision
+/// block.
+///
+/// This is the whole mns ↔ agent handshake: MNS owns storage and rendering, the
+/// agent owns judgement. The agent never writes a file — it returns JSON, the
+/// shell validates and persists it. `value` is kept untyped so an older GUI
+/// still stores a newer agent's extra fields instead of rejecting the run.
+#[derive(Clone, Debug)]
+pub struct DecisionReport {
+    pub raw: String,
+    pub value: serde_json::Value,
+}
+
+impl DecisionReport {
+    /// One-line headline for the collapsed card. Missing or non-string fields
+    /// fall back rather than hiding the whole report.
+    pub fn headline(&self) -> String {
+        self.value
+            .get("headline")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("本轮未给出结论摘要")
+            .to_owned()
+    }
+
+    pub fn verdict(&self) -> &str {
+        self.value
+            .get("verdict")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
     }
 }
 
@@ -113,6 +165,9 @@ impl RunState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
+    /// Something the user asked. Rendered as the user's own bubble, not as a
+    /// trace row, so a session reads as a conversation.
+    User,
     System,
     Thought,
     Message,
@@ -126,6 +181,7 @@ pub enum EntryKind {
 impl EntryKind {
     pub fn label(self) -> &'static str {
         match self {
+            EntryKind::User => "你",
             EntryKind::System => "系统",
             EntryKind::Thought => "思考",
             EntryKind::Message => "输出",
@@ -186,6 +242,13 @@ pub enum AgentEvent {
     PermissionResolved {
         id: u64,
     },
+    /// One prompt finished. The session stays open, so the user can follow up.
+    TurnFinished {
+        stop_reason: String,
+    },
+    /// A ```mns-decision block parsed out of the finished turn.
+    Decision(DecisionReport),
+    /// The session itself ended; a follow-up needs a new run.
     Finished {
         stop_reason: String,
     },
@@ -200,6 +263,12 @@ pub enum AgentCommand {
     Start {
         goal: String,
         settings: AgentSettings,
+        source: GoalSource,
+    },
+    /// A follow-up question in the running session. Reuses the same ACP
+    /// session so the agent keeps its plan, tool history and context.
+    Ask {
+        text: String,
     },
     Stop,
     Grant {
@@ -227,10 +296,9 @@ impl AgentHandle {
 }
 
 /// GUI settings live beside the existing `~/.mns/config.toml` and `mns.db`.
+/// Reuse the single application data root rather than repeating the path.
 pub fn settings_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mns")
+    crate::config::app_data_dir()
 }
 
 pub fn settings_path() -> PathBuf {
@@ -322,6 +390,7 @@ mod tests {
             extra_args: vec!["--log-level".to_owned(), "warn".to_owned()],
             working_dir: "/tmp/mns-work".to_owned(),
             permission_policy: PermissionPolicy::GuardWrites,
+            ..AgentSettings::default()
         };
         let encoded = toml::to_string_pretty(&settings).unwrap();
         assert!(!encoded.to_lowercase().contains("api_key"));

@@ -10,6 +10,7 @@
 - **Binary**: `target/release/mns.exe` (Windows) / `target/release/mns` (Linux/macOS)
 - **Installed CLI**: `/Applications/MNS.app/Contents/MacOS/mns` — the DMG ships the CLI inside the app bundle at the same version as the GUI. When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
+- **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/` and `agent/runs/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd.
 - **Stack**: Rust edition 2024, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
 
 ## Standard Workflow

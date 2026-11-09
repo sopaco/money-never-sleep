@@ -38,6 +38,16 @@ pub enum Request {
         shares: f64,
         price: f64,
     },
+    /// Produce the brief that opens a daily review. `refresh` maps to
+    /// `mns today`, otherwise `mns report` reuses the latest snapshot.
+    AgentBrief {
+        refresh: bool,
+    },
+    /// Persist a structured conclusion. The agent never writes files; the shell
+    /// owns storage, so an unwritable working directory cannot lose a run.
+    SaveDecision {
+        body: String,
+    },
 }
 
 pub enum Event {
@@ -46,6 +56,8 @@ pub enum Event {
     /// A write succeeded; the string is user-facing confirmation copy.
     Saved(String),
     Failed(String),
+    /// Report text for the agent prompt, produced by the CLI itself.
+    Brief(Result<String, String>),
 }
 
 #[derive(Clone)]
@@ -135,6 +147,21 @@ impl Jobs {
                             app::sell(&code, shares, price)
                                 .map(|()| format!("已记录卖出 {code} {shares:.2} 份")),
                         ),
+                        Request::AgentBrief { refresh } => {
+                            let _ = event_tx.send(Event::Brief(agent_brief(refresh)));
+                            let _ = event_tx.send(Event::Loaded(load()));
+                        }
+                        Request::SaveDecision { body } => match save_decision(&body) {
+                            Ok(path) => {
+                                let _ = event_tx.send(Event::Saved(format!(
+                                    "决策已存档：{}",
+                                    path.display()
+                                )));
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(Event::Failed(error));
+                            }
+                        },
                     }
                 }
             })
@@ -166,4 +193,55 @@ fn finish(events: &UnboundedSender<Event>, result: anyhow::Result<String>) {
 
 fn load() -> Result<Snapshot, String> {
     app::load_snapshot().map_err(|error| format!("{error:#}"))
+}
+
+/// Append-only archive of agent conclusions, one file per run.
+///
+/// Keeping the raw JSON (not a re-serialised struct) means a newer agent can add
+/// fields without this build silently dropping them.
+fn save_decision(body: &str) -> Result<std::path::PathBuf, String> {
+    let dir = crate::agent::settings_dir()
+        .join("agent")
+        .join("runs");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("无法创建存档目录：{error}"))?;
+    let name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(&path, body).map_err(|error| format!("无法写入决策存档：{error}"))?;
+    Ok(path)
+}
+
+/// Run the CLI for the report text that opens a review.
+///
+/// The shell deliberately does not re-implement report generation: the text the
+/// agent judges must be byte-identical to what the user sees in a terminal.
+fn agent_brief(refresh: bool) -> Result<String, String> {
+    let cli = crate::agent::cli_path().ok_or_else(|| {
+        "未找到 mns CLI：请安装 MNS.app，或设置 MNS_BIN 指向可执行文件".to_owned()
+    })?;
+
+    let args: &[&str] = if refresh {
+        &["today", "--quiet"]
+    } else {
+        &["report"]
+    };
+    let data_dir = crate::config::app_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let output = std::process::Command::new(&cli)
+        .args(args)
+        // 显式指定，不依赖父进程 cwd：GUI 可能从 Finder 启动。
+        .current_dir(&data_dir)
+        .output()
+        .map_err(|error| format!("无法运行 mns：{error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("mns {} 失败（退出码 {:?}）", args[0], output.status.code())
+        } else {
+            format!("mns {} 失败：{stderr}", args[0])
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

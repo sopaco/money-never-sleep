@@ -3,6 +3,45 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// MNS 应用数据目录：`~/.mns`（Windows 上是 `%USERPROFILE%\.mns`）。
+///
+/// 这是本项目的 AppData 等价物：配置、数据库、报告、Agent 工作区与存档
+/// 都落在同一个根下。刻意不换成 `~/Library/Application Support/MNS` 之类
+/// 的平台目录，是为了让既有账户数据和运行时产物保持单一根，避免一次
+/// 高风险的数据迁移。
+///
+/// 关键在于它**与进程当前工作目录无关**。从 Finder 启动的 app 其 cwd 是
+/// `/`（macOS 系统卷只读），任何相对写入都会以 `os error 30` 失败；而 CLI
+/// 从仓库根运行时同一个相对路径却恰好可用——这正是过去报告偶发失败的原因。
+pub fn app_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mns")
+}
+
+/// 解析配置中的路径：绝对值原样使用，相对值一律相对 `app_data_dir()`。
+///
+/// 旧配置里的 `"./reports"` 因此稳定落到 `~/.mns/reports`，CLI 从任何目录
+/// 运行、GUI 从 Finder 启动都得到同一个路径。配置文件无需迁移即可修复。
+pub fn resolve_data_path(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return app_data_dir();
+    }
+    if PathBuf::from(raw).is_absolute() {
+        return PathBuf::from(raw);
+    }
+    // 去掉开头的 "./" / ".\"，避免出现 `~/.mns/./reports` 这种噪声路径。
+    let cleaned = raw
+        .trim_start_matches("./")
+        .trim_start_matches(".\\")
+        .trim_start_matches('/');
+    if cleaned.is_empty() {
+        return app_data_dir();
+    }
+    app_data_dir().join(cleaned)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub settings: Settings,
@@ -499,6 +538,8 @@ pub struct Settings {
     pub annualized_target_high: f64,
     pub min_holding_days: i64,
     pub max_contrarian_weight: f64,
+    /// 报告输出目录。绝对值原样使用；相对值相对 `app_data_dir()` 解析，
+    /// 不随进程 cwd 变化（默认 `./reports` 实际写入 `~/.mns/reports`）。
     pub report_output_dir: String,
 }
 
@@ -549,7 +590,7 @@ impl AppConfig {
                 annualized_target_high: 15.0, // 年化15%在持仓表中绿色标记
                 min_holding_days: 45,          // 年化收益需至少持仓这么多天才显示
                 max_contrarian_weight: 2.0,    // 逆向加仓时单标的最大相对权重
-                report_output_dir: "./reports".to_string(),
+                report_output_dir: "./reports".to_string(), // 相对 app_data_dir()，见 resolve_data_path
             },
             allocation: Allocation {
                 us_stocks: 55.0,        // 降低美股占比
@@ -588,6 +629,12 @@ impl AppConfig {
 
     pub fn db_path() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("mns.db"))
+    }
+
+    /// 报告目录的绝对路径。所有报告读写入口都必须走这里，不要直接读
+    /// `settings.report_output_dir`——那是配置里的原始值，可能仍是 `./reports`。
+    pub fn report_dir(&self) -> PathBuf {
+        resolve_data_path(&self.settings.report_output_dir)
     }
 
     pub fn load() -> Result<Self> {
@@ -1025,6 +1072,37 @@ mod tests {
 
     fn cfg() -> AppConfig {
         AppConfig::default_config()
+    }
+
+    #[test]
+    fn 相对报告目录解析到应用数据目录() {
+        let mut config = cfg();
+        config.settings.report_output_dir = "./reports".to_owned();
+        assert_eq!(config.report_dir(), app_data_dir().join("reports"));
+        assert!(config.report_dir().is_absolute());
+        // 与 cwd 无关：从 Finder 启动时 cwd 是只读的 `/`。
+        assert_ne!(
+            config.report_dir(),
+            std::env::current_dir().unwrap().join("reports")
+        );
+    }
+
+    #[test]
+    fn 绝对报告目录保持原样() {
+        let mut config = cfg();
+        config.settings.report_output_dir = "/tmp/mns-custom-reports".to_owned();
+        assert_eq!(
+            config.report_dir(),
+            PathBuf::from("/tmp/mns-custom-reports")
+        );
+    }
+
+    #[test]
+    fn 路径解析处理常见前缀与空值() {
+        assert_eq!(resolve_data_path("reports"), app_data_dir().join("reports"));
+        assert_eq!(resolve_data_path(".\\reports"), app_data_dir().join("reports"));
+        assert_eq!(resolve_data_path("./reports/"), app_data_dir().join("reports/"));
+        assert_eq!(resolve_data_path(""), app_data_dir());
     }
 
     #[test]

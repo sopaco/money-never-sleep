@@ -11,6 +11,7 @@ mod mood;
 mod pages;
 mod theme;
 
+use chrono::Datelike;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::Disableable;
@@ -20,8 +21,9 @@ use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
 use crate::agent::{
-    AgentCommand, AgentEvent, AgentHandle, AgentSettings, EntryKind, PermissionPolicy,
-    PermissionPrompt, RunState, TimelineEntry, load_settings, save_settings, start_runtime,
+    AgentCommand, AgentEvent, AgentHandle, AgentSettings, DecisionReport, EntryKind, GoalSource,
+    PermissionPolicy, PermissionPrompt, RunState, TimelineEntry, load_settings, routine,
+    save_settings, start_runtime,
 };
 use crate::app::Snapshot;
 
@@ -35,12 +37,25 @@ actions!(
         ShowMainWindow,
         RunDefaultGoal,
         StopCurrentTask,
-        QuitApplication
+        QuitApplication,
+        CloseAgentPanel
     ]
 );
 
-const DEFAULT_GOAL: &str =
-    "检查当前账户状态与本地数据是否完整，说明今天是否需要操作；不要修改任何文件。";
+const DEFAULT_GOAL: &str = "今天需要操作吗？帮我看一眼持仓和市场风险。";
+
+/// Secondary surfaces on the assistant page. Both used to be inline cards
+/// below the conversation, which forced a second scroll region and pushed the
+/// composer off screen. One panel at a time keeps the page a single surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentPanel {
+    Trace,
+    Settings,
+}
+
+/// Feedback is transient, never a permanent layer over the content. A new
+/// message restarts this window; the id keeps an older timer from hiding it.
+const TOAST_DURATION: std::time::Duration = std::time::Duration::from_millis(2500);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum Page {
@@ -94,7 +109,7 @@ impl Page {
             Page::Portfolio => "每一笔持仓的成本、现值与配置位置",
             Page::Plan => "按情绪与偏离生成的定投分配",
             Page::Performance => "金额加权收益、回撤与资金流水",
-            Page::Agent => "提交目标，让外部 Agent 自主完成",
+            Page::Agent => "每天看一眼账户，有结论再找你",
             Page::Settings => "风险档位、定投金额与外部 Agent",
         }
     }
@@ -156,6 +171,9 @@ pub(crate) enum ToastTone {
 }
 
 pub(crate) struct Toast {
+    /// Monotonic sequence number. The dismissal task only clears the toast
+    /// that scheduled it, so a newer message is never hidden by an older one.
+    pub id: u64,
     pub text: String,
     pub tone: ToastTone,
 }
@@ -179,6 +197,11 @@ pub(crate) struct AgentState {
     pub pending: Option<PermissionPrompt>,
     pub error: Option<String>,
     pub started: bool,
+    /// Latest structured conclusion. Kept beside the timeline rather than in
+    /// it: the card is rendered from JSON, and the same run can revise it.
+    pub decision: Option<DecisionReport>,
+    /// ACP session is alive and a follow-up can be delivered.
+    pub open: bool,
 }
 
 impl AgentState {
@@ -198,6 +221,8 @@ impl AgentState {
             pending: restore.pending,
             error: restore.error,
             started: false,
+            decision: None,
+            open: false,
         }
     }
 
@@ -257,10 +282,28 @@ impl AgentState {
                     self.pending = None;
                 }
             }
+            AgentEvent::TurnFinished { stop_reason } => {
+                self.state = if self.state == RunState::Cancelled {
+                    RunState::Cancelled
+                } else {
+                    RunState::Finished
+                };
+                self.detail = if self.state == RunState::Cancelled {
+                    "已停止".to_owned()
+                } else {
+                    "本轮结束，可以继续追问".to_owned()
+                };
+                let _ = stop_reason;
+                self.pending = None;
+                self.open = self.state != RunState::Cancelled;
+            }
+            AgentEvent::Decision(report) => {
+                self.decision = Some(report);
+            }
             AgentEvent::Finished { stop_reason } => {
-                self.state = RunState::Finished;
-                self.detail = "本轮执行结束".to_owned();
-                self.push(EntryKind::System, format!("结束原因：{stop_reason}"));
+                self.open = false;
+                self.detail = "会话已结束".to_owned();
+                let _ = stop_reason;
                 self.pending = None;
             }
             AgentEvent::Failed { message } => {
@@ -269,6 +312,7 @@ impl AgentState {
                 self.error = Some(message.clone());
                 self.push(EntryKind::Error, message);
                 self.pending = None;
+                self.open = false;
             }
         }
     }
@@ -278,6 +322,44 @@ fn trim(timeline: &mut Vec<TimelineEntry>) {
     if timeline.len() > 400 {
         timeline.drain(..timeline.len() - 400);
     }
+}
+
+/// `HH:MM`, zero padded. The scheduler compares strings, so `9:5` would never
+/// fire — reject it here instead of silently accepting a time that cannot run.
+fn valid_clock_time(raw: &str) -> bool {
+    let mut parts = raw.split(':');
+    let (Some(hours), Some(minutes), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if hours.len() != 2 || minutes.len() != 2 {
+        return false;
+    }
+    matches!(
+        (hours.parse::<u32>(), minutes.parse::<u32>()),
+        (Ok(h), Ok(m)) if h < 24 && m < 60
+    )
+}
+
+/// Marker for the last scheduled review, stored next to the decision archive so
+/// a restart cannot trigger the same day twice.
+fn last_daily_path() -> std::path::PathBuf {
+    crate::agent::settings_dir()
+        .join("agent")
+        .join("last-review")
+}
+
+fn read_last_daily() -> Option<String> {
+    let text = std::fs::read_to_string(last_daily_path()).ok()?;
+    let text = text.trim().to_owned();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn write_last_daily(date: &str) {
+    let path = last_daily_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, date);
 }
 
 #[derive(Clone, Default)]
@@ -302,14 +384,31 @@ pub(crate) struct AppShell {
     pub(crate) loading: bool,
     pub(crate) refreshing: bool,
     pub(crate) toast: Option<Toast>,
+    /// Incremented for every message; see `Toast::id`.
+    toast_seq: u64,
     pub(crate) dialog: Option<Dialog>,
     pub(crate) agent: AgentState,
     pub(crate) agent_settings: AgentSettings,
     pub(crate) jobs: Jobs,
     pub(crate) goal: Entity<TextareaState>,
+    pub(crate) followup: Entity<TextareaState>,
     pub(crate) cli: Entity<InputState>,
     pub(crate) cwd: Entity<InputState>,
+    pub(crate) daily_time: Entity<InputState>,
     pub(crate) monthly: Entity<InputState>,
+    /// Date (`YYYY-MM-DD`) of the last scheduled review this process started.
+    /// Set when the run is dispatched, not when it finishes: a failing review
+    /// must not retry every minute for the rest of the day.
+    pub(crate) last_daily: Option<String>,
+    /// The one open secondary surface (execution trace or advanced setup).
+    /// `None` means the conversation owns the whole page.
+    pub(crate) agent_panel: Option<AgentPanel>,
+    /// Tracks the single scrollable conversation surface so a new answer can
+    /// follow the tail without the user fighting a nested scrollbar.
+    pub(crate) conversation_scroll: ScrollHandle,
+    /// The drawer takes focus while open: its own key context then owns Esc
+    /// instead of the composer input behind it.
+    pub(crate) agent_panel_focus: FocusHandle,
 }
 
 impl AppShell {
@@ -322,7 +421,7 @@ impl AppShell {
         let agent_settings = load_settings();
         let goal = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("用一句话说明目标，Agent 会自己规划并连续执行，不需要逐步对话")
+                .placeholder("想问什么？例如「今天需要操作吗」")
                 .default_value(DEFAULT_GOAL)
         });
         let cli = cx.new(|cx| {
@@ -330,10 +429,18 @@ impl AppShell {
                 .placeholder("opencode 可执行文件路径")
                 .default_value(agent_settings.agent_cli.clone())
         });
+        let followup = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder("接着问，例如：黄金这一腿为什么不动？")
+        });
         let cwd = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("留空则使用启动目录")
                 .default_value(agent_settings.working_dir.clone())
+        });
+        let daily_time = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("08:30")
+                .default_value(agent_settings.daily_review_time.clone())
         });
 
         // A config read is a single small TOML file; loading the whole account
@@ -367,14 +474,21 @@ impl AppShell {
             loading: true,
             refreshing: false,
             toast: None,
+            toast_seq: 0,
             dialog: None,
             agent: AgentState::new(restore.map(|s| s.agent)),
             agent_settings,
             jobs,
             goal,
+            followup,
             cli,
             cwd,
+            daily_time,
             monthly,
+            last_daily: read_last_daily(),
+            agent_panel: None,
+            conversation_scroll: ScrollHandle::new(),
+            agent_panel_focus: cx.focus_handle(),
         }
     }
 
@@ -384,8 +498,54 @@ impl AppShell {
         }
     }
 
+    /// Show feedback that goes away on its own. Each message owns its own
+    /// dismissal task; the id check keeps an older timer from hiding a newer
+    /// message when several actions happen back to back.
+    fn show_toast(&mut self, text: impl Into<String>, tone: ToastTone, cx: &mut Context<Self>) {
+        self.toast_seq = self.toast_seq.wrapping_add(1);
+        let id = self.toast_seq;
+        self.toast = Some(Toast {
+            id,
+            text: text.into(),
+            tone,
+        });
+        cx.spawn(async move |weak, async_cx| {
+            async_cx.background_executor().timer(TOAST_DURATION).await;
+            let _ = weak.update(async_cx, |shell, cx| {
+                if shell.toast.as_ref().is_some_and(|toast| toast.id == id) {
+                    shell.toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Clicking the message dismisses it immediately; the timer is harmless
+    /// because it only acts on a live toast with the same id.
+    fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        if self.toast.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Keep the newest answer in view, but never yank the page away from
+    /// someone who scrolled up to re-read an earlier turn. `force` is for a
+    /// turn the user just started themselves.
+    fn follow_conversation(&self, force: bool) {
+        let handle = &self.conversation_scroll;
+        let near_bottom = handle.max_offset().y + handle.offset().y <= px(96.);
+        if force || near_bottom {
+            handle.scroll_to_bottom();
+        }
+    }
+
     pub(crate) fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        // A drawer belongs to the page that opened it; leaving must not leave
+        // it hanging around when the user comes back.
+        self.agent_panel = None;
         cx.notify();
     }
 
@@ -396,10 +556,7 @@ impl AppShell {
         self.refreshing = true;
         if let Err(error) = self.jobs.send(Request::Refresh) {
             self.refreshing = false;
-            self.toast = Some(Toast {
-                text: error,
-                tone: ToastTone::Error,
-            });
+            self.show_toast(error, ToastTone::Error, cx);
         }
         cx.notify();
     }
@@ -411,31 +568,142 @@ impl AppShell {
     pub(crate) fn start_agent(&mut self, cx: &mut Context<Self>) {
         let goal = self.goal.read(cx).value().trim().to_string();
         if goal.is_empty() {
-            self.toast = Some(Toast {
-                text: "先写一句目标，再启动 Agent。".to_owned(),
-                tone: ToastTone::Error,
-            });
+            self.show_toast(
+                "先写一句目标，再启动 Agent。".to_owned(),
+                ToastTone::Error,
+                cx,
+            );
             cx.notify();
             return;
         }
+        self.begin_session(goal.clone(), goal, GoalSource::Manual, cx);
+    }
+
+    /// Open one ACP session. `display` is what the user sees (a short label for
+    /// scheduled runs), `prompt` is what the agent receives.
+    fn begin_session(
+        &mut self,
+        display: String,
+        prompt: String,
+        source: GoalSource,
+        cx: &mut Context<Self>,
+    ) {
         self.persist_agent_settings(cx);
         self.agent.timeline.clear();
         self.agent.streaming = None;
         self.agent.pending = None;
         self.agent.error = None;
+        self.agent.decision = None;
         self.agent.started = true;
+        self.agent.open = true;
         self.agent.state = RunState::Starting;
-        self.agent.detail = "目标已提交，正在连接外部 Agent".to_owned();
-        self.agent.push(EntryKind::System, format!("目标：{goal}"));
+        self.agent.detail = match source {
+            GoalSource::Manual => "目标已提交，正在连接外部 Agent".to_owned(),
+            GoalSource::DailyReview => "正在准备今日巡检".to_owned(),
+        };
+        // The user's own words stay in the transcript; a scheduled run shows a
+        // label instead of dumping a several-thousand-character prompt.
+        self.agent.push(EntryKind::User, display);
         if let Err(error) = self.agent_send(AgentCommand::Start {
-            goal,
+            goal: prompt,
             settings: self.agent_settings.clone(),
+            source,
+        }) {
+            self.agent.state = RunState::Failed;
+            self.agent.open = false;
+            self.agent.error = Some(error.clone());
+            self.agent.push(EntryKind::Error, error);
+        }
+        self.follow_conversation(true);
+        cx.notify();
+    }
+
+    /// Answer a follow-up inside the live session.
+    pub(crate) fn ask_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent.is_running() {
+            return;
+        }
+        if !self.agent.open {
+            self.show_toast(
+                "会话已结束，请重新开始一个任务。".to_owned(),
+                ToastTone::Error,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let question = self.followup.read(cx).value().trim().to_string();
+        if question.is_empty() {
+            return;
+        }
+
+        self.agent.push(EntryKind::User, question.clone());
+        self.agent.error = None;
+        self.agent.streaming = None;
+        self.agent.state = RunState::Running;
+        self.agent.detail = "Agent 正在回答追问…".to_owned();
+        if let Err(error) = self.agent_send(AgentCommand::Ask {
+            text: routine::followup_prompt(&question),
         }) {
             self.agent.state = RunState::Failed;
             self.agent.error = Some(error.clone());
             self.agent.push(EntryKind::Error, error);
         }
+        self.follow_conversation(true);
+        // Rebuilding the state is the only reset that does not depend on an
+        // editor-specific clear() API; the old value would otherwise linger in
+        // the box and be re-sent by a second click.
+        self.followup = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder("接着问，例如：黄金这一腿为什么不动？")
+        });
         cx.notify();
+    }
+
+    /// Kick off the daily review: the CLI produces the brief, then the session
+    /// opens with it. Nothing is written by the agent.
+    pub(crate) fn start_daily_review(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        if self.agent.is_running() {
+            return;
+        }
+        self.agent.detail = "正在生成今日报告…".to_owned();
+        self.agent.state = RunState::Starting;
+        self.agent.push(
+            EntryKind::System,
+            if refresh {
+                "正在运行 mns today，生成今日数据…"
+            } else {
+                "正在读取最近一次报告…"
+            },
+        );
+        if let Err(error) = self.jobs.send(Request::AgentBrief { refresh }) {
+            self.agent.state = RunState::Failed;
+            self.agent.error = Some(error.clone());
+            self.agent.push(EntryKind::Error, error);
+        }
+        cx.notify();
+    }
+
+    /// Scheduled entry point. Dispatches at most once per calendar day, and
+    /// only when a review is enabled.
+    pub(crate) fn maybe_start_daily(&mut self, cx: &mut Context<Self>) {
+        if !self.agent_settings.daily_review || self.agent.is_running() {
+            return;
+        }
+        let now = chrono::Local::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        if self.last_daily.as_deref() == Some(today.as_str()) {
+            return;
+        }
+        let target = self.agent_settings.daily_review_time.trim();
+        if target.is_empty() || now.format("%H:%M").to_string().as_str() < target {
+            return;
+        }
+        self.last_daily = Some(today.clone());
+        // Persisted so restarting the app mid-day does not fire the review a
+        // second time. A duplicate run means duplicate trade suggestions, which
+        // is worse than a missed one.
+        write_last_daily(&today);
+        self.start_daily_review(true, cx);
     }
 
     pub(crate) fn stop_agent(&mut self, cx: &mut Context<Self>) {
@@ -447,20 +715,14 @@ impl AppShell {
 
     pub(crate) fn apply_profile(&mut self, id: String, cx: &mut Context<Self>) {
         if let Err(error) = self.jobs.send(Request::SetProfile(id)) {
-            self.toast = Some(Toast {
-                text: error,
-                tone: ToastTone::Error,
-            });
+            self.show_toast(error, ToastTone::Error, cx);
         }
         cx.notify();
     }
 
     pub(crate) fn apply_weekday(&mut self, weekday: u32, cx: &mut Context<Self>) {
         if let Err(error) = self.jobs.send(Request::SetWeekday(weekday)) {
-            self.toast = Some(Toast {
-                text: error,
-                tone: ToastTone::Error,
-            });
+            self.show_toast(error, ToastTone::Error, cx);
         }
         cx.notify();
     }
@@ -470,17 +732,15 @@ impl AppShell {
         match parse_number(&raw) {
             Some(amount) if amount >= 0.0 => {
                 if let Err(error) = self.jobs.send(Request::SetMonthly(amount)) {
-                    self.toast = Some(Toast {
-                        text: error,
-                        tone: ToastTone::Error,
-                    });
+                    self.show_toast(error, ToastTone::Error, cx);
                 }
             }
             _ => {
-                self.toast = Some(Toast {
-                    text: "每月定投金额必须是非负数字".to_owned(),
-                    tone: ToastTone::Error,
-                });
+                self.show_toast(
+                    "每月定投金额必须是非负数字".to_owned(),
+                    ToastTone::Error,
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -505,13 +765,85 @@ impl AppShell {
         }
     }
 
+    /// One drawer at a time. Clicking the same trigger again closes it, so the
+    /// user never has to hunt for a close button.
+    pub(crate) fn toggle_agent_panel(
+        &mut self,
+        panel: AgentPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_panel == Some(panel) {
+            self.close_agent_panel(window, cx);
+            return;
+        }
+        self.agent_panel = Some(panel);
+        window.focus(&self.agent_panel_focus, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_panel.take().is_some() {
+            // Give the composer its caret back; otherwise closing a drawer
+            // would leave the window with no focused input.
+            let handle = if self.agent.open {
+                self.followup.read(cx).focus_handle(cx)
+            } else {
+                self.goal.read(cx).focus_handle(cx)
+            };
+            window.focus(&handle, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_daily_review(&mut self, cx: &mut Context<Self>) {
+        self.agent_settings.daily_review = !self.agent_settings.daily_review;
+        self.persist_daily_setting(cx);
+    }
+
+    pub(crate) fn save_daily_time(&mut self, cx: &mut Context<Self>) {
+        let raw = self.daily_time.read(cx).value().trim().to_owned();
+        if !valid_clock_time(&raw) {
+            self.show_toast(
+                "时间格式应为 HH:MM，例如 08:30".to_owned(),
+                ToastTone::Error,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.agent_settings.daily_review_time = raw;
+        self.persist_daily_setting(cx);
+    }
+
+    fn persist_daily_setting(&mut self, cx: &mut Context<Self>) {
+        match save_settings(&self.agent_settings) {
+            Ok(()) => {
+                self.show_toast(
+                    format!(
+                        "每日巡检：{}，时间 {}",
+                        if self.agent_settings.daily_review {
+                            "已开启"
+                        } else {
+                            "已关闭"
+                        },
+                        self.agent_settings.daily_review_time
+                    ),
+                    ToastTone::Success,
+                    cx,
+                );
+            }
+            Err(error) => {
+                self.show_toast(error, ToastTone::Error, cx);
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn set_policy(&mut self, policy: PermissionPolicy, cx: &mut Context<Self>) {
         self.agent_settings.permission_policy = policy;
         if let Err(error) = save_settings(&self.agent_settings) {
-            self.toast = Some(Toast {
-                text: error,
-                tone: ToastTone::Error,
-            });
+            self.show_toast(error, ToastTone::Error, cx);
         }
         self.agent.push(
             EntryKind::System,
@@ -524,16 +856,10 @@ impl AppShell {
         self.persist_agent_settings(cx);
         match save_settings(&self.agent_settings) {
             Ok(()) => {
-                self.toast = Some(Toast {
-                    text: "外部 Agent 设置已保存".to_owned(),
-                    tone: ToastTone::Success,
-                });
+                self.show_toast("外部 Agent 设置已保存".to_owned(), ToastTone::Success, cx);
             }
             Err(error) => {
-                self.toast = Some(Toast {
-                    text: error,
-                    tone: ToastTone::Error,
-                });
+                self.show_toast(error, ToastTone::Error, cx);
             }
         }
         cx.notify();
@@ -575,23 +901,14 @@ impl AppShell {
                 if let Some(error) = &outcome.fgi_error {
                     text.push_str(&format!("；情绪数据：{error}"));
                 }
-                self.toast = Some(Toast {
-                    text,
-                    tone: ToastTone::Success,
-                });
+                self.show_toast(text, ToastTone::Success, cx);
             }
             JobEvent::Refreshed(Err(error)) => {
                 self.refreshing = false;
-                self.toast = Some(Toast {
-                    text: error,
-                    tone: ToastTone::Error,
-                });
+                self.show_toast(error, ToastTone::Error, cx);
             }
             JobEvent::Saved(message) => {
-                self.toast = Some(Toast {
-                    text: message,
-                    tone: ToastTone::Success,
-                });
+                self.show_toast(message, ToastTone::Success, cx);
                 self.dialog = None;
             }
             JobEvent::Failed(error) => {
@@ -603,18 +920,55 @@ impl AppShell {
                     };
                     *slot = Some(error);
                 } else {
-                    self.toast = Some(Toast {
-                        text: error,
-                        tone: ToastTone::Error,
-                    });
+                    self.show_toast(error, ToastTone::Error, cx);
                 }
+            }
+            JobEvent::Brief(Ok(report)) => {
+                let now = chrono::Local::now();
+                let date = now.format("%Y-%m-%d").to_string();
+                let weekday = crate::app::weekday_label(now.weekday().num_days_from_monday());
+                let cli = crate::agent::cli_path();
+                let prompt = routine::daily_review_prompt(&date, weekday, &report, cli.as_deref());
+                self.begin_session(
+                    format!("每日巡检 · {date}"),
+                    prompt,
+                    GoalSource::DailyReview,
+                    cx,
+                );
+            }
+            JobEvent::Brief(Err(error)) => {
+                self.agent.state = RunState::Failed;
+                self.agent.open = false;
+                self.agent.error = Some(error.clone());
+                self.agent
+                    .push(EntryKind::Error, format!("无法生成今日报告：{error}"));
             }
         }
         cx.notify();
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        // Persist before folding into state: the card is rendered from the same
+        // JSON, and an archive failure must not block the conversation.
+        if let AgentEvent::Decision(report) = &event {
+            let _ = self.jobs.send(Request::SaveDecision {
+                body: report.raw.clone(),
+            });
+        }
+        // Only events that add something to the visible stream should move the
+        // scroll position; a pure state change must not disturb what is on screen.
+        let grows = matches!(
+            event,
+            AgentEvent::Entry(_)
+                | AgentEvent::Delta { .. }
+                | AgentEvent::Decision(_)
+                | AgentEvent::Permission(_)
+                | AgentEvent::Failed { .. }
+        );
         self.agent.apply(event);
+        if grows {
+            self.follow_conversation(false);
+        }
         cx.notify();
     }
 
@@ -693,17 +1047,17 @@ impl AppShell {
         match parsed {
             Ok(request) => {
                 if let Err(error) = self.jobs.send(request) {
-                    self.form_error(error);
+                    self.form_error(error, cx);
                 }
                 // The dialog stays open until `Event::Saved` closes it, so a
                 // rejected write never discards what the user typed.
             }
-            Err(message) => self.form_error(message),
+            Err(message) => self.form_error(message, cx),
         }
         cx.notify();
     }
 
-    fn form_error(&mut self, message: String) {
+    fn form_error(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(dialog) = self.dialog.as_mut() {
             let slot = match dialog {
                 Dialog::Trade(form) => &mut form.error,
@@ -712,10 +1066,7 @@ impl AppShell {
             };
             *slot = Some(message.clone());
         }
-        self.toast = Some(Toast {
-            text: message,
-            tone: ToastTone::Error,
-        });
+        self.show_toast(message, ToastTone::Error, cx);
     }
 }
 
@@ -735,6 +1086,13 @@ thread_local! {
 }
 
 pub fn run() {
+    // Finder 启动时进程 cwd 是 `/`（macOS 系统卷只读）。所有自有路径都已
+    // 改为绝对解析，这里再把 cwd 固定到应用数据目录，让外部 ACP agent 及
+    // 其他子进程继承到的一律是可写位置。
+    let data_dir = crate::config::app_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::env::set_current_dir(&data_dir);
+
     let (agent, agent_events) = start_runtime();
     let (jobs, job_events) = Jobs::spawn();
     AGENT.with(|cell| *cell.borrow_mut() = Some(agent.clone()));
@@ -766,7 +1124,31 @@ pub fn run() {
 
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
+            spawn_daily_scheduler(cx);
         });
+}
+
+/// Minute-resolution scheduler for the unattended review.
+///
+/// A real timer loop beats a launch hook: the app may stay open for days, and
+/// the machine may sleep through the target minute. The check is idempotent —
+/// `maybe_start_daily` keeps one date stamp per process — so a coarse poll is
+/// safer than a precise one-shot that a sleep/wake cycle can swallow.
+fn spawn_daily_scheduler(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(60))
+                .await;
+            let _ = cx.update(|cx| {
+                let view = cx.global::<GuiState>().view.clone();
+                if let Some(view) = view {
+                    view.update(cx, |shell, cx| shell.maybe_start_daily(cx));
+                }
+            });
+        }
+    })
+    .detach();
 }
 
 fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {
@@ -803,6 +1185,14 @@ fn spawn_agent_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedRece
 }
 
 fn register_actions(cx: &mut App) {
+    // The drawer owns Esc while it is focused. A context-scoped binding beats
+    // the text input's own Escape action, which would otherwise swallow the
+    // key whenever the composer behind the drawer had the caret.
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        CloseAgentPanel,
+        Some("agent-panel"),
+    )]);
     cx.on_action(|_: &ShowMainWindow, cx| {
         ensure_window(cx);
         cx.activate(true);
@@ -1161,7 +1551,7 @@ impl AppShell {
         }
     }
 
-    fn toast_layer(&self) -> Option<Div> {
+    fn toast_layer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let toast = self.toast.as_ref()?;
         let (fg, bg) = match toast.tone {
             ToastTone::Success => (SUCCESS, SUCCESS_SOFT),
@@ -1169,6 +1559,7 @@ impl AppShell {
         };
         Some(
             div()
+                .id(SharedString::from(format!("toast-{id}", id = toast.id)))
                 .absolute()
                 .bottom(px(20.))
                 .right(px(20.))
@@ -1182,7 +1573,19 @@ impl AppShell {
                 .shadow(shadow_overlay())
                 .text_size(px(12.5))
                 .text_color(rgb(fg))
-                .child(toast.text.clone()),
+                .cursor_pointer()
+                .on_click(cx.listener(|shell, _, _, cx| shell.dismiss_toast(cx)))
+                .h_flex()
+                .items_center()
+                .gap(px(12.))
+                .child(div().flex_1().child(toast.text.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(15.))
+                        .text_color(rgb(fg).opacity(0.55))
+                        .child("×"),
+                ),
         )
     }
 
@@ -1488,7 +1891,7 @@ impl Render for AppShell {
                         .child(content),
                 ),
             )
-            .children(self.toast_layer())
+            .children(self.toast_layer(cx))
             .children(self.dialog_layer(window, cx))
     }
 }

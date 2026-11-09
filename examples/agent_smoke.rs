@@ -14,7 +14,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use money_never_sleep::agent::{
-    AgentCommand, AgentEvent, EntryKind, RunState, load_settings, start_runtime,
+    AgentCommand, AgentEvent, EntryKind, GoalSource, RunState, load_settings, start_runtime,
 };
 
 /// Mirrors the GUI rule: streamed chunks extend the open line, discrete rows
@@ -60,7 +60,11 @@ async fn main() {
     println!("---");
 
     let (handle, mut events) = start_runtime();
-    if let Err(error) = handle.send(AgentCommand::Start { goal, settings }) {
+    if let Err(error) = handle.send(AgentCommand::Start {
+        goal,
+        settings,
+        source: GoalSource::Manual,
+    }) {
         eprintln!("无法提交目标：{error}");
         std::process::exit(2);
     }
@@ -74,12 +78,19 @@ async fn main() {
             Ok(Some(AgentEvent::State { state, detail })) => {
                 printer.flush();
                 println!("[状态] {} — {detail}", state.label());
-                if matches!(
-                    state,
-                    RunState::Finished | RunState::Failed | RunState::Cancelled
-                ) {
+                if matches!(state, RunState::Failed | RunState::Cancelled) {
                     terminal = Some(state);
                 }
+            }
+            Ok(Some(AgentEvent::TurnFinished { stop_reason })) => {
+                printer.entry(EntryKind::System, &format!("本轮结束：{stop_reason}"));
+                // The GUI keeps the session open for follow-ups. This example
+                // verifies a single turn, so it stops here instead of waiting
+                // for a question nobody will ask.
+                terminal = Some(RunState::Finished);
+            }
+            Ok(Some(AgentEvent::Decision(report))) => {
+                printer.entry(EntryKind::System, &format!("结构化结论：{}", report.headline()));
             }
             Ok(Some(AgentEvent::Entry(entry))) => {
                 printer.entry(entry.kind, &entry.text);
