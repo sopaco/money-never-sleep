@@ -8,6 +8,7 @@
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::app::{self, RefreshOutcome, Snapshot};
+use crate::gui::conversations::{self, ConversationRecord, ConversationSummary};
 
 pub enum Request {
     Load,
@@ -48,6 +49,16 @@ pub enum Request {
     SaveDecision {
         body: String,
     },
+    /// Assistant conversation archive. One file per conversation; a running
+    /// session overwrites its own file as turns finish.
+    LoadConversations,
+    SaveConversation(Box<ConversationRecord>),
+    LoadConversation {
+        id: String,
+    },
+    DeleteConversation {
+        id: String,
+    },
 }
 
 pub enum Event {
@@ -58,6 +69,13 @@ pub enum Event {
     Failed(String),
     /// Report text for the agent prompt, produced by the CLI itself.
     Brief(Result<String, String>),
+    /// Refreshed archive index, sent after load / save / delete.
+    Conversations(Result<Vec<ConversationSummary>, String>),
+    /// Full transcript for a read-only replay.
+    ConversationOpened(Result<Box<ConversationRecord>, String>),
+    /// A write outcome that is not a failure of the conversation itself:
+    /// archive loss must never interrupt a live agent run.
+    ConversationNotice(Result<String, String>),
 }
 
 #[derive(Clone)]
@@ -153,13 +171,37 @@ impl Jobs {
                         }
                         Request::SaveDecision { body } => match save_decision(&body) {
                             Ok(path) => {
-                                let _ = event_tx.send(Event::Saved(format!(
-                                    "决策已存档：{}",
-                                    path.display()
-                                )));
+                                let _ = event_tx
+                                    .send(Event::Saved(format!("决策已存档：{}", path.display())));
                             }
                             Err(error) => {
                                 let _ = event_tx.send(Event::Failed(error));
+                            }
+                        },
+                        Request::LoadConversations => {
+                            let _ = event_tx.send(Event::Conversations(conversations::list()));
+                        }
+                        Request::SaveConversation(record) => match conversations::save(&record) {
+                            Ok(()) => {
+                                let _ = event_tx.send(Event::Conversations(conversations::list()));
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(Event::ConversationNotice(Err(error)));
+                            }
+                        },
+                        Request::LoadConversation { id } => {
+                            let result = conversations::load(&id).map(Box::new);
+                            let _ = event_tx.send(Event::ConversationOpened(result));
+                        }
+                        Request::DeleteConversation { id } => match conversations::delete(&id) {
+                            Ok(()) => {
+                                let _ = event_tx.send(Event::ConversationNotice(Ok(
+                                    "已删除这条会话记录".to_owned(),
+                                )));
+                                let _ = event_tx.send(Event::Conversations(conversations::list()));
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(Event::ConversationNotice(Err(error)));
                             }
                         },
                     }
@@ -200,9 +242,7 @@ fn load() -> Result<Snapshot, String> {
 /// Keeping the raw JSON (not a re-serialised struct) means a newer agent can add
 /// fields without this build silently dropping them.
 fn save_decision(body: &str) -> Result<std::path::PathBuf, String> {
-    let dir = crate::agent::settings_dir()
-        .join("agent")
-        .join("runs");
+    let dir = crate::agent::settings_dir().join("agent").join("runs");
     std::fs::create_dir_all(&dir).map_err(|error| format!("无法创建存档目录：{error}"))?;
     let name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let path = dir.join(format!("{name}.json"));

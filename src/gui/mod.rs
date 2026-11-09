@@ -6,6 +6,7 @@
 
 mod chart;
 mod components;
+pub(crate) mod conversations;
 mod jobs;
 mod mood;
 mod pages;
@@ -28,6 +29,7 @@ use crate::agent::{
 use crate::app::{PlanView, Snapshot};
 
 use components::*;
+use conversations::{ConversationMeta, ConversationRecord, ConversationSummary};
 use jobs::{Event as JobEvent, Jobs, Request};
 use theme::*;
 
@@ -57,6 +59,8 @@ const DEFAULT_GOAL: &str = "今天需要操作吗？帮我看一眼持仓和市�
 pub(crate) enum AgentPanel {
     Trace,
     Settings,
+    /// Archive of past conversations: open for a read-only replay, or delete.
+    History,
 }
 
 /// Feedback is transient, never a permanent layer over the content. A new
@@ -371,6 +375,18 @@ fn write_last_daily(date: &str) {
 #[derive(Clone, Default)]
 struct ShellSnapshot {
     agent: AgentSnapshot,
+    /// Metadata of the conversation still being appended to, so a re-created
+    /// window does not start a second archive file for the same session.
+    conversation: Option<ConversationMeta>,
+}
+
+/// A past conversation shown in place of the live one. The ACP context lives
+/// in the external agent, which MNS never re-opens, so a replay is explicitly
+/// read-only rather than pretending the model remembers the thread.
+#[derive(Clone, Debug)]
+pub(crate) struct ViewedConversation {
+    pub id: String,
+    pub title: String,
 }
 
 struct GuiState {
@@ -422,6 +438,25 @@ pub(crate) struct AppShell {
     /// The "About MNS" panel is reachable from the macOS app menu, so it has
     /// to work even when the window was hidden rather than closed.
     about_open: bool,
+    /// Archive index shown in the history drawer. Only summaries are held in
+    /// memory; full transcripts are read on demand.
+    pub(crate) history: Vec<ConversationSummary>,
+    pub(crate) history_loaded: bool,
+    pub(crate) history_error: Option<String>,
+    /// Row awaiting a second click before its file is removed.
+    pub(crate) history_pending_delete: Option<String>,
+    /// Metadata for the live session, `None` before the first goal and after
+    /// the user deletes the record of the session they are still in.
+    current_conversation: Option<ConversationMeta>,
+    /// True when the transcript changed since the last archive write. The
+    /// minute tick uses it to flush a still-streaming answer without writing
+    /// the same file on every token or when nothing happened at all.
+    conversation_dirty: bool,
+    /// `Some` while a past conversation is being replayed in the chat surface.
+    pub(crate) viewing_history: Option<ViewedConversation>,
+    /// Live agent state parked while the chat surface shows a replay. Incoming
+    /// runtime events are folded into this, never into the replay.
+    live_agent: Option<Box<AgentState>>,
 }
 
 impl AppShell {
@@ -432,6 +467,9 @@ impl AppShell {
         restore: Option<ShellSnapshot>,
     ) -> Self {
         let agent_settings = load_settings();
+        let conversation = restore
+            .as_ref()
+            .and_then(|snapshot| snapshot.conversation.clone());
         let goal = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("想问什么？例如「今天需要操作吗」")
@@ -503,12 +541,28 @@ impl AppShell {
             conversation_scroll: ScrollHandle::new(),
             agent_panel_focus: cx.focus_handle(),
             about_open: false,
+            history: Vec::new(),
+            history_loaded: false,
+            history_error: None,
+            history_pending_delete: None,
+            current_conversation: conversation,
+            conversation_dirty: false,
+            viewing_history: None,
+            live_agent: None,
         }
     }
 
     fn agent_snapshot(&self) -> ShellSnapshot {
+        // A replay must never become the restored "current" conversation when
+        // a window is rebuilt on another platform.
+        let agent = self
+            .live_agent
+            .as_deref()
+            .map(AgentState::snapshot)
+            .unwrap_or_else(|| self.agent.snapshot());
         ShellSnapshot {
-            agent: self.agent.snapshot(),
+            agent,
+            conversation: self.current_conversation.clone(),
         }
     }
 
@@ -579,6 +633,136 @@ impl AppShell {
         let _ = self.jobs.send(Request::Load);
     }
 
+    // ── Conversation archive ───────────────────────────────────────────
+
+    /// Ask the worker for the archive index: on startup and whenever the
+    /// history drawer is raised, so an unattended daily review shows up too.
+    pub(crate) fn load_history(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.jobs.send(Request::LoadConversations) {
+            self.history_error = Some(error.clone());
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+    }
+
+    /// Upsert the live session. Deliberately called at low-frequency
+    /// boundaries only — writing on every streamed delta would rewrite the
+    /// whole transcript for each token.
+    fn archive_current(&mut self, cx: &mut Context<Self>) {
+        if self.viewing_history.is_some() {
+            return;
+        }
+        let Some(meta) = self.current_conversation.clone() else {
+            return;
+        };
+        let Some(record) = conversations::build_record(
+            &meta,
+            &self.agent.timeline,
+            self.agent.decision.as_ref(),
+            self.agent.state,
+        ) else {
+            return;
+        };
+        match self.jobs.send(Request::SaveConversation(Box::new(record))) {
+            Ok(()) => self.conversation_dirty = false,
+            Err(error) => self.show_toast(error, ToastTone::Error, cx),
+        }
+    }
+
+    pub(crate) fn open_history_conversation(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.agent.is_running() || self.agent.pending.is_some() {
+            self.show_toast(
+                "助手正在工作，结束后再查看历史记录。".to_owned(),
+                ToastTone::Error,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        // Switching between replays must not bump the live session's
+        // `updated_at` and reorder the list underneath the user.
+        if self.viewing_history.is_none() {
+            self.archive_current(cx);
+        }
+        if let Err(error) = self.jobs.send(Request::LoadConversation { id }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
+    }
+
+    fn show_history_record(&mut self, record: ConversationRecord, cx: &mut Context<Self>) {
+        if self.live_agent.is_none() {
+            let live = std::mem::replace(&mut self.agent, AgentState::new(None));
+            self.live_agent = Some(Box::new(live));
+        }
+        self.agent.timeline = conversations::restore_entries(&record.entries);
+        self.agent.decision = record
+            .decision
+            .as_deref()
+            .and_then(conversations::decision_from_raw);
+        self.agent.state = conversations::state_from_tag(&record.state);
+        self.agent.detail = "历史会话（只读）".to_owned();
+        self.agent.open = false;
+        self.agent.streaming = None;
+        self.agent.pending = None;
+        self.agent.error = None;
+        self.viewing_history = Some(ViewedConversation {
+            id: record.id.clone(),
+            title: record.title.clone(),
+        });
+        self.agent_panel = None;
+        self.history_pending_delete = None;
+        self.follow_conversation(true);
+        cx.notify();
+    }
+
+    pub(crate) fn exit_history_view(&mut self, cx: &mut Context<Self>) {
+        if self.viewing_history.take().is_none() {
+            return;
+        }
+        if let Some(live) = self.live_agent.take() {
+            self.agent = *live;
+        }
+        // Turns that arrived while the replay was on screen were folded into
+        // the parked state; flush them now that the live session is visible.
+        self.archive_current(cx);
+        self.follow_conversation(false);
+        cx.notify();
+    }
+
+    pub(crate) fn request_delete_history(&mut self, id: String, cx: &mut Context<Self>) {
+        self.history_pending_delete = Some(id);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_history(&mut self, cx: &mut Context<Self>) {
+        self.history_pending_delete = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_delete_history(&mut self, id: String, cx: &mut Context<Self>) {
+        self.history_pending_delete = None;
+        // Deleting the record of the live session must not let the next turn
+        // silently recreate it; a new goal opens a fresh archive entry.
+        if self
+            .current_conversation
+            .as_ref()
+            .is_some_and(|meta| meta.id == id)
+        {
+            self.current_conversation = None;
+        }
+        if self
+            .viewing_history
+            .as_ref()
+            .is_some_and(|view| view.id == id)
+        {
+            self.exit_history_view(cx);
+        }
+        if let Err(error) = self.jobs.send(Request::DeleteConversation { id }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn start_agent(&mut self, cx: &mut Context<Self>) {
         let goal = self.goal.read(cx).value().trim().to_string();
         if goal.is_empty() {
@@ -603,6 +787,16 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         self.persist_agent_settings(cx);
+        // A menu action or an unattended review can arrive while a replay is
+        // on screen: restore the live session before archiving and replacing it.
+        if self.viewing_history.is_some() {
+            self.exit_history_view(cx);
+        }
+        self.archive_current(cx);
+        self.current_conversation = Some(ConversationMeta::new(match source {
+            GoalSource::Manual => "手动",
+            GoalSource::DailyReview => "每日巡检",
+        }));
         self.agent.timeline.clear();
         self.agent.streaming = None;
         self.agent.pending = None;
@@ -628,6 +822,9 @@ impl AppShell {
             self.agent.error = Some(error.clone());
             self.agent.push(EntryKind::Error, error);
         }
+        // Persist the opening line immediately: a crash mid-run should still
+        // leave a dated, titled conversation rather than nothing at all.
+        self.archive_current(cx);
         self.follow_conversation(true);
         cx.notify();
     }
@@ -664,6 +861,7 @@ impl AppShell {
             self.agent.push(EntryKind::Error, error);
         }
         self.follow_conversation(true);
+        self.archive_current(cx);
         // Rebuilding the state is the only reset that does not depend on an
         // editor-specific clear() API; the old value would otherwise linger in
         // the box and be re-sent by a second click.
@@ -792,20 +990,29 @@ impl AppShell {
             return;
         }
         self.agent_panel = Some(panel);
+        self.history_pending_delete = None;
+        if panel == AgentPanel::History {
+            self.load_history(cx);
+        }
         window.focus(&self.agent_panel_focus, cx);
         cx.notify();
     }
 
+    /// Give the composer its caret back after a drawer or a history replay
+    /// owned the window. Without this the input is visible but cannot be typed
+    /// into until the user clicks it first.
+    pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = if self.agent.open {
+            self.followup.read(cx).focus_handle(cx)
+        } else {
+            self.goal.read(cx).focus_handle(cx)
+        };
+        window.focus(&handle, cx);
+    }
+
     pub(crate) fn close_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.agent_panel.take().is_some() {
-            // Give the composer its caret back; otherwise closing a drawer
-            // would leave the window with no focused input.
-            let handle = if self.agent.open {
-                self.followup.read(cx).focus_handle(cx)
-            } else {
-                self.goal.read(cx).focus_handle(cx)
-            };
-            window.focus(&handle, cx);
+            self.focus_composer(window, cx);
             cx.notify();
         }
     }
@@ -891,7 +1098,16 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn shutdown(&self) {
+    pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
+        // Best-effort final flush: the worker is still alive at this point, so
+        // the last (possibly streamed) turn survives an ordinary quit. Put the
+        // live session back first — a replay must never be what gets saved.
+        if self.viewing_history.take().is_some() {
+            if let Some(live) = self.live_agent.take() {
+                self.agent = *live;
+            }
+        }
+        self.archive_current(cx);
         let _ = self.agent_send(AgentCommand::Shutdown);
     }
 
@@ -957,6 +1173,28 @@ impl AppShell {
                 self.agent
                     .push(EntryKind::Error, format!("无法生成今日报告：{error}"));
             }
+            JobEvent::Conversations(Ok(rows)) => {
+                self.history = rows;
+                self.history_loaded = true;
+                self.history_error = None;
+            }
+            JobEvent::Conversations(Err(error)) => {
+                self.history_loaded = true;
+                self.history_error = Some(error.clone());
+                self.show_toast(error, ToastTone::Error, cx);
+            }
+            JobEvent::ConversationOpened(Ok(record)) => {
+                self.show_history_record(*record, cx);
+            }
+            JobEvent::ConversationOpened(Err(error)) => {
+                self.show_toast(error, ToastTone::Error, cx);
+            }
+            JobEvent::ConversationNotice(Ok(message)) => {
+                self.show_toast(message, ToastTone::Success, cx);
+            }
+            JobEvent::ConversationNotice(Err(error)) => {
+                self.show_toast(error, ToastTone::Error, cx);
+            }
         }
         cx.notify();
     }
@@ -979,9 +1217,35 @@ impl AppShell {
                 | AgentEvent::Permission(_)
                 | AgentEvent::Failed { .. }
         );
+        // A finished turn, a conclusion, a permission or a failure is the
+        // natural archive boundary. Streaming deltas are deliberately left
+        // out: one JSON write per token would drown the worker thread.
+        let archive = matches!(
+            event,
+            AgentEvent::TurnFinished { .. }
+                | AgentEvent::Finished { .. }
+                | AgentEvent::Failed { .. }
+                | AgentEvent::Decision(_)
+                | AgentEvent::Permission(_)
+        );
+        if let Some(live) = self.live_agent.as_mut() {
+            // The replay owns the visible chat surface. Runtime events keep
+            // updating the parked live session instead of corrupting the
+            // archived transcript the user is reading.
+            live.apply(event);
+            self.conversation_dirty = self.conversation_dirty || grows || archive;
+            cx.notify();
+            return;
+        }
         self.agent.apply(event);
+        if grows || archive {
+            self.conversation_dirty = true;
+        }
         if grows {
             self.follow_conversation(false);
+        }
+        if archive {
+            self.archive_current(cx);
         }
         cx.notify();
     }
@@ -1167,7 +1431,14 @@ fn spawn_daily_scheduler(cx: &mut App) {
             let _ = cx.update(|cx| {
                 let view = cx.global::<GuiState>().view.clone();
                 if let Some(view) = view {
-                    view.update(cx, |shell, cx| shell.maybe_start_daily(cx));
+                    view.update(cx, |shell, cx| {
+                        shell.maybe_start_daily(cx);
+                        // Coarse safety net for a long streamed answer: an
+                        // interrupted turn never had a TurnFinished boundary.
+                        if shell.conversation_dirty {
+                            shell.archive_current(cx);
+                        }
+                    });
                 }
                 // "今日已触发" must change even on a day where the run was
                 // skipped, so the minute tick refreshes the tray regardless.
@@ -1301,7 +1572,7 @@ fn register_actions(cx: &mut App) {
     });
     cx.on_action(|_: &QuitApplication, cx| {
         if let Some(view) = cx.global::<GuiState>().view.clone() {
-            view.update(cx, |shell, _cx| shell.shutdown());
+            view.update(cx, |shell, cx| shell.shutdown(cx));
         }
         if let Some(tray) = cx.global::<GuiState>().tray.clone() {
             let _ = tray.close(cx);
@@ -1765,8 +2036,10 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> 
         cx.new(|cx| {
             let mut shell = AppShell::new(window, cx, jobs_for_view, restore);
             // Load the account immediately; the shell shows its skeleton until
-            // the worker answers, never a fabricated zero balance.
+            // the worker answers, never a fabricated zero balance. The archive
+            // index is a separate, small directory read on the same worker.
             shell.reload();
+            shell.load_history(cx);
             shell
         })
     })?;

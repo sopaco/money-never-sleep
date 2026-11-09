@@ -5,6 +5,7 @@
 //! 定时、权限策略与工具轨迹都收进侧边抽屉：整页只有对话区一个滚动容器，
 //! 输入框永远固定在底部，不会被展开的内容顶走。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -14,8 +15,9 @@ use gpui_kit::*;
 
 use crate::agent::{EntryKind, PermissionPolicy, RunState, TimelineEntry};
 use crate::gui::components::*;
+use crate::gui::conversations::{ConversationSummary, strip_decision_block};
 use crate::gui::theme::*;
-use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, Page};
+use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, Page, ViewedConversation};
 
 use super::{card_header, notice, page_lead};
 
@@ -39,6 +41,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
         .filter(|entry| !is_message(entry.kind))
         .count();
     let settings_open = shell.agent_panel == Some(AgentPanel::Settings);
+    let history_open = shell.agent_panel == Some(AgentPanel::History);
 
     let content = div()
         .v_flex()
@@ -54,6 +57,8 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
             state_color,
             state_bg,
             settings_open,
+            history_open,
+            shell.history.len(),
             cx,
         ))
         .child(daily_bar(shell, cx, running))
@@ -79,6 +84,8 @@ fn header_bar(
     state_color: u32,
     state_bg: u32,
     settings_open: bool,
+    history_open: bool,
+    history_count: usize,
     cx: &mut Context<AppShell>,
 ) -> Div {
     let detail_label = detail.to_owned();
@@ -92,15 +99,19 @@ fn header_bar(
         .child(
             div()
                 .h_flex()
+                .flex_none()
                 .items_center()
                 .gap(px(8.))
                 .child(
                     div()
+                        .max_w(px(190.))
+                        .overflow_hidden()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(detail_label),
                 )
                 .child(status_pill(state, state_color, state_bg))
+                .child(history_toggle(history_open, history_count, cx))
                 .child(
                     Button::new("agent-settings-toggle")
                         .compact()
@@ -114,6 +125,38 @@ fn header_bar(
                         })),
                 ),
         )
+}
+
+/// The archive entry point. A clock glyph plus a word reads as a button rather
+/// than decoration, and the row count makes it obvious that runs are being
+/// kept from now on. `IconName::History` does not exist in this icon set.
+fn history_toggle(open: bool, count: usize, cx: &mut Context<AppShell>) -> Stateful<Div> {
+    let label = if count > 0 {
+        format!("历史 · {count}")
+    } else {
+        "历史".to_owned()
+    };
+    div()
+        .id("agent-history-toggle")
+        .h_flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .px(px(9.))
+        .py(px(5.))
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(rgb(if open { ACCENT } else { BORDER }))
+        .bg(rgb(if open { ACCENT_SOFT } else { SURFACE }))
+        .text_size(px(12.5))
+        .text_color(rgb(if open { ACCENT } else { TEXT_SECONDARY }))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(if open { ACCENT_SOFT } else { HOVER })))
+        .child(div().text_size(px(14.)).child(IconName::Clock))
+        .child(label)
+        .on_click(cx.listener(|shell, _, window, cx| {
+            shell.toggle_agent_panel(AgentPanel::History, window, cx);
+        }))
 }
 
 /// The one always-visible action: a scheduled review, plus a manual run.
@@ -406,6 +449,37 @@ fn conversation_card(
         "执行细节".to_owned()
     };
 
+    let replay = shell.viewing_history.as_ref();
+    let subtitle: SharedString = match replay {
+        Some(view) => format!("历史回放 · {}", view.title).into(),
+        None => "结论在这里，执行细节在右侧抽屉".into(),
+    };
+    let right = if replay.is_some() {
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(8.))
+            .child(pill("只读", ACCENT, ACCENT_SOFT))
+            .child(
+                Button::new("history-back-inline")
+                    .compact()
+                    .label("返回当前对话")
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.exit_history_view(cx);
+                        shell.focus_composer(window, cx);
+                    })),
+            )
+    } else {
+        div().child(
+            Button::new("trace-toggle")
+                .compact()
+                .label(trace_label)
+                .on_click(cx.listener(|shell, _, window, cx| {
+                    shell.toggle_agent_panel(AgentPanel::Trace, window, cx);
+                })),
+        )
+    };
+
     let header = div()
         .h_flex()
         .flex_none()
@@ -423,19 +497,14 @@ fn conversation_card(
                 .child(section_title("对话"))
                 .child(
                     div()
+                        .max_w(px(300.))
+                        .overflow_hidden()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_TERTIARY))
-                        .child("结论在这里，执行细节在右侧抽屉"),
+                        .child(subtitle),
                 ),
         )
-        .child(
-            Button::new("trace-toggle")
-                .compact()
-                .label(trace_label)
-                .on_click(cx.listener(|shell, _, window, cx| {
-                    shell.toggle_agent_panel(AgentPanel::Trace, window, cx);
-                })),
-        );
+        .child(right);
 
     let rows: Vec<Div> = shell
         .agent
@@ -647,12 +716,23 @@ fn trace_label(kind: EntryKind) -> &'static str {
 fn panel_layer(shell: &AppShell, cx: &mut Context<AppShell>) -> Option<Div> {
     let panel = shell.agent_panel?;
     let (title, hint) = match panel {
-        AgentPanel::Trace => ("执行细节", "工具调用、思考与系统消息，按时间顺序排列"),
-        AgentPanel::Settings => ("高级设置", "巡检时间、权限策略与外部 Agent"),
+        AgentPanel::Trace => (
+            "执行细节".to_owned(),
+            "工具调用、思考与系统消息，按时间顺序排列".to_owned(),
+        ),
+        AgentPanel::Settings => (
+            "高级设置".to_owned(),
+            "巡检时间、权限策略与外部 Agent".to_owned(),
+        ),
+        AgentPanel::History => (
+            "历史会话".to_owned(),
+            format!("共 {} 条 · 点击打开，可删除", shell.history.len()),
+        ),
     };
     let body = match panel {
         AgentPanel::Trace => trace_body(shell),
         AgentPanel::Settings => settings_body(shell, cx),
+        AgentPanel::History => history_body(shell, cx),
     };
 
     Some(
@@ -711,7 +791,13 @@ fn panel_layer(shell: &AppShell, cx: &mut Context<AppShell>) -> Option<Div> {
     )
 }
 
-fn panel_header(title: &'static str, hint: &'static str, cx: &mut Context<AppShell>) -> Div {
+fn panel_header(
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    cx: &mut Context<AppShell>,
+) -> Div {
+    let title: SharedString = title.into();
+    let hint: SharedString = hint.into();
     div()
         .h_flex()
         .flex_none()
@@ -788,10 +874,186 @@ fn trace_body(shell: &AppShell) -> Div {
         .children(rows)
 }
 
+// ── Conversation archive drawer ───────────────────────────────────────
+
+/// Newest first, one row per run. Clicking a row replays it; the trash glyph
+/// asks for a second confirmation before its file is removed.
+fn history_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
+    let mut body = div().v_flex().gap(px(8.)).child(
+        div()
+            .pb(px(4.))
+            .text_size(px(11.5))
+            .text_color(rgb(TEXT_TERTIARY))
+            .child("每次巡检与提问都会自动归档。回放是只读快照，外部 Agent 的上下文不会恢复。"),
+    );
+    if let Some(error) = &shell.history_error {
+        body = body.child(notice(error.clone(), (DANGER, DANGER_SOFT)));
+    }
+    if !shell.history_loaded {
+        return body.child(
+            div()
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_TERTIARY))
+                .child("正在读取历史记录…"),
+        );
+    }
+    if shell.history.is_empty() {
+        return body.child(empty_state(
+            IconName::Clock,
+            "还没有历史会话",
+            "从现在起，开始一次巡检或提问后，记录会自动出现在这里。",
+        ));
+    }
+    let rows: Vec<Div> = shell
+        .history
+        .iter()
+        .map(|item| history_row(item, shell, cx))
+        .collect();
+    body.children(rows)
+}
+
+fn history_row(item: &ConversationSummary, shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
+    let id = item.id.clone();
+    let active = shell
+        .viewing_history
+        .as_ref()
+        .is_some_and(|view| view.id == id);
+    let pending = shell.history_pending_delete.as_deref() == Some(id.as_str());
+
+    let open_id = id.clone();
+    let row = div()
+        .v_flex()
+        .flex_none()
+        .gap(px(7.))
+        .px(px(11.))
+        .py(px(10.))
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(rgb(if active { ACCENT } else { BORDER }))
+        .bg(rgb(if active { ACCENT_SOFT } else { SURFACE }))
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("history-open-{id}")))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .v_flex()
+                        .gap(px(3.))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT))
+                                .child(item.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .child(format!(
+                                    "{} · {} · {} 条消息",
+                                    item.updated_at, item.source, item.message_count
+                                )),
+                        )
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.open_history_conversation(open_id.clone(), cx);
+                        })),
+                )
+                // A sibling, not a child of the clickable title: the trash
+                // glyph must never also open the conversation.
+                .child(history_delete_button(id.clone(), cx)),
+        )
+        .child(
+            div()
+                .w_full()
+                .overflow_hidden()
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(item.preview.clone()),
+        );
+
+    if pending {
+        row.child(history_delete_confirm(id, cx))
+    } else {
+        row
+    }
+}
+
+fn history_delete_button(id: String, cx: &mut Context<AppShell>) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(format!("history-delete-{id}")))
+        .flex_none()
+        .w(px(28.))
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(RADIUS_SM))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_size(px(14.))
+        .text_color(rgb(TEXT_TERTIARY))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(DANGER_SOFT)))
+        .child(IconName::Trash)
+        .on_click(cx.listener(move |shell, _, _, cx| {
+            shell.request_delete_history(id.clone(), cx);
+        }))
+}
+
+fn history_delete_confirm(id: String, cx: &mut Context<AppShell>) -> Div {
+    div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .pt(px(9.))
+        .border_t_1()
+        .border_color(rgb(DIVIDER))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(DANGER))
+                .child("确定删除这条记录？"),
+        )
+        .child(
+            div()
+                .h_flex()
+                .gap(px(6.))
+                .child(
+                    Button::new("history-delete-cancel")
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.cancel_delete_history(cx);
+                        })),
+                )
+                .child(
+                    Button::new("history-delete-confirm")
+                        .compact()
+                        .label("删除")
+                        .on_click(cx.listener(move |shell, _, _, cx| {
+                            shell.confirm_delete_history(id.clone(), cx);
+                        })),
+                ),
+        )
+}
+
 /// One composer for the whole life of the session. Before the first run it
 /// binds to `goal` (start), afterwards to `followup` (ask); the user never
-/// sees two input boxes or a "start vs. ask" decision.
+/// sees two input boxes or a "start vs. ask" decision. A replay is read-only:
+/// the ACP context lives in the external agent and MNS never re-opens it.
 fn composer(shell: &AppShell, cx: &mut Context<AppShell>, running: bool) -> Div {
+    if let Some(view) = &shell.viewing_history {
+        return replay_composer(view, cx);
+    }
     let open = shell.agent.open;
     let input = if open {
         Textarea::new(&shell.followup)
@@ -845,6 +1107,56 @@ fn composer(shell: &AppShell, cx: &mut Context<AppShell>, running: bool) -> Div 
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT_TERTIARY))
                 .child(hint),
+        )
+}
+
+/// The composer is replaced, not disabled: a greyed-out input would invite
+/// the user to type a message that can never be delivered to the old ACP
+/// session. Say plainly what a replay is, and offer the way back.
+fn replay_composer(view: &ViewedConversation, cx: &mut Context<AppShell>) -> Div {
+    div()
+        .v_flex()
+        .flex_none()
+        .gap(px(10.))
+        .px(px(14.))
+        .py(px(13.))
+        .border_t_1()
+        .border_color(rgb(DIVIDER))
+        .bg(rgb(LAYER))
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .justify_between()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(3.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("正在查看：{}", view.title)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .child("这是只读归档，无法在旧会话里继续追问；返回当前对话即可接着问。"),
+                        ),
+                )
+                .child(
+                    Button::new("history-back")
+                        .primary()
+                        .label("返回当前对话")
+                        .on_click(cx.listener(|shell, _, window, cx| {
+                            shell.exit_history_view(cx);
+                            shell.focus_composer(window, cx);
+                        })),
+                ),
         )
 }
 
@@ -935,35 +1247,6 @@ fn policy_chip(policy: PermissionPolicy, shell: &AppShell, cx: &mut Context<AppS
     button.on_click(cx.listener(move |shell, _, _, cx| shell.set_policy(policy, cx)))
 }
 
-/// The ```mns-decision fence is a machine channel: the shell already renders
-/// it as a card. Leaving the raw JSON in the prose would show the reader a
-/// block of syntax they never asked for.
-fn strip_decision_block(text: &str) -> String {
-    const FENCE: &str = "```mns-decision";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let Some(start) = rest.find(FENCE) else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..start]);
-        let after = &rest[start + FENCE.len()..];
-        match after.find("```") {
-            Some(end) => {
-                rest = after[end + 3..].trim_start_matches(['\r', '\n']);
-            }
-            // Streaming text can end mid-fence. Drop the incomplete tail.
-            None => {
-                rest = "";
-            }
-        }
-    }
-    let mut cleaned = out.trim_end().to_owned();
-    cleaned.push('\n');
-    cleaned
-}
-
 fn mono_family() -> &'static str {
     if cfg!(target_os = "windows") {
         "Consolas"
@@ -976,8 +1259,9 @@ fn mono_family() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_message, strip_decision_block};
+    use super::is_message;
     use crate::agent::EntryKind;
+    use crate::gui::conversations::strip_decision_block;
 
     #[test]
     fn decision_fence_is_removed_from_visible_prose() {
