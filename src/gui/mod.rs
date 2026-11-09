@@ -25,7 +25,7 @@ use crate::agent::{
     PermissionPolicy, PermissionPrompt, RunState, TimelineEntry, load_settings, routine,
     save_settings, start_runtime,
 };
-use crate::app::Snapshot;
+use crate::app::{PlanView, Snapshot};
 
 use components::*;
 use jobs::{Event as JobEvent, Jobs, Request};
@@ -38,7 +38,13 @@ actions!(
         RunDefaultGoal,
         StopCurrentTask,
         QuitApplication,
-        CloseAgentPanel
+        CloseAgentPanel,
+        CloseMainWindow,
+        ShowAbout,
+        RefreshData,
+        OpenPlanPage,
+        OpenAgentPage,
+        RunTodayReview
     ]
 );
 
@@ -373,6 +379,10 @@ struct GuiState {
     tray: Option<Tray>,
     jobs: Option<Jobs>,
     snapshot: Option<ShellSnapshot>,
+    /// Last brief actually pushed into the native menu. `refresh_menu` always
+    /// bumps its generation, so an unchanged brief must not be pushed again or
+    /// macOS rebuilds the NSMenu (and closes an open one) once per minute.
+    last_tray_brief: Option<TrayBrief>,
 }
 
 impl Global for GuiState {}
@@ -409,6 +419,9 @@ pub(crate) struct AppShell {
     /// The drawer takes focus while open: its own key context then owns Esc
     /// instead of the composer input behind it.
     pub(crate) agent_panel_focus: FocusHandle,
+    /// The "About MNS" panel is reachable from the macOS app menu, so it has
+    /// to work even when the window was hidden rather than closed.
+    about_open: bool,
 }
 
 impl AppShell {
@@ -489,6 +502,7 @@ impl AppShell {
             agent_panel: None,
             conversation_scroll: ScrollHandle::new(),
             agent_panel_focus: cx.focus_handle(),
+            about_open: false,
         }
     }
 
@@ -1109,7 +1123,16 @@ pub fn run() {
                 tray: None,
                 jobs: Some(jobs.clone()),
                 snapshot: None,
+                last_tray_brief: None,
             });
+
+            // Outside macOS the traffic lights and ctrl-w really destroy the
+            // window; clear the handle so `ensure_window` can rebuild it from
+            // the tray. macOS hides instead, so its handle stays valid.
+            cx.on_window_closed(|cx, _window_id| {
+                cx.global_mut::<GuiState>().window = None;
+            })
+            .detach();
 
             register_actions(cx);
 
@@ -1121,6 +1144,7 @@ pub fn run() {
                 cx.quit();
                 return;
             }
+            refresh_tray(cx);
 
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
@@ -1145,6 +1169,9 @@ fn spawn_daily_scheduler(cx: &mut App) {
                 if let Some(view) = view {
                     view.update(cx, |shell, cx| shell.maybe_start_daily(cx));
                 }
+                // "今日已触发" must change even on a day where the run was
+                // skipped, so the minute tick refreshes the tray regardless.
+                refresh_tray(cx);
             });
         }
     })
@@ -1159,6 +1186,9 @@ fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiv
                 if let Some(view) = view {
                     view.update(cx, |shell, cx| shell.apply_job_event(event, cx));
                 }
+                // Refresh outside the view's update lease: the menu builder
+                // reads the same entity on the way back in.
+                refresh_tray(cx);
             });
         }
     })
@@ -1172,12 +1202,10 @@ fn spawn_agent_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedRece
                 let view = cx.global::<GuiState>().view.clone();
                 if let Some(view) = view {
                     view.update(cx, |shell, cx| shell.apply_agent_event(event, cx));
-                    // `build_tray_menu` reads the view. Refresh only after the
-                    // update lease ends, otherwise it re-enters `AppShell`.
-                    if let Some(tray) = cx.global::<GuiState>().tray.clone() {
-                        let _ = tray.refresh_menu(cx);
-                    }
                 }
+                // Both the menu and the menu-bar label read the view, so the
+                // refresh must wait until the update lease above has ended.
+                refresh_tray(cx);
             });
         }
     })
@@ -1185,17 +1213,79 @@ fn spawn_agent_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedRece
 }
 
 fn register_actions(cx: &mut App) {
-    // The drawer owns Esc while it is focused. A context-scoped binding beats
-    // the text input's own Escape action, which would otherwise swallow the
-    // key whenever the composer behind the drawer had the caret.
-    cx.bind_keys([KeyBinding::new(
+    // GPUI Kit deliberately leaves cmd-q / cmd-w / alt-f4 to the application
+    // (its own integration test asserts those bindings stay empty). Without an
+    // explicit binding here the menu bar can render but nothing happens.
+    let mut bindings = vec![KeyBinding::new(
         "escape",
         CloseAgentPanel,
         Some("agent-panel"),
-    )]);
+    )];
+    #[cfg(target_os = "macos")]
+    bindings.extend([
+        KeyBinding::new("cmd-w", CloseMainWindow, None),
+        KeyBinding::new("cmd-q", QuitApplication, None),
+        KeyBinding::new("cmd-r", RefreshData, None),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    bindings.extend([
+        KeyBinding::new("ctrl-w", CloseMainWindow, None),
+        KeyBinding::new("ctrl-r", RefreshData, None),
+        KeyBinding::new("alt-f4", CloseMainWindow, None),
+    ]);
+    cx.bind_keys(bindings);
+
+    // set_menus reads the keymap to draw the shortcut column, so it must come
+    // after the bindings above. On macOS the first menu is shown under the app
+    // name regardless of the name passed here.
+    #[cfg(target_os = "macos")]
+    cx.set_menus(app_menus());
+
     cx.on_action(|_: &ShowMainWindow, cx| {
         ensure_window(cx);
         cx.activate(true);
+        refresh_tray(cx);
+    });
+    cx.on_action(|_: &CloseMainWindow, cx| {
+        // macOS convention for a menu-bar app: dismissing the window hides the
+        // app, the tray stays alive and "打开 MNS" brings it back. Elsewhere
+        // the window really closes; the tray is still the way back in.
+        if cfg!(target_os = "macos") {
+            cx.hide();
+            return;
+        }
+        if let Some(handle) = cx.global::<GuiState>().window.clone() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    });
+    cx.on_action(|_: &ShowAbout, cx| {
+        ensure_window(cx);
+        cx.activate(true);
+        if let Some(view) = cx.global::<GuiState>().view.clone() {
+            view.update(cx, |shell, cx| {
+                shell.about_open = true;
+                cx.notify();
+            });
+        }
+    });
+    cx.on_action(|_: &RefreshData, cx| {
+        ensure_window(cx);
+        cx.activate(true);
+        if let Some(view) = cx.global::<GuiState>().view.clone() {
+            view.update(cx, |shell, cx| shell.refresh(cx));
+        }
+    });
+    cx.on_action(|_: &OpenPlanPage, cx| open_page(cx, Page::Plan));
+    cx.on_action(|_: &OpenAgentPage, cx| open_page(cx, Page::Agent));
+    cx.on_action(|_: &RunTodayReview, cx| {
+        ensure_window(cx);
+        cx.activate(true);
+        if let Some(view) = cx.global::<GuiState>().view.clone() {
+            view.update(cx, |shell, cx| {
+                shell.navigate(Page::Agent, cx);
+                shell.start_daily_review(true, cx);
+            });
+        }
     });
     cx.on_action(|_: &RunDefaultGoal, cx| {
         ensure_window(cx);
@@ -1220,6 +1310,42 @@ fn register_actions(cx: &mut App) {
     });
 }
 
+/// Native macOS menu bar. Every item maps to an action registered above;
+/// an item with no listener is exactly the "click does nothing" symptom.
+#[cfg(target_os = "macos")]
+fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("MNS").items([
+            MenuItem::action("关于 MNS", ShowAbout),
+            MenuItem::separator(),
+            MenuItem::os_submenu("服务", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("退出 MNS", QuitApplication),
+        ]),
+        Menu::new("文件").items([
+            MenuItem::action("打开主窗口", ShowMainWindow),
+            MenuItem::separator(),
+            MenuItem::action("关闭窗口", CloseMainWindow),
+        ]),
+        Menu::new("操作").items([
+            MenuItem::action("更新数据", RefreshData),
+            MenuItem::action("今日巡检", RunTodayReview),
+            MenuItem::action("开始自主任务", RunDefaultGoal),
+            MenuItem::separator(),
+            MenuItem::action("本月计划", OpenPlanPage),
+            MenuItem::action("助手结论", OpenAgentPage),
+        ]),
+    ]
+}
+
+fn open_page(cx: &mut App, page: Page) {
+    ensure_window(cx);
+    cx.activate(true);
+    if let Some(view) = cx.global::<GuiState>().view.clone() {
+        view.update(cx, |shell, cx| shell.navigate(page, cx));
+    }
+}
+
 fn ensure_window(cx: &mut App) {
     if cx.global::<GuiState>().window.is_some() {
         return;
@@ -1230,11 +1356,265 @@ fn ensure_window(cx: &mut App) {
     }
 }
 
+// ─────────────────────────── Tray brief ───────────────────────────
+
+/// What the tray can say without opening a window.
+///
+/// The tray is a read surface, not a second dashboard and not a control panel
+/// for the agent runtime. Engine advice (derived from the rebalance band) and
+/// the external agent's conclusion are separate fields: a model's opinion must
+/// never read as a rule of the strategy, and neither is a timing signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrayBrief {
+    /// Short label beside the icon in the menu bar.
+    title: String,
+    /// Full sentence for the native tooltip.
+    tooltip: String,
+    /// Calendar day of this brief; makes cross-midnight refresh deterministic
+    /// even when every account number happens to be unchanged.
+    day_label: String,
+    /// Date + freshness, always shown so an old number cannot read as "today".
+    as_of: String,
+    /// Account facts, already formatted, in display order.
+    facts: Vec<String>,
+    /// Engine advice. Never a buy/sell timing call.
+    advice: String,
+    /// Daily review state.
+    review: String,
+    /// External agent conclusion, explicitly labelled.
+    agent_note: Option<String>,
+    /// Whether an agent run is active (controls the run/stop menu item).
+    running: bool,
+}
+
+impl Default for TrayBrief {
+    fn default() -> Self {
+        Self {
+            title: "MNS".to_owned(),
+            tooltip: "Money Never Sleeps · 正在读取本地数据".to_owned(),
+            day_label: "今日".to_owned(),
+            as_of: "正在读取本地数据…".to_owned(),
+            facts: Vec::new(),
+            advice: "打开 MNS 查看账户状态".to_owned(),
+            review: "每日巡检：未设置".to_owned(),
+            agent_note: None,
+            running: false,
+        }
+    }
+}
+
+/// The four states the tray can be in. A pure classification keeps the copy
+/// below from silently disagreeing with the rules that produce it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdviceKind {
+    NeedSignal,
+    NeedPlan,
+    Rebalance,
+    Hold,
+}
+
+fn tray_advice_kind(has_signal: bool, has_plan: bool, has_orders: bool) -> AdviceKind {
+    if !has_signal {
+        AdviceKind::NeedSignal
+    } else if !has_plan {
+        AdviceKind::NeedPlan
+    } else if has_orders {
+        AdviceKind::Rebalance
+    } else {
+        AdviceKind::Hold
+    }
+}
+
+/// Title suffix + advice line for one state. Staleness only appends a caveat:
+/// old data must never be upgraded into a fresh "no action" claim.
+fn tray_advice_copy(
+    kind: AdviceKind,
+    plan: Option<&PlanView>,
+    blocked: Option<&str>,
+    stale: bool,
+) -> (&'static str, String) {
+    let caveat = if stale {
+        "；数据非当日，建议先更新"
+    } else {
+        ""
+    };
+    let (label, mut text) = match kind {
+        AdviceKind::NeedSignal => ("待更新", "尚无情绪数据，先更新数据才能生成计划".to_owned()),
+        AdviceKind::NeedPlan => (
+            "待设置",
+            format!(
+                "计划未生成：{}",
+                blocked.unwrap_or("缺少生成计划所需的数据")
+            ),
+        ),
+        AdviceKind::Rebalance => match plan {
+            Some(plan) => (
+                "待调仓",
+                format!(
+                    "再平衡计划：买入 {} / 卖出 {}",
+                    money(plan.total_buy),
+                    money(plan.total_sell)
+                ),
+            ),
+            None => ("待设置", "再平衡计划缺少数据".to_owned()),
+        },
+        AdviceKind::Hold => {
+            let band = plan.map(|plan| plan.band_pp).unwrap_or(0.0);
+            (
+                "无需动作",
+                format!("偏离未触发 ±{:.1}pp，今天无需调仓", band),
+            )
+        }
+    };
+    // NeedSignal / NeedPlan are already instructions; a caveat would repeat them.
+    if matches!(kind, AdviceKind::Rebalance | AdviceKind::Hold) {
+        text.push_str(caveat);
+    }
+    (label, text)
+}
+
+/// A menu item is a single native line: control characters and long agent
+/// prose would otherwise blow the menu's width open.
+fn tray_line(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let clean = clean.trim();
+    if clean.chars().count() <= max {
+        return clean.to_owned();
+    }
+    let mut shortened: String = clean.chars().take(max.saturating_sub(1)).collect();
+    shortened.push('…');
+    shortened
+}
+
+fn tray_review_line(
+    agent: &AgentState,
+    settings: &AgentSettings,
+    last_daily: Option<&str>,
+    today: &str,
+) -> String {
+    if agent.is_running() {
+        return format!("巡检中：{}", tray_line(&agent.detail, 36));
+    }
+    if agent.state == RunState::Failed {
+        return format!(
+            "上次任务失败：{}",
+            tray_line(agent.error.as_deref().unwrap_or("未知错误"), 36)
+        );
+    }
+    if !settings.daily_review {
+        return "每日巡检：未开启".to_owned();
+    }
+    let time = settings.daily_review_time.trim();
+    if last_daily == Some(today) {
+        format!("每日巡检 {} · 今日已触发", time)
+    } else {
+        format!("每日巡检 {} · 今日待触发", time)
+    }
+}
+
+fn tray_brief(
+    data: Option<&Snapshot>,
+    load_error: Option<&str>,
+    agent: &AgentState,
+    settings: &AgentSettings,
+    last_daily: Option<&str>,
+    day_label: &str,
+    today: &str,
+) -> TrayBrief {
+    let mut brief = TrayBrief::default();
+    brief.day_label = day_label.to_owned();
+    brief.running = agent.is_running();
+    brief.review = tray_review_line(agent, settings, last_daily, today);
+    brief.agent_note = agent
+        .decision
+        .as_ref()
+        .map(|report| format!("助手结论：{}", tray_line(&report.headline(), 42)));
+
+    if let Some(error) = load_error {
+        brief.title = "MNS · 读取失败".to_owned();
+        brief.as_of = "本地数据不可用".to_owned();
+        brief.advice = format!("读取失败：{}", tray_line(error, 48));
+        brief.tooltip = format!("Money Never Sleeps · {}", brief.advice);
+        return brief;
+    }
+
+    let Some(data) = data else {
+        return brief;
+    };
+    brief.as_of = format!(
+        "数据截至 {} · {}",
+        data.as_of.format("%Y-%m-%d"),
+        data.freshness.summary()
+    );
+
+    brief.facts.push(format!(
+        "总资产 {} · XIRR {}",
+        money(data.total_assets),
+        data.xirr.map(pct_signed).unwrap_or_else(|| "—".to_owned())
+    ));
+    if let Some(plan) = &data.plan {
+        brief.facts.push(format!(
+            "风险仓位 {} / 目标 {} · 偏离 {}",
+            pct_points(plan.current_risk_pct),
+            pct_points(plan.target_risk_pct),
+            pp_signed(plan.current_risk_pct - plan.target_risk_pct),
+        ));
+    } else {
+        brief
+            .facts
+            .push(format!("风险仓位 {}", pct_points(data.risk_weight_pct())));
+    }
+    if let Some(signal) = &data.signal {
+        brief.facts.push(format!(
+            "情绪 {:.0} {} · {} · 决策日 {}",
+            signal.effective_score,
+            signal.effective_zone,
+            if signal.confirmed {
+                "区间已确认"
+            } else {
+                "区间未确认"
+            },
+            data.config.decision_label,
+        ));
+    } else {
+        brief
+            .facts
+            .push("尚无情绪数据，无法给出目标仓位".to_owned());
+    }
+
+    // Sunday prices are legitimately a day old, so staleness is a caveat on
+    // the advice rather than a verdict that replaces it.
+    let stale = data.freshness.price_is_stale()
+        || data
+            .freshness
+            .fgi_age_days
+            .map(|days| days >= 1)
+            .unwrap_or(true);
+    let kind = tray_advice_kind(
+        data.signal.is_some(),
+        data.plan.is_some(),
+        data.plan.as_ref().is_some_and(|plan| plan.has_orders()),
+    );
+    let (label, advice) = tray_advice_copy(
+        kind,
+        data.plan.as_ref(),
+        data.plan_blocked.as_deref(),
+        stale,
+    );
+    brief.title = format!("MNS · {label}");
+    brief.advice = advice;
+    brief.tooltip = format!("{} · {}", brief.advice, brief.as_of);
+    brief
+}
+
 fn setup_tray(cx: &mut App) -> gpui_tray::Result<()> {
     let tray = Tray::builder()
         .icon(tray_icon()?)
         .title("MNS")
-        .tooltip("Money Never Sleeps · 投资助手")
+        .tooltip("Money Never Sleeps · 正在读取本地数据")
         .on_activate(ShowMainWindow)
         .menu(build_tray_menu)
         .build(cx)?;
@@ -1242,22 +1622,86 @@ fn setup_tray(cx: &mut App) -> gpui_tray::Result<()> {
     Ok(())
 }
 
+/// The window may be hidden or closed; `GuiState` keeps the view alive, so the
+/// tray still reads the same account state the dashboard would show.
+fn current_tray_brief(cx: &mut App) -> TrayBrief {
+    let now = chrono::Local::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    const WEEKDAYS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+    let weekday = WEEKDAYS[now.weekday().num_days_from_monday() as usize];
+    let day_label = format!("今日 {} 周{}", now.format("%m-%d"), weekday);
+    let Some(view) = cx.global::<GuiState>().view.clone() else {
+        return TrayBrief::default();
+    };
+    let shell = view.read(cx);
+    tray_brief(
+        shell.data.as_ref(),
+        shell.load_error.as_deref(),
+        &shell.agent,
+        &shell.agent_settings,
+        shell.last_daily.as_deref(),
+        &day_label,
+        &today,
+    )
+}
+
+/// Rebuild every tray surface together. `refresh_menu` alone would leave the
+/// menu bar label and the tooltip showing yesterday's conclusion.
+fn refresh_tray(cx: &mut App) {
+    let Some(tray) = cx.global::<GuiState>().tray.clone() else {
+        return;
+    };
+    let brief = current_tray_brief(cx);
+    let _ = tray.set_title(Some(brief.title.clone()), cx);
+    let _ = tray.set_tooltip(Some(brief.tooltip.clone()), cx);
+
+    // The title/tooltip setters are cheap no-ops when unchanged; recompiling
+    // the native menu is not, so it only happens on a real state change.
+    let changed = cx.global::<GuiState>().last_tray_brief.as_ref() != Some(&brief);
+    if changed {
+        cx.global_mut::<GuiState>().last_tray_brief = Some(brief);
+        let _ = tray.refresh_menu(cx);
+    }
+}
+
+/// Disabled actions are the only way to put read-only text in a native menu.
+fn tray_info(label: impl Into<SharedString>) -> MenuItem {
+    MenuItem::action(label, NoAction).disabled(true)
+}
+
 fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
-    let status = cx
-        .global::<GuiState>()
-        .view
-        .as_ref()
-        .map(|view| view.read(cx).agent.state)
-        .unwrap_or_default();
-    vec![
-        MenuItem::action("打开 MNS", ShowMainWindow),
-        MenuItem::separator(),
-        MenuItem::action(format!("任务状态：{}", status.label()), NoAction).disabled(true),
-        MenuItem::action("开始自主任务", RunDefaultGoal),
-        MenuItem::action("停止当前任务", StopCurrentTask),
-        MenuItem::separator(),
-        MenuItem::action("退出 MNS", QuitApplication),
-    ]
+    let brief = current_tray_brief(cx);
+
+    let mut items = vec![
+        tray_info(brief.day_label.clone()),
+        tray_info(tray_line(&brief.as_of, 64)),
+    ];
+    for fact in &brief.facts {
+        items.push(tray_info(tray_line(fact, 64)));
+    }
+
+    items.push(MenuItem::separator());
+    items.push(tray_info("建议"));
+    items.push(tray_info(tray_line(&brief.advice, 64)));
+    items.push(MenuItem::action("打开本月计划", OpenPlanPage));
+
+    items.push(MenuItem::separator());
+    items.push(tray_info(tray_line(&brief.review, 64)));
+    if let Some(note) = &brief.agent_note {
+        items.push(MenuItem::action(tray_line(note, 64), OpenAgentPage));
+    }
+    if brief.running {
+        items.push(MenuItem::action("停止当前任务", StopCurrentTask));
+    } else {
+        items.push(MenuItem::action("立即巡检", RunTodayReview));
+    }
+
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action("更新数据", RefreshData));
+    items.push(MenuItem::action("打开 MNS", ShowMainWindow));
+    items.push(MenuItem::action("关于 MNS", ShowAbout));
+    items.push(MenuItem::action("退出 MNS", QuitApplication));
+    items
 }
 
 fn tray_icon() -> gpui_tray::Result<Icon> {
@@ -1610,6 +2054,96 @@ impl AppShell {
                 .child(card),
         )
     }
+
+    /// "关于 MNS" lives in the macOS app menu, which stays reachable while the
+    /// window is hidden; `ensure_window` opens it before this panel appears.
+    fn about_layer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.about_open {
+            return None;
+        }
+        let data_dir = crate::config::app_data_dir().display().to_string();
+        let card = div()
+            .v_flex()
+            .w(px(420.))
+            .gap(px(14.))
+            .p(px(24.))
+            .rounded(px(RADIUS_LG))
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow(shadow_overlay())
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(brand_mark(44.))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Money Never Sleeps"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(TEXT_TERTIARY))
+                                    .child(format!("版本 {}", env!("CARGO_PKG_VERSION"))),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child("本地运行的投资决策与记账工具。只记录已成交的交易，不连接券商、不代为下单。"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_TERTIARY))
+                    .child(format!("数据目录：{data_dir}")),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .justify_end()
+                    .pt(px(4.))
+                    .child(
+                        Button::new("about-close")
+                            .primary()
+                            .label("好")
+                            .on_click(cx.listener(|shell, _, _, cx| {
+                                shell.about_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        Some(
+            div()
+                // `on_click` lives on StatefulInteractiveElement, so the
+                // overlay needs an id to become a stateful Div first.
+                .id("about-overlay")
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .w_full()
+                .h_full()
+                .bg(rgb(0x000000).opacity(0.32))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(|shell, _, _, cx| {
+                    shell.about_open = false;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
 }
 
 impl AppShell {
@@ -1893,5 +2427,104 @@ impl Render for AppShell {
             )
             .children(self.toast_layer(cx))
             .children(self.dialog_layer(window, cx))
+            .children(self.about_layer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    // Explicit imports, not `use super::*`: gpui_kit re-exports an attribute
+    // macro also named `test`, which would shadow the built-in `#[test]`.
+    use super::{
+        AdviceKind, AgentSettings, AgentState, PlanView, tray_advice_copy, tray_advice_kind,
+        tray_line, tray_review_line,
+    };
+
+    fn plan(total_buy: f64, total_sell: f64, band_pp: f64) -> PlanView {
+        PlanView {
+            monthly: 3000.0,
+            score: 50.0,
+            target_risk_pct: 60.0,
+            current_risk_pct: 58.0,
+            band_pp,
+            total_buy,
+            total_sell,
+            estimated_fees: 0.0,
+            cash_constrained: false,
+            legs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn advice_state_never_reports_orders_without_a_signal() {
+        assert_eq!(tray_advice_kind(false, true, true), AdviceKind::NeedSignal);
+        assert_eq!(tray_advice_kind(true, false, true), AdviceKind::NeedPlan);
+        assert_eq!(tray_advice_kind(true, true, true), AdviceKind::Rebalance);
+        assert_eq!(tray_advice_kind(true, true, false), AdviceKind::Hold);
+    }
+
+    #[test]
+    fn hold_copy_states_the_band_and_flags_stale_data() {
+        let plan = plan(0.0, 0.0, 4.0);
+        let (label, fresh) = tray_advice_copy(AdviceKind::Hold, Some(&plan), None, false);
+        assert_eq!(label, "无需动作");
+        assert!(fresh.contains("±4.0pp"), "{fresh}");
+        assert!(!fresh.contains("先更新"), "{fresh}");
+
+        let (_, stale) = tray_advice_copy(AdviceKind::Hold, Some(&plan), None, true);
+        assert!(stale.contains("数据非当日"), "{stale}");
+    }
+
+    #[test]
+    fn rebalance_copy_is_about_amounts_not_timing() {
+        let plan = plan(3000.0, 500.0, 4.0);
+        let (label, text) = tray_advice_copy(AdviceKind::Rebalance, Some(&plan), None, false);
+        assert_eq!(label, "待调仓");
+        assert!(text.contains("再平衡计划"), "{text}");
+        // The FGI is a position target, never a buy/sell trigger.
+        assert!(!text.contains("看多"), "{text}");
+        assert!(!text.contains("抄底"), "{text}");
+    }
+
+    #[test]
+    fn missing_plan_explains_itself() {
+        let (label, text) = tray_advice_copy(
+            AdviceKind::NeedPlan,
+            None,
+            Some("未设置每月定投金额"),
+            false,
+        );
+        assert_eq!(label, "待设置");
+        assert!(text.contains("未设置每月定投金额"), "{text}");
+    }
+
+    #[test]
+    fn menu_lines_stay_single_line_and_bounded() {
+        assert_eq!(tray_line("  今日\n建议  ", 64), "今日 建议");
+        let long = "建".repeat(80);
+        let shortened = tray_line(&long, 20);
+        assert_eq!(shortened.chars().count(), 20);
+        assert!(shortened.ends_with('…'));
+    }
+
+    #[test]
+    fn review_state_reflects_the_schedule() {
+        let agent = AgentState::new(None);
+        let mut settings = AgentSettings::default();
+        settings.daily_review = true;
+        settings.daily_review_time = "08:30".to_owned();
+        assert_eq!(
+            tray_review_line(&agent, &settings, None, "2026-11-09"),
+            "每日巡检 08:30 · 今日待触发"
+        );
+        assert_eq!(
+            tray_review_line(&agent, &settings, Some("2026-11-09"), "2026-11-09"),
+            "每日巡检 08:30 · 今日已触发"
+        );
+        settings.daily_review = false;
+        assert_eq!(
+            tray_review_line(&agent, &settings, None, "2026-11-09"),
+            "每日巡检：未开启"
+        );
     }
 }
