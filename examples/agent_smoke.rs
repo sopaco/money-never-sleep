@@ -55,6 +55,14 @@ async fn main() {
     let settings = load_settings();
 
     println!("agent_cli = {}", settings.agent_cli);
+    println!(
+        "model     = {}",
+        if settings.model.trim().is_empty() {
+            "(agent default)"
+        } else {
+            settings.model.trim()
+        }
+    );
     println!("policy    = {:?}", settings.permission_policy);
     println!("goal      = {goal}");
     println!("---");

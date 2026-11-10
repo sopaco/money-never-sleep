@@ -193,7 +193,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
             .gap(px(10.))
             .child(card_header(
                 "外部 Agent",
-                "只配置 CLI 路径；推理端点与凭据由 opencode 自己管理",
+                "只配置 CLI 路径与模型名；推理端点与凭据由 opencode 自己管理",
             ))
             .child(
                 div()
@@ -226,8 +226,17 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         ),
                     ),
             )
+            .child(
+                div()
+                    .v_flex()
+                    .gap(px(4.))
+                    .child(caption("模型（可选）"))
+                    .child(Input::new(&shell.model)),
+            )
             .child(caption(
-                "MNS 自动追加 `acp` 子命令。当前只支持 opencode 作为外部 Agent。",
+                "MNS 自动追加 `acp` 子命令。模型留空则沿用 opencode 自己配置的默认模型；\
+                 需要指定时按 provider/model 填写，例如 opencode/deepseek-v4.1-flash-free。\
+                 这里只保存名字、不内置清单——免费模型随时会变。",
             )),
     );
 

@@ -420,6 +420,8 @@ pub(crate) struct AppShell {
     pub(crate) followup: Entity<TextareaState>,
     pub(crate) cli: Entity<InputState>,
     pub(crate) cwd: Entity<InputState>,
+    /// Free-text model id. Empty defers to the external agent's own default.
+    pub(crate) model: Entity<InputState>,
     pub(crate) daily_time: Entity<InputState>,
     pub(crate) monthly: Entity<InputState>,
     /// Date (`YYYY-MM-DD`) of the last scheduled review this process started.
@@ -488,6 +490,11 @@ impl AppShell {
                 .placeholder("留空则使用启动目录")
                 .default_value(agent_settings.working_dir.clone())
         });
+        let model = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("例如 opencode/deepseek-v4.1-flash-free")
+                .default_value(agent_settings.model.clone())
+        });
         let daily_time = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("08:30")
@@ -534,6 +541,7 @@ impl AppShell {
             followup,
             cli,
             cwd,
+            model,
             daily_time,
             monthly,
             last_daily: read_last_daily(),
@@ -972,6 +980,7 @@ impl AppShell {
     fn persist_agent_settings(&mut self, cx: &mut Context<Self>) {
         self.agent_settings.agent_cli = self.cli.read(cx).value().trim().to_owned();
         self.agent_settings.working_dir = self.cwd.read(cx).value().trim().to_owned();
+        self.agent_settings.model = self.model.read(cx).value().trim().to_owned();
         if let Err(error) = save_settings(&self.agent_settings) {
             self.agent.error = Some(error);
         }
@@ -1077,7 +1086,16 @@ impl AppShell {
         self.persist_agent_settings(cx);
         match save_settings(&self.agent_settings) {
             Ok(()) => {
-                self.show_toast("外部 Agent 设置已保存".to_owned(), ToastTone::Success, cx);
+                // A model id opencode cannot resolve fails at the provider with
+                // the same opaque quota/HTTP error shape, so say the shape out
+                // loud here rather than letting the run discover it.
+                let model = self.agent_settings.model.clone();
+                let text = if !model.is_empty() && !model.contains('/') {
+                    format!("已保存；模型名通常写作 provider/model，当前是「{model}」")
+                } else {
+                    "外部 Agent 设置已保存".to_owned()
+                };
+                self.show_toast(text, ToastTone::Success, cx);
             }
             Err(error) => {
                 self.show_toast(error, ToastTone::Error, cx);

@@ -2,10 +2,19 @@
 //!
 //! # Design boundary
 //!
-//! MNS deliberately does **not** own a model, an inference endpoint or an API
-//! key. It only needs the path of an ACP-compatible CLI (first supported target:
-//! `opencode`) and automatically appends the `acp` subcommand. Provider, model
-//! and credentials stay in the external agent's own configuration.
+//! MNS deliberately does **not** own an inference endpoint or an API key. It
+//! only needs the path of an ACP-compatible CLI (first supported target:
+//! `opencode`) and automatically appends the `acp` subcommand. Provider,
+//! credentials and endpoint stay in the external agent's own configuration.
+//!
+//! One thing MNS does carry is an optional **model name**. The ACP surface has
+//! no model selector — `opencode acp` has no `--model` flag and the protocol
+//! version MNS speaks has no `session/set_model` request — so a session would
+//! silently inherit the agent's global default. That default is a paid model
+//! for opencode, which turns "free models work locally" into an opaque
+//! `-32603 / provider.quota` the moment the GUI runs it. The field is a plain
+//! string, never a fixed list: free model ids come and go, and only the user
+//! knows which one their account may use today.
 //!
 //! # Autonomy
 //!
@@ -68,6 +77,13 @@ impl PermissionPolicy {
 pub struct AgentSettings {
     /// Absolute path (or name on PATH) of the external ACP agent CLI.
     pub agent_cli: String,
+    /// Optional model id handed to the external agent, e.g.
+    /// `opencode/deepseek-v4.1-flash-free`.
+    ///
+    /// Stored as free text on purpose: free/qualified model ids change far more
+    /// often than this app ships, and the user's own account decides which ones
+    /// are usable. Empty means "do not touch the agent's default".
+    pub model: String,
     /// Extra CLI arguments. MNS always appends `acp` when it is missing.
     pub extra_args: Vec<String>,
     /// Session working directory. Empty means the launch directory.
@@ -83,6 +99,7 @@ impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             agent_cli: detect_agent_cli(),
+            model: String::new(),
             extra_args: Vec::new(),
             working_dir: String::new(),
             permission_policy: PermissionPolicy::Autonomous,
@@ -381,12 +398,17 @@ mod tests {
         assert!(settings.extra_args.is_empty());
         assert_eq!(settings.permission_policy, PermissionPolicy::Autonomous);
         assert!(settings.working_dir.is_empty());
+        assert!(
+            settings.model.is_empty(),
+            "an unset model must defer to the agent's own default"
+        );
     }
 
     #[test]
     fn settings_round_trip_never_contains_an_endpoint_or_api_key() {
         let settings = AgentSettings {
             agent_cli: "/opt/bin/opencode".to_owned(),
+            model: "opencode/deepseek-v4.1-flash-free".to_owned(),
             extra_args: vec!["--log-level".to_owned(), "warn".to_owned()],
             working_dir: "/tmp/mns-work".to_owned(),
             permission_policy: PermissionPolicy::GuardWrites,
@@ -398,6 +420,10 @@ mod tests {
         assert!(!encoded.to_lowercase().contains("base_url"));
         let decoded: AgentSettings = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.agent_cli, settings.agent_cli);
+        assert_eq!(
+            decoded.model, "opencode/deepseek-v4.1-flash-free",
+            "the model name is user data, not a value MNS may rewrite"
+        );
         assert_eq!(decoded.extra_args, settings.extra_args);
         assert_eq!(decoded.working_dir, settings.working_dir);
         assert_eq!(decoded.permission_policy, PermissionPolicy::GuardWrites);

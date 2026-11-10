@@ -300,6 +300,47 @@ fn agent_env(cli: &Path, existing_path: &str) -> Vec<(String, String)> {
     vars
 }
 
+/// Optional model override handed to the external agent as an extra env var.
+///
+/// Why an env var instead of an argument: `opencode acp` accepts no `--model`
+/// flag, and the ACP version this crate speaks has no `session/set_model`
+/// request, so a session started by the GUI would otherwise inherit the
+/// agent's global default — which for opencode is a paid model, surfacing as an
+/// opaque `-32603 / provider.quota` when the account has no balance.
+///
+/// `OPENCODE_CONFIG_CONTENT` is opencode's inline config layer: it is parsed as
+/// one more config document that merges over the user's own file *for this
+/// child process only*. Verified end to end: the file said one model, this var
+/// said another, and the ACP session used the var. An empty value returns
+/// `None` so an unset field really means "leave the agent alone".
+fn model_env(model: &str) -> Option<(String, String)> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    // Respect an inline config the user may already have exported: merge into
+    // it rather than replacing it, so a model field never eats other keys.
+    let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    Some((
+        "OPENCODE_CONFIG_CONTENT".to_owned(),
+        merge_model_config(existing.as_deref(), model),
+    ))
+}
+
+/// Put `model` into an inline opencode config, keeping whatever the user had.
+fn merge_model_config(existing: Option<&str>, model: &str) -> String {
+    let mut content = existing
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    content.insert(
+        "model".to_owned(),
+        serde_json::Value::String(model.to_owned()),
+    );
+    serde_json::Value::Object(content).to_string()
+}
+
 fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig {
     let base = if settings.agent_cli.trim().is_empty() {
         detect_agent_cli()
@@ -322,12 +363,19 @@ fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig
         AcpAgentConfig::new(base).args(args)
     };
 
-    match cli {
-        Some(cli) => {
-            let existing = std::env::var("PATH").unwrap_or_default();
-            config.envs(agent_env(cli, &existing))
-        }
-        None => config,
+    let mut vars: Vec<(String, String)> = Vec::new();
+    if let Some(model) = model_env(&settings.model) {
+        vars.push(model);
+    }
+    if let Some(cli) = cli {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        vars.extend(agent_env(cli, &existing));
+    }
+
+    if vars.is_empty() {
+        config
+    } else {
+        config.envs(vars)
     }
 }
 
@@ -381,7 +429,7 @@ fn compose_goal(goal: &str, cwd: &Path, cli: Option<&Path>) -> String {
          {cli_rule}\n\
          - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
          - 工作目录可写，但不要另建记录或存档文件：最终结论只通过回答里的 mns-decision 块回传，由 MNS 统一保存与展示。\n\
-         - 模型、推理端点与凭据由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
+         - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
          MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
          - 完成后用中文输出：已完成事项、涉及的文件或命令、以及未完成或有风险的事项。",
         cwd = cwd.display()
@@ -458,6 +506,16 @@ async fn run_session(
             "未检测到 mns CLI：本次任务不提供账户数据入口",
         ),
     }
+    // Naming the model in the timeline is the fastest way to answer "did my
+    // setting actually reach the agent?" when a provider rejects the call.
+    emit_entry(
+        &events,
+        EntryKind::System,
+        match settings.model.trim() {
+            "" => "模型：沿用外部 Agent 的默认模型".to_owned(),
+            model => format!("模型：{model}"),
+        },
+    );
 
     let agent = AcpAgent::new(config);
     let prompt_text = compose_goal(&goal, &cwd, cli.as_deref());
@@ -1151,6 +1209,52 @@ mod tests {
             path.starts_with("/Applications/MNS.app/Contents/MacOS:"),
             "the bundle directory must come first so a bare `mns` resolves to it, got {path}"
         );
+    }
+
+    #[test]
+    fn launch_config_forwards_the_typed_model_as_inline_config() {
+        let settings = AgentSettings {
+            agent_cli: "opencode".to_owned(),
+            model: "  opencode/deepseek-v4.1-flash-free  ".to_owned(),
+            ..AgentSettings::default()
+        };
+        let config = launch_config(&settings, None);
+        let raw = config
+            .environment()
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("a typed model must reach the agent");
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            value["model"], "opencode/deepseek-v4.1-flash-free",
+            "whitespace is trimmed; the id itself is passed through untouched"
+        );
+    }
+
+    #[test]
+    fn launch_config_leaves_the_agent_alone_without_a_model() {
+        let settings = AgentSettings {
+            agent_cli: "opencode".to_owned(),
+            ..AgentSettings::default()
+        };
+        let config = launch_config(&settings, None);
+        assert!(
+            config.environment().is_empty(),
+            "an empty field must not override the agent's own default: {:?}",
+            config.environment()
+        );
+    }
+
+    #[test]
+    fn merge_model_config_keeps_what_the_user_already_exported() {
+        let merged =
+            merge_model_config(Some(r#"{"theme":"dark","model":"old/model"}"#), "new/model");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["theme"], "dark", "unrelated keys survive");
+        assert_eq!(value["model"], "new/model", "the settings field wins");
+
+        let broken = merge_model_config(Some("not json"), "new/model");
+        let value: serde_json::Value = serde_json::from_str(&broken).unwrap();
+        assert_eq!(value["model"], "new/model");
     }
 
     #[test]
