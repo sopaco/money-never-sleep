@@ -12,7 +12,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Utc};
 use crate::config::{AppConfig, RiskProfile};
 use crate::db::Database;
 use crate::models::Position;
-use crate::{metrics, quote, sentiment, signal, strategy};
+use crate::{discipline, guardrail, metrics, quote, sentiment, signal, strategy};
 
 /// Category keys in the order the product presents them.
 pub const CATEGORY_KEYS: [&str; 3] = ["us_stocks", "cn_stocks", "counter_cyclical"];
@@ -181,6 +181,84 @@ impl PlanView {
     }
 }
 
+/// 决策日再平衡结论（`mns report` 决策版同源）。与 `PlanView`（月度定投，
+/// 只买不卖）是两个语义：这里允许卖出来回到目标带。
+#[derive(Clone, Debug)]
+pub struct RebalanceView {
+    pub score: f64,
+    pub target_risk_pct: f64,
+    pub current_risk_pct: f64,
+    pub band_pp: f64,
+    pub total_buy: f64,
+    pub total_sell: f64,
+    pub cash_constrained: bool,
+    pub legs: Vec<LegView>,
+}
+
+impl RebalanceView {
+    pub fn has_orders(&self) -> bool {
+        self.total_buy >= 1.0 || self.total_sell >= 1.0
+    }
+}
+
+/// `reports/` 里最新一份存档报告，供 GUI 只读回看。`date` 取自文件名。
+#[derive(Clone, Debug)]
+pub struct LatestReport {
+    pub date: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// F2 买入冷静期的过热上下文。`None` = 护栏关闭或未过热（不过热时是
+/// `Some` 里的非 hot 判定，见 `load_snapshot` 的过滤）。
+#[derive(Clone, Debug)]
+pub struct GuardrailHot {
+    pub effective_score: f64,
+    pub hot_threshold: f64,
+    pub cooldown_days: u32,
+}
+
+/// F2 买入冷静期判定结果（纯数据，供 GUI 渲染与 note 前缀推导）。
+#[derive(Clone, Debug, Default)]
+pub struct BuyGuardrail {
+    /// (a) 基金不在计划条目里（定投计划 ∪ 再平衡计划都没有它）。
+    pub out_of_plan: bool,
+    /// (b) 金额 > 2×该基金计划买入额 且 > 最小交易额。
+    pub oversized: bool,
+    /// 该基金的计划买入额合计（(b) 的文案用；计划外时为 0）。
+    pub planned_amount: f64,
+    /// (c) 过热上下文；None = 没有过热（或护栏关闭）。
+    pub hot: Option<GuardrailHot>,
+}
+
+impl BuyGuardrail {
+    /// (a)/(b) 触发 → 理由必填；纯 (c) → 选填。
+    pub fn reason_required(&self) -> bool {
+        self.out_of_plan || self.oversized
+    }
+
+    /// 是否需要弹冷静期层（不阻断，只是先让用户写理由）。
+    pub fn triggered(&self) -> bool {
+        self.reason_required() || self.hot.is_some()
+    }
+
+    /// 落库 note 的结构化前缀（F3 按前缀分桶，不猜测）：
+    ///   (a)/(b) → 「计划外冷静：{理由}」；
+    ///   纯 (c) 写了理由 → 「过热冷静：{理由}」；
+    ///   纯 (c) 没写理由 → 整条为 None（F3 归「未标记」——按计划执行
+    ///   不该被表述成上头）。
+    pub fn build_note(&self, reason: &str) -> Option<String> {
+        let reason = reason.trim();
+        if self.reason_required() {
+            Some(format!("{}{reason}", discipline::OUT_OF_PLAN_PREFIX))
+        } else if self.hot.is_some() && !reason.is_empty() {
+            Some(format!("{}{reason}", discipline::HOT_CALM_PREFIX))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FlowRow {
     pub date: NaiveDate,
@@ -276,9 +354,20 @@ pub struct Snapshot {
     pub signal: Option<SignalView>,
     pub plan: Option<PlanView>,
     pub plan_blocked: Option<String>,
+    /// 决策日再平衡结论（与 `mns report` 决策版同源）。缺情绪历史时为
+    /// None，UI 给空态，而不是用 50 分伪造一个可执行的结论。
+    pub rebalance: Option<RebalanceView>,
+    /// 下一个决策日；`decision_weekday = 0`（每天决策）时为 None。
+    pub next_decision_day: Option<NaiveDate>,
+    /// `reports/` 最新一份存档报告，只读回看用。
+    pub latest_report: Option<LatestReport>,
+    /// F2 买入冷静期的过热上下文。None = 护栏关闭或未过热。
+    pub guardrail_hot: Option<GuardrailHot>,
     pub fgi_history: Vec<(NaiveDate, f64)>,
     pub flows: Vec<FlowRow>,
     pub trades: Vec<TradeRow>,
+    /// 本年交易纪律统计（按 note 前缀分桶，不推断未标记的意图）。
+    pub discipline: discipline::YearReview,
     pub freshness: Freshness,
     pub config: ConfigView,
     pub counts: Counts,
@@ -450,28 +539,6 @@ pub fn load_snapshot() -> Result<Snapshot> {
             .map(|s| s.effective_score)
             .unwrap_or(50.0);
         let plan = strategy::calculate_monthly_plan(&config, score, cash, &positions, monthly);
-        let legs = plan
-            .legs
-            .iter()
-            .map(|leg| LegView {
-                category_cn: leg.category_cn.clone(),
-                target_pct: leg.target_weight,
-                current_pct: leg.current_weight,
-                drift_pp: leg.drift_pp,
-                amount: leg.amount,
-                hold_reason: leg.hold_reason.clone(),
-                items: leg
-                    .items
-                    .iter()
-                    .map(|item| LegItemView {
-                        code: item.asset_code.clone(),
-                        name: item.asset_name.clone(),
-                        amount: item.amount,
-                        note: item.note.clone(),
-                    })
-                    .collect(),
-            })
-            .collect();
         (
             Some(PlanView {
                 monthly,
@@ -483,11 +550,49 @@ pub fn load_snapshot() -> Result<Snapshot> {
                 total_sell: plan.total_sell,
                 estimated_fees: plan.estimated_fees(&config.costs),
                 cash_constrained: plan.cash_constrained,
-                legs,
+                legs: leg_views(&plan.legs),
             }),
             None,
         )
     };
+
+    // 本周结论的数据底座：决策日再平衡计划，与 `mns report` 决策版同源。
+    // 只要本地有情绪历史就算得出（含非决策日的偏离上下文），UI 决定怎么
+    // 呈现"操作/不操作"；缺数据时给 None + 空态。
+    let rebalance = if fgi_history.is_empty() {
+        None
+    } else {
+        let score = signal_view
+            .as_ref()
+            .map(|s| s.effective_score)
+            .unwrap_or(50.0);
+        let plan = strategy::calculate_rebalance_plan(&config, score, cash, &positions, today);
+        Some(RebalanceView {
+            score,
+            target_risk_pct: plan.target_risk_weight,
+            current_risk_pct: plan.current_risk_weight,
+            band_pp: plan.band_pp,
+            total_buy: plan.total_buy,
+            total_sell: plan.total_sell,
+            cash_constrained: plan.cash_constrained,
+            legs: leg_views(&plan.legs),
+        })
+    };
+
+    let next_decision_day = signal::next_decision_day(today, config.rebalance.decision_weekday);
+    let latest_report = latest_archived_report(&config);
+
+    // F2 过热上下文：只在真过热时给出（render 的非过热分支是 CLI 的
+    // 「按既定计划执行」话术，对 GUI 冷静期层没有意义）。
+    let guardrail_hot = signal_view.as_ref().and_then(|s| {
+        guardrail::evaluate(&config, s.effective_score)
+            .filter(|advice| advice.hot)
+            .map(|advice| GuardrailHot {
+                effective_score: s.effective_score,
+                hot_threshold: config.guardrail.hot_threshold,
+                cooldown_days: advice.cooldown_days,
+            })
+    });
 
     let freshness = build_freshness(&db, &positions, &series, today)?;
 
@@ -563,6 +668,25 @@ pub fn load_snapshot() -> Result<Snapshot> {
         flows: flows.len(),
     };
 
+    // 纪律复盘按自然年统计「今年操作几次」，不能用上面那 12 条交易
+    // （limit 是行数，不是时间窗）。日期解析失败的行跳过：审计链写入的
+    // 都是 `YYYY-MM-DD`，无法归年的脏数据不该被算进任何一年。
+    let year_txs: Vec<(NaiveDate, Option<String>)> = db
+        .list_transactions_since(&format!("{}-01-01", today.year()))?
+        .into_iter()
+        .filter_map(|tx| {
+            NaiveDate::parse_from_str(&tx.tx_date, "%Y-%m-%d")
+                .ok()
+                .map(|date| (date, tx.note))
+        })
+        .collect();
+    let discipline = discipline::review(
+        today.year(),
+        config.backtest.annual_trade_budget_min,
+        config.backtest.annual_trade_budget_max,
+        year_txs,
+    );
+
     Ok(Snapshot {
         as_of: today,
         cash,
@@ -578,12 +702,79 @@ pub fn load_snapshot() -> Result<Snapshot> {
         signal: signal_view,
         plan,
         plan_blocked,
+        rebalance,
+        next_decision_day,
+        latest_report,
+        guardrail_hot,
         fgi_history,
         flows,
         trades,
+        discipline,
         freshness,
         config: config_view,
         counts,
+    })
+}
+
+/// `strategy::LegPlan` → `LegView`，定投计划与再平衡结论共用同一映射，
+/// 两个视图的字段永远不漂移。
+fn leg_views(legs: &[strategy::LegPlan]) -> Vec<LegView> {
+    legs.iter()
+        .map(|leg| LegView {
+            category_cn: leg.category_cn.clone(),
+            target_pct: leg.target_weight,
+            current_pct: leg.current_weight,
+            drift_pp: leg.drift_pp,
+            amount: leg.amount,
+            hold_reason: leg.hold_reason.clone(),
+            items: leg
+                .items
+                .iter()
+                .map(|item| LegItemView {
+                    code: item.asset_code.clone(),
+                    name: item.asset_name.clone(),
+                    amount: item.amount,
+                    note: item.note.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// `reports/` 目录里最新一份存档报告。文件名是 ISO 日期，字典序即时间序。
+/// 目录不存在（还没跑过 report）与空目录同等对待，返回 None。
+fn latest_archived_report(config: &AppConfig) -> Option<LatestReport> {
+    latest_report_in_dir(&config.report_dir())
+}
+
+/// 独立出目录参数以便测试；不读 `~/.mns` 也能覆盖选取逻辑。
+fn latest_report_in_dir(dir: &std::path::Path) -> Option<LatestReport> {
+    let mut newest: Option<(String, std::path::PathBuf, String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // 半写坏的文件读不出来就跳过，不让一份坏文件挡住回看。
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .map(|(name, _, _)| stem > name.as_str())
+            .unwrap_or(true)
+        {
+            newest = Some((stem.to_owned(), path, content));
+        }
+    }
+    let (date, path, content) = newest?;
+    Some(LatestReport {
+        date,
+        path: path.display().to_string(),
+        content,
     })
 }
 
@@ -798,9 +989,52 @@ pub fn add_asset(code: &str, name: &str, category: &str) -> Result<()> {
     db.add_position(code, name, category)
 }
 
-pub fn buy(code: &str, shares: f64, price: f64) -> Result<()> {
+pub fn buy(code: &str, shares: f64, price: f64, note: Option<&str>) -> Result<()> {
     let db = Database::open()?;
-    db.buy_position(code.trim(), shares, price)
+    db.buy_position(code.trim(), shares, price, note)
+}
+
+/// F2 买入冷静期判定（纯函数，不碰 IO，方便回归测试）。
+///
+/// 触发条件（满足其一即弹冷静期层；**不阻断交易**，理由写完照常落库）：
+///   (a) 基金不在计划条目里——计划 = 定投计划 ∪ 再平衡计划的 items；
+///   (b) 金额 > 2×该基金计划买入额 且 > 最小交易额（产品拍板的下限，
+///       避免小额偏差也被表述成「计划外」）；
+///   (c) 情绪过热（`guardrail::evaluate` 判 hot，阈值与开关同 CLI 单源）。
+///
+/// 降级规则：定投或再平衡计划**任一**缺失 → 跳过 (a)/(b)——腿计划金额
+/// 来自两条链，缺任何一条时 2× 比较与「计划内」判定都不完整，宁可不判，
+/// 绝不因数据缺失拦人（产品拍板）；过热上下文缺失 → 跳过 (c)。(c) 独立
+/// 于计划数据，不受计划降级影响。
+pub fn evaluate_buy_guardrail(
+    code: &str,
+    amount: f64,
+    plan: Option<&PlanView>,
+    rebalance: Option<&RebalanceView>,
+    min_trade_amount: f64,
+    hot: Option<GuardrailHot>,
+) -> BuyGuardrail {
+    let legs = plan
+        .into_iter()
+        .flat_map(|view| view.legs.iter())
+        .chain(rebalance.into_iter().flat_map(|view| view.legs.iter()));
+    let mut planned_amount = 0.0;
+    let mut in_plan = false;
+    for leg in legs {
+        for item in &leg.items {
+            if item.code == code {
+                in_plan = true;
+                planned_amount += item.amount.max(0.0);
+            }
+        }
+    }
+    let plans_complete = plan.is_some() && rebalance.is_some();
+    BuyGuardrail {
+        out_of_plan: plans_complete && !in_plan,
+        oversized: plans_complete && amount > 2.0 * planned_amount && amount > min_trade_amount,
+        planned_amount,
+        hot,
+    }
 }
 
 pub fn sell(code: &str, shares: f64, price: f64) -> Result<()> {
@@ -831,4 +1065,219 @@ pub fn today_report_path() -> Option<std::path::PathBuf> {
 
 pub fn decision_weekday_today() -> u32 {
     Local::now().weekday().num_days_from_monday() + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 独立临时目录，避免测试碰 `~/.mns`。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("mns-app-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn 最新报告按文件名取最大日期() {
+        let dir = temp_dir("latest-report");
+        std::fs::write(dir.join("2026-11-06.txt"), "older").unwrap();
+        std::fs::write(dir.join("2026-11-13.txt"), "newer").unwrap();
+        std::fs::write(dir.join("2026-11-09.txt"), "middle").unwrap();
+        std::fs::write(dir.join("notes.md"), "not a report").unwrap();
+        let got = latest_report_in_dir(&dir);
+        assert_eq!(got.as_ref().map(|r| r.date.as_str()), Some("2026-11-13"));
+        assert_eq!(got.as_ref().map(|r| r.content.as_str()), Some("newer"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 没有报告或目录不存在时返回空() {
+        let dir = temp_dir("empty-report");
+        assert!(latest_report_in_dir(&dir).is_none());
+        assert!(
+            latest_report_in_dir(&dir.join("does-not-exist")).is_none(),
+            "目录不存在按无报告处理"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 坏文件不挡住好文件() {
+        let dir = temp_dir("bad-report");
+        std::fs::write(dir.join("2026-11-13.txt"), "good").unwrap();
+        // 目录伪装成 txt：读不出来必须被跳过
+        std::fs::create_dir_all(dir.join("2026-12-01.txt")).unwrap();
+        let got = latest_report_in_dir(&dir);
+        assert_eq!(got.as_ref().map(|r| r.date.as_str()), Some("2026-11-13"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── F2 买入冷静期 ──
+
+    /// 单腿计划：items 直接给 (代码, 计划买入额)。
+    fn plan_view(items: Vec<(&str, f64)>) -> PlanView {
+        let total: f64 = items.iter().map(|(_, a)| *a).sum();
+        PlanView {
+            monthly: 3000.0,
+            score: 50.0,
+            target_risk_pct: 84.0,
+            current_risk_pct: 70.0,
+            band_pp: 4.0,
+            total_buy: total,
+            total_sell: 0.0,
+            estimated_fees: 0.0,
+            cash_constrained: false,
+            legs: vec![leg_view("A股", total, items)],
+        }
+    }
+
+    fn rebalance_view(items: Vec<(&str, f64)>) -> RebalanceView {
+        let total: f64 = items.iter().map(|(_, a)| *a).sum();
+        RebalanceView {
+            score: 50.0,
+            target_risk_pct: 84.0,
+            current_risk_pct: 70.0,
+            band_pp: 4.0,
+            total_buy: total,
+            total_sell: 0.0,
+            cash_constrained: false,
+            legs: vec![leg_view("A股", total, items)],
+        }
+    }
+
+    fn leg_view(category_cn: &str, amount: f64, items: Vec<(&str, f64)>) -> LegView {
+        LegView {
+            category_cn: category_cn.to_owned(),
+            target_pct: 30.0,
+            current_pct: 25.0,
+            drift_pp: -5.0,
+            amount,
+            hold_reason: None,
+            items: items
+                .into_iter()
+                .map(|(code, item_amount)| LegItemView {
+                    code: code.to_owned(),
+                    name: "基金".to_owned(),
+                    amount: item_amount,
+                    note: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn hot() -> Option<GuardrailHot> {
+        Some(GuardrailHot {
+            effective_score: 88.0,
+            hot_threshold: 75.0,
+            cooldown_days: 1,
+        })
+    }
+
+    #[test]
+    fn 计划外买入触发且理由必填() {
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        let rebal = rebalance_view(vec![("007605", 500.0)]);
+        let v = evaluate_buy_guardrail("005827", 800.0, Some(&plan), Some(&rebal), 100.0, None);
+        assert!(v.out_of_plan, "基金不在任一计划条目里");
+        // 计划外基金的计划买入额是 0，任何 > 最小交易额的买入同时满足 (b)——
+        // (a)/(b) 重叠是预期行为，都归「计划外冷静」前缀，理由必填。
+        assert!(v.oversized);
+        assert_eq!(v.planned_amount, 0.0);
+        assert!(v.reason_required());
+        assert!(v.triggered());
+        assert_eq!(
+            v.build_note("临时看到估值低想加一笔").as_deref(),
+            Some("计划外冷静：临时看到估值低想加一笔")
+        );
+    }
+
+    #[test]
+    fn 超过计划两倍且大于最小交易额才触发() {
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        let rebal = rebalance_view(vec![("007605", 1000.0)]);
+        // 计划买入额 = 1000 + 1000 = 2000，4100 > 2×2000 且 > 100：触发
+        let v = evaluate_buy_guardrail("007605", 4100.0, Some(&plan), Some(&rebal), 100.0, None);
+        assert!(!v.out_of_plan, "在计划条目里");
+        assert!(v.oversized);
+        assert!(v.reason_required());
+        // 恰好两倍不算超额
+        let v2 = evaluate_buy_guardrail("007605", 4000.0, Some(&plan), Some(&rebal), 100.0, None);
+        assert!(!v2.oversized);
+        assert!(!v2.triggered(), "按计划执行不该被表述成上头");
+        // 超过两倍但低于最小交易额：不触发（产品拍板的下限）
+        let small_plan = plan_view(vec![("007605", 60.0)]);
+        let small_rebal = rebalance_view(vec![("007605", 60.0)]);
+        let v3 = evaluate_buy_guardrail(
+            "007605",
+            300.0,
+            Some(&small_plan),
+            Some(&small_rebal),
+            500.0,
+            None,
+        );
+        assert!(!v3.oversized);
+    }
+
+    #[test]
+    fn 纯过热理由选填且空理由不落前缀() {
+        // (c) 独立于计划数据：即使计划链不齐，过热提示仍然生效。
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        let v = evaluate_buy_guardrail("007605", 1000.0, Some(&plan), None, 100.0, hot());
+        assert!(!v.reason_required(), "纯过热不该强制写理由");
+        assert!(v.triggered());
+        assert_eq!(v.build_note(""), None, "纯(c)空理由整条为空，F3 归未标记");
+        assert_eq!(
+            v.build_note("  按计划执行但分两批  ").as_deref(),
+            Some("过热冷静：按计划执行但分两批")
+        );
+    }
+
+    #[test]
+    fn 计划外优先于过热前缀() {
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        let rebal = rebalance_view(vec![("007605", 500.0)]);
+        let v = evaluate_buy_guardrail("005827", 800.0, Some(&plan), Some(&rebal), 100.0, hot());
+        assert!(v.out_of_plan && v.hot.is_some());
+        assert_eq!(
+            v.build_note("看到回调想买一笔").as_deref(),
+            Some("计划外冷静：看到回调想买一笔")
+        );
+    }
+
+    #[test]
+    fn 计划任一链缺失时降级为不拦() {
+        // 两份计划都缺：跳过 (a)/(b)，绝不在数据缺失时拦人
+        let v = evaluate_buy_guardrail("005827", 900.0, None, None, 100.0, None);
+        assert!(!v.triggered());
+        // 缺任何一条也跳过：腿计划金额来自定投与再平衡两条链，缺一时
+        // 2× 比较与「计划内」判定都不完整（产品拍板）
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        let v2 = evaluate_buy_guardrail("005827", 900.0, Some(&plan), None, 100.0, None);
+        assert!(!v2.triggered());
+        let rebal = rebalance_view(vec![("007605", 1000.0)]);
+        let v3 = evaluate_buy_guardrail("005827", 900.0, None, Some(&rebal), 100.0, None);
+        assert!(!v3.triggered());
+        // 计划齐备但不过热：(a)/(b) 正常判，计划内合规买入直接放行
+        let rebal2 = rebalance_view(vec![("007605", 1000.0)]);
+        let v4 = evaluate_buy_guardrail("007605", 1000.0, Some(&plan), Some(&rebal2), 100.0, None);
+        assert!(!v4.triggered());
+    }
+
+    #[test]
+    fn 计划判定用定投与再平衡的并集() {
+        let plan = plan_view(vec![("007605", 1000.0)]);
+        // 只出现在再平衡条目里也算计划内
+        let rebal = rebalance_view(vec![("005827", 600.0)]);
+        let v = evaluate_buy_guardrail("005827", 600.0, Some(&plan), Some(&rebal), 100.0, None);
+        assert!(!v.out_of_plan);
+        assert!(!v.triggered());
+        // (b) 的基数 = 两份计划里该基金计划买入额之和
+        let rebal2 = rebalance_view(vec![("007605", 800.0)]);
+        let v2 = evaluate_buy_guardrail("007605", 4000.0, Some(&plan), Some(&rebal2), 100.0, None);
+        assert!(v2.oversized, "4000 > 2×(1000+800)=3600");
+        assert_eq!(v2.planned_amount, 1800.0);
+    }
 }

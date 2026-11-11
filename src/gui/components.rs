@@ -221,8 +221,9 @@ pub fn stat_tile(
         .flex_1()
         .min_w(px(168.))
         .relative()
-        .p(px(18.))
-        .gap(px(6.))
+        // 账户体检要在一屏里看全四张：内边距与行距都比通用卡片紧一点。
+        .p(px(13.))
+        .gap(px(3.))
         .child(watermark(icon, fg, 84., 0.068))
         .child(overline(label))
         .child(if missing {
@@ -251,7 +252,6 @@ pub fn stat_tile(
     if let Some(hint) = hint {
         tile = tile.child(
             div()
-                .pt(px(2.))
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_TERTIARY))
                 .child(hint),
@@ -336,4 +336,17 @@ pub fn th(text: &'static str) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(TEXT_TERTIARY))
         .child(text)
+}
+
+/// Monospace stack for engine output (reports, traces). The CLI-side artifacts
+/// are laid out assuming fixed-width glyphs; a proportional font breaks their
+/// table alignment.
+pub fn mono_family() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    }
 }

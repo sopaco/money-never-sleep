@@ -33,6 +33,9 @@ pub enum Request {
         code: String,
         shares: f64,
         price: f64,
+        /// 冷静期理由（含结构化前缀，见 `BuyGuardrail::build_note`）。
+        /// 未触发护栏时为 None。
+        note: Option<String>,
     },
     Sell {
         code: String,
@@ -151,9 +154,10 @@ impl Jobs {
                             code,
                             shares,
                             price,
+                            note,
                         } => finish(
                             &event_tx,
-                            app::buy(&code, shares, price)
+                            app::buy(&code, shares, price, note.as_deref())
                                 .map(|()| format!("已记录买入 {code} {shares:.2} 份")),
                         ),
                         Request::Sell {

@@ -687,7 +687,9 @@ fn cmd_add(code: &str, name: &str, category: &str) -> Result<()> {
 fn cmd_buy(code: &str, shares: f64, price: f64) -> Result<()> {
     let db = db::Database::open()?;
     let amount = shares * price;
-    db.buy_position(code, shares, price)?;
+    // CLI 无冷静期理由输入：传 None，note 列留空。护栏只在 GUI 呈现，
+    // CLI 行为保持不变。
+    db.buy_position(code, shares, price, None)?;
     println!(
         "✓ 买入 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}",
         code, shares, price, amount
@@ -1088,7 +1090,7 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
     println!("=================================================================");
     println!();
     println!(
-        "风险档位: {} | 决策分数 {:.1} | 目标风险仓位 {:.0}%（含本月新钱）",
+        "风险档位: {} | 决策分数 {:.1} | 目标风险仓位 {:.0}% | 当前与偏离按含本月新钱的总资产计",
         config.profile_label(),
         score,
         plan.target_risk_weight
@@ -1125,6 +1127,18 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
     println!("{}", table);
     println!();
 
+    // 「合计」只含可执行金额：缺标的的腿已被引擎清零（NO_INSTRUMENT_REASON），
+    // 缺口必须如实说明，否则用户会以为这 ¥500 全能按表投出去。
+    if plan.total_buy + 0.01 < monthly {
+        println!(
+            "可执行 ¥{:.0} / 月投入 ¥{:.0}：缺口 ¥{:.0} 留在现金，补齐标的后继续。",
+            plan.total_buy,
+            monthly,
+            monthly - plan.total_buy
+        );
+        println!();
+    }
+
     if plan.legs.iter().all(|l| l.items.is_empty()) {
         println!("持仓池为空，先用 `mns add <代码> <名称> <类别>` 添加标的。");
         return Ok(());
@@ -1133,6 +1147,15 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
     println!("标的分配:");
     for leg in &plan.legs {
         if leg.items.is_empty() {
+            // 原来的静默跳过让「买入 ¥101」下面一条明细都没有，用户只能猜。
+            if leg.hold_reason.as_deref() == Some(strategy::NO_INSTRUMENT_REASON) {
+                println!(
+                    "  {}：{}{}",
+                    leg.category_cn,
+                    strategy::NO_INSTRUMENT_REASON,
+                    report::NO_INSTRUMENT_ACTION_CLI
+                );
+            }
             continue;
         }
         println!("  {}（¥{:.0}）", leg.category_cn, leg.amount);
@@ -1198,7 +1221,7 @@ fn cmd_history(limit: i64) -> Result<()> {
     table
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
-    table.set_header(vec!["日期", "类型", "代码", "份额", "价格", "金额"]);
+    table.set_header(vec!["日期", "类型", "代码", "份额", "价格", "金额", "备注"]);
 
     for tx in &txs {
         let type_label = if tx.tx_type == "buy" {
@@ -1213,6 +1236,9 @@ fn cmd_history(limit: i64) -> Result<()> {
             Cell::new(format!("{:.2}", tx.shares)),
             Cell::new(format!("{:.2}", tx.price)),
             Cell::new(format!("¥{:.2}", tx.amount)),
+            // 备注只由 GUI 冷静期护栏写入（计划外冷静：/过热冷静：），
+            // 空备注显示破折号，避免整列留白看起来像数据缺失。
+            Cell::new(tx.note.as_deref().unwrap_or("—")),
         ]);
     }
 

@@ -175,8 +175,18 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                                         .text_size(px(12.5))
                                         .text_color(rgb(TEXT_TERTIARY))
                                         .child(format!(
-                                            "预算使用 {:.0}%",
-                                            (scale * 100.0).min(999.0)
+                                            "预算使用 {:.0}%{}",
+                                            (scale * 100.0).min(999.0),
+                                            // 与 CLI 的缺口行同口径：399 和 500 两个数
+                                            // 摆在一起，差额得有人替用户算出来。
+                                            if plan.monthly - plan.total_buy >= 1.0 {
+                                                format!(
+                                                    " · {} 留现金",
+                                                    money(plan.monthly - plan.total_buy)
+                                                )
+                                            } else {
+                                                String::new()
+                                            }
                                         )),
                                 ),
                         ),
@@ -248,7 +258,7 @@ fn legs_card(data: &Snapshot) -> Div {
         .gap(px(0.))
         .child(div().pb(px(10.)).child(card_header(
             "分腿分配",
-            "只买不卖；偏离来自目标权重与当前市值",
+            "只买不卖；当前与偏离含本月新钱",
         )));
 
     let header = div()
@@ -315,7 +325,7 @@ fn legs_card(data: &Snapshot) -> Div {
                 div()
                     .text_size(px(11.5))
                     .text_color(rgb(TEXT_TERTIARY))
-                    .child(reason.clone()),
+                    .child(crate::gui::hold_reason_text(reason)),
             );
         }
 

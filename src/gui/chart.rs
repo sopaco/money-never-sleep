@@ -9,19 +9,28 @@ use gpui_kit::*;
 
 use super::theme::DIVIDER;
 
-/// Filled area + 2px stroke + end marker, with three horizontal gridlines.
-pub fn area_chart(values: Vec<f64>, height: f32, color: u32) -> Div {
-    div().w_full().h(px(height)).child(canvas(
-        move |bounds, _, _| bounds,
-        move |bounds, _paint_bounds, window, _| paint_area(bounds, &values, color, true, window),
-    ))
+/// A canvas that fills the box it is given.
+///
+/// `canvas()` lays out with `size: auto`, and inside a block-layout wrapper
+/// that means the width fills but the height collapses to 0px. `paint_area`
+/// bails out on `height <= 1.0`, so the card looked empty even though the
+/// canvas had been laid out at full width. Asking for a full size makes the
+/// painted box equal to the wrapper.
+///
+/// `gauge_aura` hid the same collapse: `paint_arc` ignores the height and
+/// derives its centre from the width alone, so it drew outside a 0px box.
+fn filled_canvas<T: 'static>(
+    prepaint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> T,
+    paint: impl 'static + FnOnce(Bounds<Pixels>, T, &mut Window, &mut App),
+) -> impl IntoElement {
+    canvas(prepaint, paint).size_full()
 }
 
-/// Same geometry without gridlines, for small inline trend strips.
-pub fn sparkline(values: Vec<f64>, height: f32, color: u32) -> Div {
-    div().w_full().h(px(height)).child(canvas(
+/// Filled area + 2px stroke + end marker, with three horizontal gridlines.
+pub fn area_chart(values: Vec<f64>, height: f32, color: u32) -> Div {
+    div().w_full().h(px(height)).child(filled_canvas(
         move |bounds, _, _| bounds,
-        move |bounds, _paint_bounds, window, _| paint_area(bounds, &values, color, false, window),
+        move |bounds, _paint_bounds, window, _| paint_area(bounds, &values, color, true, window),
     ))
 }
 
@@ -116,7 +125,7 @@ fn ring_points(cx: f32, cy: f32, radius: f32) -> Vec<Point<Pixels>> {
 /// A wide arc band, used purely as atmosphere behind the hero panel. It echoes
 /// the gauge in the product mark and reads as light, not as data.
 pub fn gauge_aura(size: f32, color: u32, alpha: f32) -> Div {
-    div().w(px(size)).h(px(size)).child(canvas(
+    div().w(px(size)).h(px(size)).child(filled_canvas(
         move |bounds, _, _| bounds,
         move |bounds, _, window, _| paint_arc(bounds, color, alpha, window),
     ))
@@ -166,5 +175,163 @@ fn paint_arc(bounds: Bounds<Pixels>, color: u32, alpha: f32, window: &mut Window
                 window.paint_path(path, rgb(color).opacity(a));
             }
         }
+    }
+}
+
+// Headless layout regressions for the canvas charts.
+//
+// The asset curve rendered as an empty card: the canvas box was 1096x0, so
+// `paint_area` bailed out on its `height <= 1.0` guard and nothing was drawn.
+// `canvas()` is `size: auto`, and in block layout that fills the width but
+// leaves the height at zero. A screenshot was the only way to notice, so these
+// tests pin the two facts that make the chart visible:
+//
+//   1. the wrapper spans the card's content box;
+//   2. the canvas fills that wrapper, height included.
+//
+// `on_children_prepainted` reports the bounds children were actually laid out
+// in, so the tests need no test-only hooks in the production elements.
+//
+// Run with `cargo test --features gui-test`.
+
+#[cfg(all(test, feature = "gui-test"))]
+mod layout_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Explicit imports, not `use gpui_kit::*`: the glob would shadow Rust's
+    // `#[test]` with gpui-kit's macro inside the expansion and recurse forever.
+    use gpui_kit::base::StyledExt;
+    use gpui_kit::{
+        AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
+        StatefulInteractiveElement, Styled, TestAppContext, Window, div, px, size,
+    };
+
+    /// Renders the chart inside the same flex chain as the real dashboard.
+    struct ChartProbe {
+        /// Bounds of the card's children in the last completed frame.
+        children: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    }
+
+    impl Render for ChartProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let children = self.children.clone();
+            // AppShell → content column → page root → card, because the chart
+            // is sized by a chain of stretched flex containers.
+            div().v_flex().size_full().child(
+                div().h_flex().flex_1().min_h(px(0.)).child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .h_full()
+                        .overflow_hidden()
+                        .min_w(px(0.))
+                        .min_h(px(0.))
+                        .child(
+                            div()
+                                .id("probe-page")
+                                .v_flex()
+                                .flex_1()
+                                .w_full()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .px(px(22.))
+                                .pt(px(20.))
+                                .pb(px(28.))
+                                .gap(px(14.))
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .flex_none()
+                                        .p(px(20.))
+                                        .gap(px(14.))
+                                        .child(super::area_chart(
+                                            vec![1.0, 2.5, 1.5, 3.0],
+                                            168.,
+                                            0x0067c0,
+                                        ))
+                                        .on_children_prepainted(move |bounds, _, _| {
+                                            *children.borrow_mut() = bounds;
+                                        }),
+                                ),
+                        ),
+                ),
+            )
+        }
+    }
+
+    /// Renders one filled canvas inside a fixed box.
+    struct CanvasProbe {
+        seen: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    }
+
+    impl Render for CanvasProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            div().w(px(300.)).h(px(120.)).child(super::filled_canvas(
+                move |bounds, _, _| {
+                    *seen.borrow_mut() = Some(bounds);
+                    bounds
+                },
+                |_, _, _, _| {},
+            ))
+        }
+    }
+
+    fn draw(handle: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |_, window, cx| {
+            // Mirrors TestWindowExt::render_frame without gpui-base's
+            // test-support feature, which cannot be enabled (see Cargo.toml).
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn area_chart_fills_the_card_content_width(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let children = Rc::new(RefCell::new(Vec::new()));
+        let handle = cx.open_window(size(px(1180.), px(720.)), |_, _| ChartProbe {
+            children: children.clone(),
+        });
+        draw(handle.into(), cx);
+
+        let measured = children.borrow();
+        let chart = measured
+            .first()
+            .copied()
+            .expect("the card must prepaint its chart child");
+        // A 1180px window, 22px page padding on each side and the card's own
+        // 20px padding leave this much content width.
+        let expected: f32 = 1180. - 22. * 2. - 20. * 2.;
+        let width: f32 = chart.size.width.into();
+        let height: f32 = chart.size.height.into();
+        assert!(width > 1., "chart collapsed to {width}px wide");
+        assert!(
+            (width - expected).abs() < 1.,
+            "chart is {width}px wide, card content is {expected}px"
+        );
+        assert!((height - 168.).abs() < 1., "chart is {height}px tall");
+    }
+
+    #[gpui_kit::test]
+    fn chart_canvas_fills_its_wrapper(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let seen = Rc::new(RefCell::new(None));
+        let handle = cx.open_window(size(px(600.), px(400.)), |_, _| CanvasProbe {
+            seen: seen.clone(),
+        });
+        draw(handle.into(), cx);
+
+        let bounds = seen.borrow().expect("the canvas must be prepainted");
+        let width: f32 = bounds.size.width.into();
+        let height: f32 = bounds.size.height.into();
+        assert!(
+            (height - 120.).abs() < 1.,
+            "canvas is {height}px tall inside a 120px box; an auto-sized canvas \
+             collapses to zero height and paint_area draws nothing"
+        );
+        assert!((width - 300.).abs() < 1., "canvas is {width}px wide");
     }
 }

@@ -385,7 +385,7 @@ impl Database {
         }
     }
 
-    pub fn buy_position(&self, code: &str, shares: f64, price: f64) -> Result<()> {
+    pub fn buy_position(&self, code: &str, shares: f64, price: f64, note: Option<&str>) -> Result<()> {
         if shares <= 0.0 {
             anyhow::bail!("买入份额必须为正数");
         }
@@ -439,8 +439,10 @@ impl Database {
         )?;
 
         tx.execute(
-            "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date) VALUES ('buy', ?, ?, ?, ?, ?)",
-            params![code, shares, price, amount, today],
+            // note 只由 GUI 冷静期护栏写入（计划外冷静：/过热冷静：前缀）；
+            // CLI 记买入传 None，保持既有行为不变。
+            "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date, note) VALUES ('buy', ?, ?, ?, ?, ?, ?)",
+            params![code, shares, price, amount, today, note],
         )?;
 
         tx.commit().with_context(|| "提交事务失败")?;
@@ -541,18 +543,25 @@ impl Database {
             "SELECT id, type, asset_code, shares, price, amount, tx_date, note
              FROM transactions ORDER BY id DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map([limit], |row| {
-            Ok(Transaction {
-                id: row.get(0)?,
-                tx_type: row.get(1)?,
-                asset_code: row.get(2)?,
-                shares: row.get(3)?,
-                price: row.get(4)?,
-                amount: row.get(5)?,
-                tx_date: row.get(6)?,
-                note: row.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map([limit], transaction_from_row)?;
+        let mut txs = Vec::new();
+        for row in rows {
+            txs.push(row?);
+        }
+        Ok(txs)
+    }
+
+    /// 读取 `from`（含，`YYYY-MM-DD`）之后的所有交易，按日期升序。
+    ///
+    /// 纪律复盘要按年统计「今年操作了几次」，`list_transactions` 的 limit
+    /// 是行数，取 12 条只够看最近记录，会把全年笔数算少。这里不设上限，
+    /// 也不改动 `list_transactions` 的语义——总览页的活动卡依赖那 12 条。
+    pub fn list_transactions_since(&self, from: &str) -> Result<Vec<Transaction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, asset_code, shares, price, amount, tx_date, note
+             FROM transactions WHERE tx_date >= ? ORDER BY tx_date ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([from], transaction_from_row)?;
         let mut txs = Vec::new();
         for row in rows {
             txs.push(row?);
@@ -642,5 +651,87 @@ impl Database {
             params![score, rating, today, previous_close, previous_1_week, previous_1_month, previous_1_year, now],
         )?;
         Ok(())
+    }
+}
+
+/// `transactions` 的行映射，`list_transactions*` 共用，避免两处列序漂移。
+fn transaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
+    Ok(Transaction {
+        id: row.get(0)?,
+        tx_type: row.get(1)?,
+        asset_code: row.get(2)?,
+        shares: row.get(3)?,
+        price: row.get(4)?,
+        amount: row.get(5)?,
+        tx_date: row.get(6)?,
+        note: row.get(7)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn seeded() -> Database {
+        let db = Database {
+            conn: Connection::open_in_memory().expect("in-memory db"),
+        };
+        db.init_tables().expect("schema");
+        for (date, note) in [
+            ("2025-12-31", Some("计划外冷静：去年")),
+            ("2026-01-05", Some("计划外冷静：追高")),
+            ("2026-03-09", Some("过热冷静：按计划分两批")),
+            ("2026-03-09", None),
+            ("2026-11-11", None),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date, note)
+                     VALUES ('buy', '007605', 1.0, 1.0, 1.0, ?, ?)",
+                    params![date, note],
+                )
+                .expect("insert");
+        }
+        db
+    }
+
+    #[test]
+    fn 按起始日期查询不设行数上限且保留备注() {
+        let txs = seeded().list_transactions_since("2026-01-01").unwrap();
+        // 2025 的记录被挡掉，2026 的 4 笔全部返回（远少于 list_transactions
+        // 常见的 10/12 条窗口也不会被截断）。
+        assert_eq!(txs.len(), 4);
+        assert!(txs.iter().all(|t| t.tx_date.as_str() >= "2026-01-01"));
+        assert_eq!(
+            txs[0].note.as_deref(),
+            Some("计划外冷静：追高"),
+            "日期升序时第一条应是新年最早的一笔"
+        );
+        assert_eq!(txs[3].note, None, "空备注不能被写坏");
+        assert_eq!(txs[3].tx_date, "2026-11-11");
+    }
+
+    #[test]
+    fn 纪律复盘能从数据库流水直接分桶() {
+        let txs = seeded().list_transactions_since("2026-01-01").unwrap();
+        let review = crate::discipline::review(
+            2026,
+            10,
+            20,
+            txs.into_iter().filter_map(|t| {
+                NaiveDate::parse_from_str(&t.tx_date, "%Y-%m-%d")
+                    .ok()
+                    .map(|d| (d, t.note))
+            }),
+        );
+        assert_eq!(review.total, 4);
+        assert_eq!(review.out_of_plan, 1);
+        assert_eq!(review.hot_calm, 1);
+        assert_eq!(review.unmarked, 2);
+        assert_eq!(
+            review.last_trade,
+            NaiveDate::from_ymd_opt(2026, 11, 11)
+        );
     }
 }

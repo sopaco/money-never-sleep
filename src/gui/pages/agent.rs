@@ -1247,16 +1247,6 @@ fn policy_chip(policy: PermissionPolicy, shell: &AppShell, cx: &mut Context<AppS
     button.on_click(cx.listener(move |shell, _, _, cx| shell.set_policy(policy, cx)))
 }
 
-fn mono_family() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "Consolas"
-    } else if cfg!(target_os = "macos") {
-        "Menlo"
-    } else {
-        "DejaVu Sans Mono"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::is_message;

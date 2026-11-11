@@ -16,7 +16,7 @@
 //! 与 CNN API 格式脱耦；历史不足时逐级降级（见 `DecisionSignal::note`）。
 
 use crate::config::AppConfig;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 
 /// 快照表中按日期取的 (日期, 原始分数) 记录，升序
 pub type ScoreHistory = Vec<(NaiveDate, f64)>;
@@ -250,6 +250,20 @@ pub fn compute(
     }
 }
 
+/// 下一个决策日（严格在未来）。`decision_weekday = 0`（每天决策）没有
+/// "下一个"的概念，返回 None。今天就是决策日时返回下周同一天。
+///
+/// 观察版报告与 GUI 的"本周结论"都用它，保证两处的日期数学只有一份。
+pub fn next_decision_day(today: NaiveDate, decision_weekday: u32) -> Option<NaiveDate> {
+    if decision_weekday == 0 || decision_weekday > 7 {
+        return None;
+    }
+    let today_idx = today.weekday().num_days_from_monday() as u32 + 1; // 周一=1
+    let delta = (decision_weekday + 7 - today_idx) % 7;
+    let delta = if delta == 0 { 7 } else { delta };
+    Some(today + Duration::days(delta as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +435,33 @@ mod tests {
         // 缺口10天: 今天 40 在 cutoff(=-6) 内，历史全在窗口外
         assert_eq!(s.samples_used, 1);
         assert_eq!(s.smoothed_zone, "恐慌", "窗口内只剩今天的40，应为恐慌区间");
+    }
+
+    #[test]
+    fn 下一个决策日_非决策日往后数() {
+        // 2026-11-02 是周一，决策日=周五 → 11-06
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert_eq!(
+            next_decision_day(monday, 5),
+            Some(NaiveDate::from_ymd_opt(2026, 11, 6).unwrap())
+        );
+    }
+
+    #[test]
+    fn 下一个决策日_当天就是决策日则取下周() {
+        // 2026-11-06 是周五且决策日=周五 → 下一个决策日是 11-13
+        let friday = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        assert_eq!(
+            next_decision_day(friday, 5),
+            Some(NaiveDate::from_ymd_opt(2026, 11, 13).unwrap())
+        );
+    }
+
+    #[test]
+    fn 下一个决策日_每天决策时无下一个() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert_eq!(next_decision_day(today, 0), None);
+        // 越界值与 0 同等对待：拿不到可信日期就不给
+        assert_eq!(next_decision_day(today, 8), None);
     }
 }

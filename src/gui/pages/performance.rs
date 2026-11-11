@@ -67,6 +67,7 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
                 Some("每日快照口径".to_owned()),
             ),
         ]))
+        .child(discipline_card(data))
         .child(curve_card(data));
 
     if let Some(drawdown) = drawdown {
@@ -118,6 +119,141 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
     }
 
     root.child(trades_card(data)).into_any_element()
+}
+
+/// 年度纪律卡：回答「我今年有没有乱动」。
+///
+/// 只呈现流水统计与前缀分桶。没有前缀的记录写成「未标记」并说明不推断，
+/// 不把它算成计划内（也就不会替用户美化纪律）。
+fn discipline_card(data: &Snapshot) -> Div {
+    let review = &data.discipline;
+    let over = review.over_budget();
+    let total = review.total;
+    let headline = if total == 0 {
+        "尚未操作".to_owned()
+    } else {
+        format!("{total} 次")
+    };
+    let track = if review.budget_max == 0 {
+        0.0
+    } else {
+        total as f32 / review.budget_max as f32
+    };
+    let accent = if over { WARNING } else { ACCENT };
+
+    card_pad()
+        .child(card_header(
+            "纪律复盘",
+            "按交易流水的 note 前缀统计；不评价单笔对错",
+        ))
+        .child(
+            div()
+                .v_flex()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_baseline()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .text_size(px(28.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if over { WARNING } else { TEXT }))
+                                .child(headline),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(format!("{} 年操作次数", review.year)),
+                        ),
+                )
+                .child(div().text_size(px(12.5)).text_color(rgb(TEXT_TERTIARY)).child(budget_line(review)))
+                .child(hbar(track, accent, 8.))
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap(px(18.))
+                        .child(bucket(
+                            "计划外冷静",
+                            review.out_of_plan,
+                            WARNING,
+                            "护栏判定不在计划内或金额异常",
+                        ))
+                        .child(bucket(
+                            "过热冷静",
+                            review.hot_calm,
+                            ACCENT,
+                            "按计划买入，只是当时情绪过热",
+                        ))
+                        .child(bucket(
+                            "未标记",
+                            review.unmarked,
+                            TEXT_TERTIARY,
+                            "没有护栏前缀，不推断是否计划内",
+                        )),
+                ),
+        )
+        .child(divider())
+        .child(kv_row(
+            "最近一次操作",
+            review
+                .last_trade
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "今年还没有操作".to_owned()),
+        ))
+}
+
+/// One bucket: the count is the loud part, the label and the caveat sit beside
+/// it. `hint` is where "未标记" states that nothing is inferred.
+fn bucket(label: &'static str, count: usize, color: u32, hint: &'static str) -> Div {
+    div()
+        .v_flex()
+        .gap(px(2.))
+        .child(
+            div()
+                .h_flex()
+                .items_baseline()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(18.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(if count == 0 { TEXT_TERTIARY } else { color }))
+                        .child(count.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(label),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT_TERTIARY))
+                .child(hint),
+        )
+}
+
+/// Budget sentence. Equal to the upper bound is still inside the budget, so the
+/// wording distinguishes "还剩 0 次" from "已超 N 次".
+fn budget_line(review: &crate::discipline::YearReview) -> String {
+    let range = format!("{}-{} 次/年", review.budget_min, review.budget_max);
+    if review.over_budget() {
+        format!(
+            "已超预算 {} 次（{}）——建议接下来只在决策日执行计划内交易",
+            review.total - review.budget_max as usize,
+            range
+        )
+    } else if review.total == review.budget_max as usize {
+        format!("预算 {range}，今年次数已用满（操作仍以决策日计划为准）")
+    } else {
+        format!("预算 {range}，还剩 {} 次", review.remaining())
+    }
 }
 
 fn curve_card(data: &Snapshot) -> Div {
@@ -268,4 +404,48 @@ fn trades_card(data: &Snapshot) -> Div {
         })
         .collect();
     card.child(div().v_flex().children(rows))
+}
+
+// 只测纯函数，因此刻意窄导入：`use super::*` 会连带引入 gpui 的 prelude，
+// 把 #[test] 的宏展开撑爆（与 dashboard.rs 同样的理由）。
+#[cfg(test)]
+mod tests {
+    use super::budget_line;
+    use crate::discipline::YearReview;
+    use chrono::NaiveDate;
+
+    fn review(total: usize) -> YearReview {
+        YearReview {
+            year: 2026,
+            total,
+            out_of_plan: 0,
+            hot_calm: 0,
+            unmarked: 0,
+            budget_min: 10,
+            budget_max: 20,
+            last_trade: Some(NaiveDate::from_ymd_opt(2026, 3, 9).unwrap()),
+        }
+    }
+
+    #[test]
+    fn 预算内说明还剩几次() {
+        let text = budget_line(&review(7));
+        assert!(text.contains("10-20 次/年"));
+        assert!(text.contains("还剩 13 次"), "实际: {text}");
+        assert!(!text.contains("超预算"));
+    }
+
+    #[test]
+    fn 用满上限不算超预算() {
+        let text = budget_line(&review(20));
+        assert!(text.contains("已用满"), "实际: {text}");
+        assert!(!text.contains("超预算"));
+    }
+
+    #[test]
+    fn 超过上限给出超出笔数与收敛建议() {
+        let text = budget_line(&review(23));
+        assert!(text.contains("已超预算 3 次"), "实际: {text}");
+        assert!(text.contains("只在决策日"));
+    }
 }

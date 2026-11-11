@@ -26,7 +26,21 @@ use crate::agent::{
     PermissionPolicy, PermissionPrompt, RunState, TimelineEntry, load_settings, routine,
     save_settings, start_runtime,
 };
-use crate::app::{PlanView, Snapshot};
+use crate::app::{BuyGuardrail, PlanView, Snapshot};
+
+/// 「缺标的」在 GUI 侧的下一步动作。引擎只存原因，去处由各界面拼：
+/// 持仓页一定有「添加标的」入口（空态与非空态各一处），计划页没有；
+/// 总览页只在空账户起始卡里给一个。所以这里指向持仓页，而不是本页。
+pub(crate) const NO_INSTRUMENT_ACTION: &str = "，去持仓页添加标的";
+
+/// 把引擎原因转成 GUI 展示文本：缺标的时补上「去哪儿补」，其余原因原样返回。
+pub(crate) fn hold_reason_text(reason: &str) -> String {
+    if reason == crate::strategy::NO_INSTRUMENT_REASON {
+        format!("{reason}{NO_INSTRUMENT_ACTION}")
+    } else {
+        reason.to_owned()
+    }
+}
 
 use components::*;
 use conversations::{ConversationMeta, ConversationRecord, ConversationSummary};
@@ -161,6 +175,23 @@ pub(crate) struct CashForm {
     pub error: Option<String>,
 }
 
+/// F2 买入冷静期层：买入触发护栏（计划外/超额/过热）后，先让用户把理由
+/// 写下来再落库。保留已填的交易参数，确认时直接提交；「返回修改」时
+/// 回填买入表单。不阻断——写完理由交易照常记录。
+pub(crate) struct GuardrailForm {
+    pub code: String,
+    /// 解析后的交易参数，确认时直接提交。
+    pub shares: f64,
+    pub price: f64,
+    /// 原样保留用户输入，「返回修改」时回填，不让用户重打数字。
+    pub shares_text: String,
+    pub price_text: String,
+    pub amount: f64,
+    pub verdict: BuyGuardrail,
+    pub reason: Entity<InputState>,
+    pub error: Option<String>,
+}
+
 pub(crate) struct AssetForm {
     pub code: Entity<InputState>,
     pub name: Entity<InputState>,
@@ -170,6 +201,8 @@ pub(crate) struct AssetForm {
 
 pub(crate) enum Dialog {
     Trade(TradeForm),
+    /// 买入冷静期（F2）：Trade 提交时先过护栏判定，触发才进这一层。
+    Guardrail(GuardrailForm),
     Cash(CashForm),
     AddAsset(AssetForm),
 }
@@ -456,6 +489,10 @@ pub(crate) struct AppShell {
     conversation_dirty: bool,
     /// `Some` while a past conversation is being replayed in the chat surface.
     pub(crate) viewing_history: Option<ViewedConversation>,
+    /// Whether the dashboard's "最近报告" card shows the full archived text.
+    /// Collapsed by default: the card previews the header; the full weekly
+    /// ritual text is one click away.
+    pub(crate) report_expanded: bool,
     /// Live agent state parked while the chat surface shows a replay. Incoming
     /// runtime events are folded into this, never into the replay.
     live_agent: Option<Box<AgentState>>,
@@ -556,6 +593,7 @@ impl AppShell {
             current_conversation: conversation,
             conversation_dirty: false,
             viewing_history: None,
+            report_expanded: false,
             live_agent: None,
         }
     }
@@ -622,6 +660,11 @@ impl AppShell {
         // A drawer belongs to the page that opened it; leaving must not leave
         // it hanging around when the user comes back.
         self.agent_panel = None;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_report(&mut self, cx: &mut Context<Self>) {
+        self.report_expanded = !self.report_expanded;
         cx.notify();
     }
 
@@ -1163,6 +1206,7 @@ impl AppShell {
                 if let Some(dialog) = self.dialog.as_mut() {
                     let slot = match dialog {
                         Dialog::Trade(form) => &mut form.error,
+                        Dialog::Guardrail(form) => &mut form.error,
                         Dialog::Cash(form) => &mut form.error,
                         Dialog::AddAsset(form) => &mut form.error,
                     };
@@ -1278,11 +1322,55 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn submit_dialog(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = self.dialog.as_ref() else {
             return;
         };
+        // F2：买入先取出表单参数做冷静期判定（触发则转入护栏层而不是直接
+        // 落库）；其余表单解析成 Request。先取 owned 值再动 self，避免借用
+        // 冲突。
+        let buy_params: Option<Result<(String, String, String, f64), String>> = match dialog {
+            Dialog::Trade(form) if form.side == TradeSide::Buy => {
+                let code = form.code.read(cx).value().trim().to_owned();
+                let shares_text = form.shares.read(cx).value().trim().to_owned();
+                let price_text = form.price.read(cx).value().trim().to_owned();
+                let shares = parse_number(&shares_text);
+                let price = parse_number(&price_text);
+                Some(match (code.is_empty(), shares, price) {
+                    (true, _, _) => Err("请填写资产代码".to_owned()),
+                    (_, None, _) => Err("份额必须是数字".to_owned()),
+                    (_, _, None) => Err("价格必须是数字".to_owned()),
+                    _ => Ok((
+                        code,
+                        shares_text,
+                        price_text,
+                        shares.unwrap_or(0.0) * price.unwrap_or(0.0),
+                    )),
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(parsed) = buy_params {
+            match parsed {
+                Ok((code, shares_text, price_text, amount)) => {
+                    self.open_cooldown_if_triggered(
+                        code,
+                        shares_text,
+                        price_text,
+                        amount,
+                        window,
+                        cx,
+                    );
+                }
+                Err(message) => self.form_error(message, cx),
+            }
+            cx.notify();
+            return;
+        }
+
         let parsed: Result<Request, String> = match dialog {
+            // 走到这里只剩卖出：买入在上面已经拦截。
             Dialog::Trade(form) => {
                 let code = form.code.read(cx).value().trim().to_owned();
                 let shares = parse_number(&form.shares.read(cx).value());
@@ -1291,18 +1379,24 @@ impl AppShell {
                     (true, _, _) => Err("请填写资产代码".to_owned()),
                     (_, None, _) => Err("份额必须是数字".to_owned()),
                     (_, _, None) => Err("价格必须是数字".to_owned()),
-                    _ => Ok(match form.side {
-                        TradeSide::Buy => Request::Buy {
-                            code,
-                            shares: shares.unwrap_or(0.0),
-                            price: price.unwrap_or(0.0),
-                        },
-                        TradeSide::Sell => Request::Sell {
-                            code,
-                            shares: shares.unwrap_or(0.0),
-                            price: price.unwrap_or(0.0),
-                        },
+                    _ => Ok(Request::Sell {
+                        code,
+                        shares: shares.unwrap_or(0.0),
+                        price: price.unwrap_or(0.0),
                     }),
+                }
+            }
+            Dialog::Guardrail(form) => {
+                let reason = form.reason.read(cx).value().trim().to_owned();
+                if form.verdict.reason_required() && reason.chars().count() < 6 {
+                    Err("计划外买入需要写下理由（至少 6 个字），供日后纪律复盘".to_owned())
+                } else {
+                    Ok(Request::Buy {
+                        code: form.code.clone(),
+                        shares: form.shares,
+                        price: form.price,
+                        note: form.verdict.build_note(&reason),
+                    })
                 }
             }
             Dialog::Cash(form) => {
@@ -1357,12 +1451,116 @@ impl AppShell {
         if let Some(dialog) = self.dialog.as_mut() {
             let slot = match dialog {
                 Dialog::Trade(form) => &mut form.error,
+                Dialog::Guardrail(form) => &mut form.error,
                 Dialog::Cash(form) => &mut form.error,
                 Dialog::AddAsset(form) => &mut form.error,
             };
             *slot = Some(message.clone());
         }
         self.show_toast(message, ToastTone::Error, cx);
+    }
+
+    /// F2：买入提交后的冷静期判定。
+    ///
+    /// 触发护栏 → 转入冷静期层（保留已填参数）；未触发或快照还没加载好
+    /// （无计划/无情绪数据）→ 不判定、不拦人，直接落库，note 为 None，
+    /// 行为与护栏上线前一致。
+    fn open_cooldown_if_triggered(
+        &mut self,
+        code: String,
+        shares_text: String,
+        price_text: String,
+        amount: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shares = parse_number(&shares_text).unwrap_or(0.0);
+        let price = parse_number(&price_text).unwrap_or(0.0);
+        let Some(data) = self.data.as_ref() else {
+            self.send_buy(&code, shares, price, None, cx);
+            return;
+        };
+        let verdict = crate::app::evaluate_buy_guardrail(
+            &code,
+            amount,
+            data.plan.as_ref(),
+            data.rebalance.as_ref(),
+            data.config.min_trade_amount,
+            data.guardrail_hot.clone(),
+        );
+        if !verdict.triggered() {
+            self.send_buy(&code, shares, price, None, cx);
+            return;
+        }
+        let reason = cx.new(|cx| InputState::new(window, cx).placeholder("这笔买入和计划的关系？"));
+        self.open_dialog(
+            Dialog::Guardrail(GuardrailForm {
+                code,
+                shares,
+                price,
+                shares_text,
+                price_text,
+                amount,
+                verdict,
+                reason,
+                error: None,
+            }),
+            cx,
+        );
+    }
+
+    /// 冷静期层判定通过后的落库入口。
+    fn send_buy(
+        &mut self,
+        code: &str,
+        shares: f64,
+        price: f64,
+        note: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.jobs.send(Request::Buy {
+            code: code.to_owned(),
+            shares,
+            price,
+            note,
+        }) {
+            self.form_error(error, cx);
+        }
+        // 对话框保持打开，直到 Event::Saved 再关——落库被拒时不丢用户输入。
+    }
+
+    /// F2：冷静期层「返回修改」——用已填参数回填买入表单，不让用户重打。
+    pub(crate) fn cooldown_back_to_trade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::Guardrail(form)) = self.dialog.as_ref() else {
+            return;
+        };
+        let (code, shares_text, price_text) =
+            (form.code.clone(), form.shares_text.clone(), form.price_text.clone());
+        let code_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("资产代码，例如 007605")
+                .default_value(code)
+        });
+        let shares = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("例如 1669.62")
+                .default_value(shares_text)
+        });
+        let price = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("例如 1.2018")
+                .default_value(price_text)
+        });
+        self.open_dialog(
+            Dialog::Trade(TradeForm {
+                side: TradeSide::Buy,
+                code: code_input,
+                shares,
+                price,
+                error: None,
+            }),
+            cx,
+        );
     }
 }
 
@@ -2328,6 +2526,7 @@ impl AppShell {
         let dialog = self.dialog.as_ref()?;
         let card = match dialog {
             Dialog::Trade(form) => trade_dialog(form, window, cx),
+            Dialog::Guardrail(form) => guardrail_dialog(form, window, cx),
             Dialog::Cash(form) => cash_dialog(form, window, cx),
             Dialog::AddAsset(form) => asset_dialog(form, window, cx),
         };
@@ -2585,7 +2784,78 @@ fn trade_dialog(form: &TradeForm, _window: &mut Window, cx: &mut Context<AppShel
                 Button::new("trade-submit")
                     .primary()
                     .label(form.side.label())
-                    .on_click(cx.listener(|shell, _, _, cx| shell.submit_dialog(cx))),
+                    .on_click(cx.listener(|shell, _, window, cx| shell.submit_dialog(window, cx))),
+            ),
+    )
+}
+
+/// F2 买入冷静期层。触发护栏时在这里把理由写下来；不阻断、不代做决策，
+/// 理由带结构化前缀落库（计划外冷静：/过热冷静：），供 F3 纪律复盘分桶。
+fn guardrail_dialog(form: &GuardrailForm, _window: &mut Window, cx: &mut Context<AppShell>) -> Div {
+    let v = &form.verdict;
+    let mut reasons: Vec<String> = Vec::new();
+    if v.out_of_plan {
+        reasons.push(format!("{} 不在本月计划内：定投与再平衡的条目里都没有它。", form.code));
+    }
+    if v.oversized && v.planned_amount > 0.0 {
+        reasons.push(format!(
+            "本次 ¥{:.2} 超过 {} 计划买入 ¥{:.2} 的 2 倍。",
+            form.amount, form.code, v.planned_amount
+        ));
+    }
+    if let Some(hot) = &v.hot {
+        reasons.push(format!(
+            "决策分数 {:.0} ≥ 过热阈值 {:.0}，建议延迟 {} 个交易日再执行。",
+            hot.effective_score, hot.hot_threshold, hot.cooldown_days
+        ));
+    }
+
+    let reason_label: &'static str = if v.reason_required() {
+        "买入理由（必填，至少 6 个字）"
+    } else {
+        "买入理由（选填，写了会记入流水供日后复盘）"
+    };
+
+    dialog_shell(
+        "买入冷静期",
+        "不是拦截：写下理由照常记录，这里只是让你慢一步",
+        vec![
+            div().v_flex().gap(px(6.)).children(reasons.into_iter().map(|line| {
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(line)
+            })),
+            div()
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(RADIUS_SM))
+                .bg(rgb(WARNING_SOFT))
+                .text_size(px(12.))
+                .text_color(rgb(WARNING))
+                .child("本工具不替你决定是否买入，也不会阻断交易。"),
+            field(reason_label, Input::new(&form.reason)),
+        ],
+        form.error.clone(),
+    )
+    .child(
+        div()
+            .h_flex()
+            .justify_end()
+            .gap(px(8.))
+            .child(
+                Button::new("guardrail-back")
+                    .outline()
+                    .label("返回修改")
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.cooldown_back_to_trade(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("guardrail-confirm")
+                    .primary()
+                    .label("写下理由，继续记录")
+                    .on_click(cx.listener(|shell, _, window, cx| shell.submit_dialog(window, cx))),
             ),
     )
 }
@@ -2619,7 +2889,7 @@ fn cash_dialog(form: &CashForm, _window: &mut Window, cx: &mut Context<AppShell>
                 Button::new("cash-submit")
                     .primary()
                     .label("确认")
-                    .on_click(cx.listener(|shell, _, _, cx| shell.submit_dialog(cx))),
+                    .on_click(cx.listener(|shell, _, window, cx| shell.submit_dialog(window, cx))),
             ),
     )
 }
@@ -2650,7 +2920,7 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
                 Button::new("asset-submit")
                     .primary()
                     .label("添加")
-                    .on_click(cx.listener(|shell, _, _, cx| shell.submit_dialog(cx))),
+                    .on_click(cx.listener(|shell, _, window, cx| shell.submit_dialog(window, cx))),
             ),
     )
 }

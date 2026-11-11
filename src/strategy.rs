@@ -2,6 +2,17 @@ use crate::config::AppConfig;
 use crate::models::Position;
 use chrono::NaiveDate;
 
+/// 目标类别没有任何可买标的时，买入腿会被清零并挂上这条原因。
+///
+/// report、计划页、结论卡都认这一条常量来判断「这条腿的钱买不到东西」，
+/// 而不是各自去看 `items.is_empty()`——同一件事三种写法，迟早会漂
+/// （2026-11-11 复盘：CLI 报「买入 ¥148,700」、卡面却无标的可买）。
+///
+/// 这里**只存原因**，不存「去哪儿补」。CLI 的下一步是 `mns add`，GUI 的
+/// 下一步是持仓页的「添加标的」按钮——把去处写进引擎常量，就会出现
+/// 计划页自己写着「去计划页补齐」（那页根本没有添加标的入口）。
+pub const NO_INSTRUMENT_REASON: &str = "目标类别暂无可买标的";
+
 #[derive(Debug)]
 pub struct RiskWarning {
     pub asset_code: String,
@@ -271,15 +282,26 @@ pub fn calculate_rebalance_plan(
             });
             continue;
         }
-        leg.amount = amount;
-        total_buy += amount;
 
         // 腿内分摊：排除高浮亏个股，宽基指数不排除
         let members: Vec<&Position> = positions
             .iter()
             .filter(|p| p.category == leg.category)
             .collect();
-        leg.items = split_within_leg(&members, amount, config.settings.max_contrarian_weight);
+        let items = split_within_leg(&members, amount, config.settings.max_contrarian_weight);
+        if items.is_empty() {
+            // 腿级金额算得出来，不代表买得到：该类别一个标的都没有（空池，
+            // 或用户刚加的新类别）。这个数报出去就是一条无法执行的建议，
+            // 还会混进 report 的净买入总额，让 CLI 与结论卡各说各话。
+            // 清零 + 挂原因，三处界面自动同源。
+            leg.amount = 0.0;
+            leg.hold_reason = Some(NO_INSTRUMENT_REASON.to_owned());
+            continue;
+        }
+        leg.amount = amount;
+        leg.items = items;
+        total_buy += amount;
+
         if cash_constrained {
             leg.hold_reason = Some(format!("需 ¥{:.0}，受可用资金限制按比例缩减", need));
         }
@@ -298,11 +320,16 @@ pub fn calculate_rebalance_plan(
     }
 }
 
-/// 生成月度定投计划：**只买不卖**，各腿买入金额之和 = 月投入（费用前）。
+/// 生成月度定投计划：**只买不卖**。
 ///
 /// 分配规则：
 /// - 有新钱先补低配腿，按缺口占比重分配；
 /// - 所有腿都达标后，剩余金额按目标权重分配（维持配置，而不是追高）。
+///
+/// 可执行性：目标类别没有任何标的时，该腿金额清零并挂
+/// [`NO_INSTRUMENT_REASON`]——`total_buy` 只累计**可执行**金额，因此可能小于
+/// 月投入。缺口不挪给别的腿（否则等于拿缺标的类别的预算去追另一类，配置会漂），
+/// 由调用方提示「留在现金」。标的齐备时各腿之和仍等于月投入。
 pub fn calculate_monthly_plan(
     config: &AppConfig,
     score: f64,
@@ -355,21 +382,29 @@ pub fn calculate_monthly_plan(
             let share = if risk_w > 0.0 { leg_target[idx] / risk_w } else { 0.0 };
             deficits[idx] + (monthly - deficit_sum) * share
         };
-        leg.amount = amount;
-        total_buy += amount;
 
         if amount <= 0.0 {
             leg.hold_reason = Some("本月无需买入".to_string());
             continue;
         }
-        if deficits[idx] <= 0.0 {
-            leg.hold_reason = Some("已达标，按目标权重分配新钱".to_string());
-        }
         let members: Vec<&Position> = positions
             .iter()
             .filter(|p| p.category == leg.category)
             .collect();
-        leg.items = split_within_leg(&members, amount, config.settings.max_contrarian_weight);
+        let items = split_within_leg(&members, amount, config.settings.max_contrarian_weight);
+        if items.is_empty() {
+            // 与再平衡同一条根因（R1 应修③）：这条腿的钱买不到东西，报出去
+            // 就是一条无法执行的建议。清零 + 挂原因，合计只算可执行金额。
+            // 缺口不挪给别的腿——那等于拿缺标的类别的预算去追另一类，配置会漂。
+            leg.hold_reason = Some(NO_INSTRUMENT_REASON.to_owned());
+            continue;
+        }
+        if deficits[idx] <= 0.0 {
+            leg.hold_reason = Some("已达标，按目标权重分配新钱".to_string());
+        }
+        leg.amount = amount;
+        leg.items = items;
+        total_buy += amount;
     }
 
     RebalancePlan {
@@ -527,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn 空仓且极度恐慌时应建议买到目标仓位() {
+    fn 空池不给无法执行的买入金额() {
         let c = AppConfig::default_config();
         let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &[], today());
         assert_eq!(p.target_risk_weight, 85.0);
@@ -543,9 +578,40 @@ mod tests {
             p.legs.iter().all(|l| l.current_weight.is_sign_positive()),
             "腿级当前权重符号应为正零（表格里不得出现 -0.0%）"
         );
-        // 无持仓标的，腿内无可分摊对象，但腿级金额应已给出
-        let total: f64 = p.legs.iter().map(|l| l.amount).sum();
-        assert!((total - 85_000.0).abs() < 1.0, "应建议买入约8.5万, 实际{}", total);
+        // 一个标的都没有时，腿级目标金额不是"可执行建议"：清零并说明原因，
+        // 否则 report 的净买入总额会含一笔买不到的钱。
+        assert_eq!(p.total_buy, 0.0);
+        assert!(!p.has_action());
+        assert!(p.legs.iter().all(|l| l.amount == 0.0));
+        assert!(
+            p.legs
+                .iter()
+                .all(|l| l.hold_reason.as_deref() == Some(NO_INSTRUMENT_REASON)),
+            "空池的腿必须挂上「暂无可买标的」原因"
+        );
+    }
+
+    #[test]
+    fn 只有部分类别有标的时只为有标的的腿报金额() {
+        // 标的存在、份额还是 0（刚 add 未买）也算可执行：不能把「还没买」
+        // 误判成「买不到」。另外两条没有标的的腿必须清零，不进总额。
+        let c = AppConfig::default_config();
+        let positions = vec![pos("QQQ", "纳指ETF", "us_stocks", 0.0, 0.0, 1.0, "2020-01-01")];
+        let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
+
+        let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
+        assert!(us.amount > 0.0, "有标的的腿应给出金额");
+        assert!(!us.items.is_empty(), "有标的的腿应分摊到具体标的");
+        assert!(us.hold_reason.is_none());
+
+        for leg in p.legs.iter().filter(|l| l.category != "us_stocks") {
+            assert_eq!(leg.amount, 0.0, "{}腿没有标的，不应报金额", leg.category_cn);
+            assert_eq!(leg.hold_reason.as_deref(), Some(NO_INSTRUMENT_REASON));
+        }
+        // 总额只含有标的的腿
+        let legs_sum: f64 = p.legs.iter().map(|l| l.amount).sum();
+        assert!((p.total_buy - legs_sum).abs() < 0.01);
+        assert!(p.total_buy < 85_000.0, "无标的的腿不应计入总额");
     }
 
     #[test]
@@ -649,6 +715,7 @@ mod tests {
         let positions = vec![
             pos("QQQ", "纳指ETF", "us_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
             pos("DIV", "红利ETF", "cn_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
+            pos("GLD", "黄金ETF", "counter_cyclical", 100.0, 1.0, 1.0, "2020-01-01"),
         ];
         let p = calculate_monthly_plan(&c, 50.0, 1_000.0, &positions, 3_000.0);
         let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
@@ -663,12 +730,49 @@ mod tests {
     }
 
     #[test]
+    fn 定投缺标的的腿不给金额且合计只算可执行部分() {
+        // 产品 B 批：计划页是用户「照着买」的主路径。只持有美股基金时，
+        // 逆周期腿算得出 ¥101 却一条标的都没有——这个数不能报，否则用户
+        // 拿着钱买不到东西，同屏的结论卡却说「该类别暂无可买标的」。
+        let c = AppConfig::default_config();
+        let positions = vec![pos(
+            "QQQ", "纳指ETF", "us_stocks", 100.0, 1.0, 1.0, "2020-01-01",
+        )];
+        let monthly = 3_000.0;
+        let p = calculate_monthly_plan(&c, 22.0, 1_000.0, &positions, monthly);
+
+        let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
+        assert!(us.amount > 0.0, "有标的的腿应给金额");
+        assert!(!us.items.is_empty());
+
+        for leg in p.legs.iter().filter(|l| l.category != "us_stocks") {
+            assert_eq!(leg.amount, 0.0, "{}腿没有标的，不应报金额", leg.category_cn);
+            assert_eq!(
+                leg.hold_reason.as_deref(),
+                Some(NO_INSTRUMENT_REASON),
+                "{}腿应挂上补齐标的的指引",
+                leg.category_cn
+            );
+            assert!(leg.items.is_empty());
+        }
+        let legs_sum: f64 = p.legs.iter().map(|l| l.amount).sum();
+        assert!((p.total_buy - legs_sum).abs() < 0.01, "合计应等于可执行腿之和");
+        assert!(
+            p.total_buy < monthly,
+            "合计应小于月投入（缺口留在现金）: {}",
+            p.total_buy
+        );
+    }
+
+    #[test]
     fn 定投在所有腿达标后按目标权重分配() {
         let c = AppConfig::default_config();
         // 极度贪婪时目标仅 35%，现金充裕 → 所有腿都无需补缺
-        let positions = vec![pos(
-            "QQQ", "纳指ETF", "us_stocks", 40_000.0, 1.0, 1.0, "2020-01-01",
-        )];
+        let positions = vec![
+            pos("QQQ", "纳指ETF", "us_stocks", 40_000.0, 1.0, 1.0, "2020-01-01"),
+            pos("DIV", "红利ETF", "cn_stocks", 40_000.0, 1.0, 1.0, "2020-01-01"),
+            pos("GLD", "黄金ETF", "counter_cyclical", 40_000.0, 1.0, 1.0, "2020-01-01"),
+        ];
         let p = calculate_monthly_plan(&c, 90.0, 1_000_000.0, &positions, 3_000.0);
         let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
         assert!((sum - 3000.0).abs() < 0.01, "各腿之和应等于月投入: {}", sum);
@@ -689,25 +793,84 @@ mod tests {
     #[test]
     fn 买入受可用现金约束时应按比例缩减() {
         let c = AppConfig::default_config();
-        // 美股昨日刚买入（卖出被最短持有期封锁），其余两腿空缺，现金很少
-        // → 需买入金额将超过可用资金
-        let positions = vec![pos(
-            "A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2026-07-30",
-        )];
+        // 美股昨日刚买入（卖出被最短持有期封锁），其余两腿低配，现金很少
+        // → 需买入金额将超过可用资金。
+        // A股/逆周期各放一个份额为 0 的标的（刚 add 未买，可执行）：否则这两
+        // 条腿会被「暂无可买标的」清零，`buy <= 10_000` 就成了一恒真断言，
+        // 测不到「按比例缩减」这件事。
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2026-07-30"),
+            pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
+            pos("GLD", "黄金ETF", "counter_cyclical", 0.0, 0.0, 1.0, "2020-01-01"),
+        ];
         let p = calculate_rebalance_plan(&c, 50.0, 10_000.0, &positions, today());
         assert_eq!(p.total_sell, 0.0, "美股未满持有期不应卖出");
         assert!(p.cash_constrained, "应标记为受资金约束");
         let buy: f64 = p.legs.iter().map(|l| l.amount.max(0.0)).sum();
-        assert!(buy <= 10_000.0 + 0.01, "买入不应超过可用现金: {}", buy);
+        assert!(
+            (buy - 10_000.0).abs() < 1.0,
+            "可用现金应被足额分配（按缺口比例缩减），实际买入 {:.2}",
+            buy
+        );
+        assert!((p.total_buy - buy).abs() < 0.01, "总额应等于各腿之和");
+        // 每条有标的的腿都应有可执行明细，且都挂了缩减原因
+        for leg in p.legs.iter().filter(|l| l.amount > 0.0) {
+            assert!(!leg.items.is_empty(), "{}腿应有可执行明细", leg.category_cn);
+            assert!(
+                leg.hold_reason.as_deref().unwrap_or("").contains("受可用资金限制"),
+                "{}腿应披露缩减原因",
+                leg.category_cn
+            );
+        }
+    }
+
+    #[test]
+    fn 标的齐备时应买到目标仓位() {
+        // happy path：空仓 + 三腿各有一个标的（份额 0，刚 add 未买）→ 钱应
+        // 按腿目标权重分完，且总额等于目标风险仓位对应的金额。
+        let c = AppConfig::default_config();
+        let positions = vec![
+            pos("QQQ", "纳指ETF", "us_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
+            pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
+            pos("GLD", "黄金ETF", "counter_cyclical", 0.0, 0.0, 1.0, "2020-01-01"),
+        ];
+        let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
+        assert_eq!(p.target_risk_weight, 85.0);
+        assert!(!p.cash_constrained, "现金充足不应缩减");
+        assert!(
+            (p.total_buy - 85_000.0).abs() < 1.0,
+            "应买到目标仓位约 8.5 万，实际 {:.2}",
+            p.total_buy
+        );
+        let legs_sum: f64 = p.legs.iter().map(|l| l.amount).sum();
+        assert!((legs_sum - p.total_buy).abs() < 0.01);
+
+        // 各腿金额应按腿目标权重分配（目标权重已是占总资产的百分比）
+        let total_assets = p.total_assets;
+        for leg in &p.legs {
+            let expected = total_assets * leg.target_weight / 100.0;
+            assert!(
+                (leg.amount - expected).abs() < 1.0,
+                "{}腿应约 ¥{:.2}，实际 ¥{:.2}",
+                leg.category_cn,
+                expected,
+                leg.amount
+            );
+            assert!(!leg.items.is_empty(), "{}腿应有可执行明细", leg.category_cn);
+            assert!(leg.hold_reason.is_none(), "{}腿不应有阻碍原因", leg.category_cn);
+        }
     }
 
     #[test]
     fn 卖出回收资金应计入买入预算() {
         let c = AppConfig::default_config();
-        // 美股严重超配、其余为零，现金为零 → 卖美股的钱应能买其他腿
-        let positions = vec![pos(
-            "A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2020-01-01",
-        )];
+        // 美股严重超配、现金为零 → 卖美股的钱应能买其他腿。
+        // A股给一个份额为 0 的标的（刚 add 未买），否则该腿没有可买对象，
+        // 引擎会按「暂无可买标的」清零，这笔钱就无处可去。
+        let positions = vec![
+            pos("A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2020-01-01"),
+            pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
+        ];
         let p = calculate_rebalance_plan(&c, 50.0, 0.0, &positions, today());
         assert!(p.total_sell > 0.0, "美股应减仓");
         assert!(p.total_buy > 0.0, "卖出回收应能支持其他腿买入");

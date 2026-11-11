@@ -17,7 +17,19 @@ fn pad_display(s: &str, width: usize) -> String {
     }
 }
 use crate::models::Position;
-use crate::strategy::{LegPlan, RebalancePlan, RiskAdvice, RiskWarning};
+use crate::strategy::{LegPlan, NO_INSTRUMENT_REASON, RebalancePlan, RiskAdvice, RiskWarning};
+
+/// 「缺标的」原因在 CLI 侧的下一步动作（引擎只存原因，去处由各界面拼）。
+pub const NO_INSTRUMENT_ACTION_CLI: &str = "，用 mns add 补齐";
+
+/// 把引擎原因转成 CLI 展示文本：缺标的时补上「怎么补」，其余原因原样返回。
+fn cli_reason(reason: &str) -> String {
+    if reason == NO_INSTRUMENT_REASON {
+        format!("{reason}{NO_INSTRUMENT_ACTION_CLI}")
+    } else {
+        reason.to_owned()
+    }
+}
 
 /// 无动作时的真实原因：不能一律归为“在带宽内”。
 #[derive(Clone)]
@@ -147,15 +159,18 @@ pub fn generate_report(
     // 结论先行：四行 TL;DR，长文保留在后面
     let fees = plan.estimated_fees(&config.costs);
     let no_action = no_action_reason(plan);
-    // 无可执行标的（产品 C 批发现）：腿级金额已算出（has_action 为真）但
-    // 所有腿的 items 为空——空标的池时 split_within_leg 无从分摊，个别
-    // 类别缺资产同样无法分摊。此时费用为 0，若照常输出"买入 ¥9400"会与
-    // "¥0 无需交易"的费用行自相矛盾。如实引导建池，类似 EmptyAccount
-    // 的注资引导。
-    let no_executable_items = plan.has_action() && plan.legs.iter().all(|l| l.items.is_empty());
+    // 无可执行标的（产品 C 批发现，R1 修正到引擎层）：腿级金额算得出来，
+    // 不代表买得到——该类别一个标的都没有时，calculate_rebalance_plan 会把
+    // 这条腿清零并挂上 NO_INSTRUMENT_REASON。这里只认这条原因，不再自己看
+    // items 空不空：同一件事两种判断，正是 CLI 与结论卡各说各话的根源。
+    let no_executable_buy = !plan.has_action()
+        && plan
+            .legs
+            .iter()
+            .any(|l| l.hold_reason.as_deref() == Some(NO_INSTRUMENT_REASON));
     // 动作行用精确金额（¥{:.2}），与下方调仓明细同口径——费用是估算值，
     // 保持 fmt_money 的取整不动；动作金额是"要执行多少钱"，必须精确。
-    let action_line = if no_executable_items {
+    let action_line = if no_executable_buy {
         if positions.is_empty() {
             "资金已就位，但标的池为空——先 `mns add <代码> <名称> <类别>` 建池".to_string()
         } else {
@@ -188,7 +203,7 @@ pub fn generate_report(
         .legs
         .iter()
         .max_by(|a, b| a.drift_pp.abs().partial_cmp(&b.drift_pp.abs()).unwrap_or(std::cmp::Ordering::Equal));
-    let why_line = if no_executable_items {
+    let why_line = if no_executable_buy {
         format!(
             "情绪 {}（{:.0} 分），目标风险仓位 {:.0}%——暂无可执行标的，建池后下个决策日即可执行",
             rating, score, plan.target_risk_weight
@@ -219,7 +234,10 @@ pub fn generate_report(
                         format!(
                             "{}：{}",
                             l.category_cn,
-                            l.hold_reason.as_deref().unwrap_or("暂不建议操作")
+                            l.hold_reason
+                                .as_deref()
+                                .map(cli_reason)
+                                .unwrap_or_else(|| "暂不建议操作".to_owned())
                         )
                     })
                     .collect();
@@ -228,7 +246,7 @@ pub fn generate_report(
         }
     };
 
-    let fee_line = if no_executable_items {
+    let fee_line = if no_executable_buy {
         "预计费用：—（无可执行标的）".to_string()
     } else if fees < 1.0 {
         "预计费用：¥0（本次无需交易）".to_string()
@@ -467,7 +485,7 @@ pub fn generate_report(
         }
         report.push_str(&format!("  ▸ {}\n", leg.category_cn));
         if let Some(reason) = &leg.hold_reason {
-            report.push_str(&format!("    · {}\n", reason));
+            report.push_str(&format!("    · {}\n", cli_reason(reason)));
         }
         for item in &leg.items {
             let verb = if item.amount >= 0.0 {
@@ -524,7 +542,10 @@ pub fn generate_report(
                     report.push_str(&format!(
                         "    · {}：{}\n",
                         l.category_cn,
-                        l.hold_reason.as_deref().unwrap_or("暂不建议操作")
+                        l.hold_reason
+                            .as_deref()
+                            .map(cli_reason)
+                            .unwrap_or_else(|| "暂不建议操作".to_owned())
                     ));
                 }
             }
@@ -687,14 +708,20 @@ pub fn generate_observation_report(
     }
 
     // 观察日也给一句话结论：不操作 + 下一个决策日
-    let next_note = match config.rebalance.decision_weekday {
-        0 => "每日都是决策日".to_string(),
-        wd => {
+    // 日期数学与 signal::next_decision_day 同源，GUI 的"本周结论"也用同一份。
+    let next_note = match crate::signal::next_decision_day(
+        today.date_naive(),
+        config.rebalance.decision_weekday,
+    ) {
+        None => "每日都是决策日".to_string(),
+        Some(next) => {
             let names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
-            let today_idx = today.weekday().num_days_from_monday() as u32 + 1;
-            let delta = (wd + 7 - today_idx) % 7;
-            let delta = if delta == 0 { 7 } else { delta };
-            format!("下一个决策日：{}（{} 天后）", names[(wd - 1) as usize], delta)
+            let delta = (next - today.date_naive()).num_days();
+            format!(
+                "下一个决策日：{}（{} 天后）",
+                names[(config.rebalance.decision_weekday - 1) as usize],
+                delta
+            )
         }
     };
     report.push_str("【本周结论】\n");
@@ -965,13 +992,14 @@ mod tests {
 
     #[test]
     fn 空标的池时引导建池而非给出无法执行的建议() {
-        // 产品 C 批发现：空池 + 有现金 → has_action 为真（腿级金额已算出）
-        // 但 items 全空、费用为 0，"操作：买入 ¥9400" 与 "¥0 无需交易"
-        // 自相矛盾。正确 UX 是引导 mns add 建池。
+        // 产品 C 批发现：空池 + 有现金 → 旧实现给出"操作：买入 ¥9400"，
+        // 与 "¥0 无需交易" 的费用行自相矛盾。R1 把修正落到引擎：不可执行的
+        // 买入腿金额清零并挂 NO_INSTRUMENT_REASON，报告只认这条原因。
         let config = AppConfig::default_config();
-        let mut p = plan(100_000.0, vec![leg("us_stocks", None)]);
-        p.total_buy = 9400.00; // 腿级金额存在，但空池无从分摊 → items 为空
-        p.legs[0].amount = 9400.00;
+        let p = plan(
+            100_000.0,
+            vec![leg("us_stocks", Some(NO_INSTRUMENT_REASON))],
+        );
         let report = generate_report(
             &config,
             22.0,
@@ -1017,9 +1045,10 @@ mod tests {
         // items 全空的另一种形态：持仓存在，但要买入的类别下没有资产
         // （如只持有美股，恐贪走高后逆周期腿要买入却无标的可分摊）。
         let config = AppConfig::default_config();
-        let mut p = plan(100_000.0, vec![leg("counter_cyclical", None)]);
-        p.total_buy = 5000.00;
-        p.legs[0].amount = 5000.00;
+        let p = plan(
+            100_000.0,
+            vec![leg("counter_cyclical", Some(NO_INSTRUMENT_REASON))],
+        );
         let positions = vec![Position {
             id: 1,
             asset_code: "QQQ".into(),
@@ -1061,6 +1090,75 @@ mod tests {
             action
         );
         assert!(!action.contains("买入"));
+    }
+
+    #[test]
+    fn 部分类别缺标的时总额不含买不到的腿() {
+        // 引擎级修正的端到端证据：只持有美股基金时，逆周期腿要补但没有标的。
+        // report 的净买入不得含这笔钱，腿表要显示「不动作」+ 原因。
+        let config = AppConfig::default_config();
+        let positions = vec![Position {
+            id: 1,
+            asset_code: "QQQ".into(),
+            asset_name: "纳指100".into(),
+            category: "us_stocks".into(),
+            shares: 0.0,
+            cost_price: 0.0,
+            current_price: Some(1.0),
+            first_buy_date: "2020-01-01".into(),
+            updated_at: "2020-01-01".into(),
+        }];
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let p = crate::strategy::calculate_rebalance_plan(&config, 22.0, 100_000.0, &positions, today);
+        let blocked: Vec<&str> = p
+            .legs
+            .iter()
+            .filter(|l| l.amount == 0.0)
+            .map(|l| l.category.as_str())
+            .collect();
+        assert_eq!(blocked.len(), 2, "缺少标的的两条腿应被清零");
+
+        let report = generate_report(
+            &config,
+            22.0,
+            "恐惧",
+            22.0,
+            "恐惧",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &positions,
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let action = report
+            .lines()
+            .find(|l| l.contains("1. 操作："))
+            .unwrap_or("<未找到>");
+        assert!(
+            action.contains(&format!("买入 ¥{:.2}", p.total_buy)),
+            "动作金额应只含有标的的腿，实际: {}",
+            action
+        );
+        assert!(
+            action.contains(&format!("¥{:.2}", p.total_buy)),
+            "动作金额应与 total_buy 同口径"
+        );
+        assert!(
+            report.contains(NO_INSTRUMENT_REASON),
+            "缺失标的的腿应在明细里给出原因"
+        );
+        assert!(
+            report.matches("不动作").count() >= 2,
+            "缺失标的的腿在腿表里应显示不动作"
+        );
     }
 
     #[test]

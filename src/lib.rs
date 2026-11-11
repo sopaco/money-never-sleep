@@ -10,6 +10,7 @@ pub mod backtest;
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod discipline;
 pub mod guardrail;
 // 数据集模块含完整的 CSV 元数据契约与可复算轨迹（抓取日、各腿起止、stale 天数、
 // FGI 来源段等），部分字段供审计导出使用、当前打印层未全部消费。
