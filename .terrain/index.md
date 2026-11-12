@@ -58,6 +58,7 @@ source: .
     - config.rs
     - lib.rs
     - sentiment.rs
+    - discipline.rs
     - models.rs
     - agent/
     - db.rs
