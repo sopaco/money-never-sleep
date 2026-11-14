@@ -112,6 +112,12 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build --features gui --bin mns-gui 失败（exit $LASTEXITCODE）"
     }
+
+    Write-Step '编译 mns-help.exe（帮助中心，release，--features gui）'
+    & cargo build --release @targetArgs --features gui --bin mns-help
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build --features gui --bin mns-help 失败（exit $LASTEXITCODE）"
+    }
 }
 else {
     Write-Step '跳过编译，使用已有构建产物'
@@ -119,9 +125,10 @@ else {
 
 $guiExe = Join-Path $binDir 'mns-gui.exe'
 $cliExe = Join-Path $binDir 'mns.exe'
-foreach ($exe in @($guiExe, $cliExe)) {
+$helpExe = Join-Path $binDir 'mns-help.exe'
+foreach ($exe in @($guiExe, $cliExe, $helpExe)) {
     if (-not (Test-Path -LiteralPath $exe)) {
-        throw "缺少构建产物：$exe（先执行 cargo build --release --features gui --bin mns-gui 与 --bin mns）"
+        throw "缺少构建产物：$exe（先执行 cargo build --release --features gui --bin mns-gui 与 --bin mns 与 --bin mns-help）"
     }
 }
 
@@ -143,7 +150,25 @@ New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
 Copy-Item -LiteralPath $guiExe -Destination $stageDir
 Copy-Item -LiteralPath $cliExe -Destination $stageDir
+Copy-Item -LiteralPath $helpExe -Destination $stageDir
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stageDir
+
+# 帮助中心运行时从自身旁边的 help\images 读取截图；没有截图时显示占位框。
+$helpImagesDir = Join-Path $root 'help\images'
+$helpImages = @()
+if (Test-Path -LiteralPath $helpImagesDir) {
+    $helpImages = @(Get-ChildItem -LiteralPath $helpImagesDir -File -Filter *.png)
+}
+if ($helpImages.Count -gt 0) {
+    $stageImagesDir = Join-Path $stageDir 'help\images'
+    New-Item -ItemType Directory -Path $stageImagesDir -Force | Out-Null
+    # -LiteralPath 不做通配符展开，这里必须用 -Path 逐个传入真实文件路径。
+    Copy-Item -Path $helpImages.FullName -Destination $stageImagesDir -Force
+    Write-Step "帮助截图 $($helpImages.Count) 张 → help\images"
+}
+else {
+    Write-Warn "未找到 $helpImagesDir 下的图片，安装包将不含帮助截图（帮助中心显示占位框）"
+}
 
 $zipPath = Join-Path $distDir "$stageName.zip"
 if (Test-Path -LiteralPath $zipPath) {
@@ -288,4 +313,5 @@ if (Test-Path -LiteralPath $setupPath) {
 Write-Host ''
 Write-Host "   GUI  $guiExe"
 Write-Host "   CLI  $cliExe"
+Write-Host "   Help $helpExe"
 Write-Host '   安装后 mns-gui 会自动把同目录的 mns.exe 交给外接 Agent，无需配置 PATH。'

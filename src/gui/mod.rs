@@ -6,17 +6,17 @@
 
 mod autostart;
 mod chart;
-mod components;
+// Theme and small building blocks are shared with the mns-help viewer.
+pub(crate) mod components;
 pub(crate) mod conversations;
 mod jobs;
 mod mood;
 mod pages;
-mod theme;
+pub(crate) mod theme;
 
 use chrono::Datelike;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::Disableable;
 use gpui_kit::component::input::{Input, InputState, TextareaState};
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
@@ -78,7 +78,8 @@ actions!(
         RefreshData,
         OpenPlanPage,
         OpenAgentPage,
-        RunTodayReview
+        RunTodayReview,
+        OpenHelpCenter
     ]
 );
 
@@ -1659,6 +1660,13 @@ thread_local! {
 }
 
 pub fn run() {
+    // 单实例：常驻托盘的程序被重复双击时，用户要的是「把已有窗口提到前面」，
+    // 不是第二个进程。后启动的进程通知 Primary 后直接退出。
+    let instance = match crate::single_instance::acquire("mns-gui") {
+        crate::single_instance::Acquired::Primary(guard) => guard,
+        crate::single_instance::Acquired::AlreadyRunning => return,
+    };
+
     // Finder 启动时进程 cwd 是 `/`（macOS 系统卷只读）。所有自有路径都已
     // 改为绝对解析，这里再把 cwd 固定到应用数据目录，让外部 ACP agent 及
     // 其他子进程继承到的一律是可写位置。
@@ -1729,7 +1737,35 @@ pub fn run() {
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
             spawn_daily_scheduler(cx);
+            spawn_instance_watcher(cx, instance);
         });
+}
+
+/// 等待「又有人启动了 mns-gui」的信号，并把主窗口带回前台。
+///
+/// 与托盘菜单「打开 MNS」走同一条路径：窗口被关到托盘时 `ensure_window`
+/// 会按快照重建一个可见窗口；窗口只是被最小化或被压在后面时
+/// `Window::activate_window` 负责还原并置前（Windows 上 `App::activate`
+/// 是空实现）。
+fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            if !guard.wakeup_requested() {
+                continue;
+            }
+            let _ = cx.update(|cx| {
+                ensure_window(cx);
+                if let Some(handle) = cx.global::<GuiState>().window.clone() {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                }
+                cx.activate(true);
+            });
+        }
+    })
+    .detach();
 }
 
 /// Minute-resolution scheduler for the unattended review.
@@ -1886,6 +1922,11 @@ fn register_actions(cx: &mut App) {
             view.update(cx, |shell, cx| shell.stop_agent(cx));
         }
     });
+    cx.on_action(|_: &OpenHelpCenter, _| {
+        if let Err(error) = open_help_center() {
+            eprintln!("启动 mns-help 失败：{error}");
+        }
+    });
     cx.on_action(|_: &QuitApplication, cx| {
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| shell.shutdown(cx));
@@ -1921,6 +1962,8 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("本月计划", OpenPlanPage),
             MenuItem::action("助手结论", OpenAgentPage),
+            MenuItem::separator(),
+            MenuItem::action("帮助中心", OpenHelpCenter),
         ]),
     ]
 }
@@ -2303,9 +2346,27 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
     items.push(MenuItem::separator());
     items.push(MenuItem::action("更新数据", RefreshData));
     items.push(MenuItem::action("打开 MNS", ShowMainWindow));
+    items.push(MenuItem::action("帮助中心", OpenHelpCenter));
     items.push(MenuItem::action("关于 MNS", ShowAbout));
     items.push(MenuItem::action("退出 MNS", QuitApplication));
     items
+}
+
+/// Spawns the standalone `mns-help` viewer bundled next to this executable.
+/// In dev builds the sibling lives in `target/<profile>/` alongside `mns-gui`.
+fn open_help_center() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let name = if cfg!(target_os = "windows") {
+        "mns-help.exe"
+    } else {
+        "mns-help"
+    };
+    command(dir.join(name)).spawn()?;
+    Ok(())
 }
 
 fn tray_icon() -> gpui_tray::Result<Icon> {

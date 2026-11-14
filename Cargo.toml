@@ -20,6 +20,13 @@ name = "mns-gui"
 path = "src/bin/mns-gui.rs"
 required-features = ["gui"]
 
+# Standalone CHM-style help viewer opened from the MNS tray menu.
+#   cargo run --bin mns-help --features gui
+[[bin]]
+name = "mns-help"
+path = "src/bin/mns-help.rs"
+required-features = ["gui"]
+
 # Headless verification of the ACP chain used by the GUI:
 #   cargo run --example agent_smoke --features agent
 [[example]]

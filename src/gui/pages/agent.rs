@@ -7,14 +7,13 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::Disableable;
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::agent::{EntryKind, PermissionPolicy, RunState, TimelineEntry};
 use crate::gui::components::*;
-use crate::gui::conversations::{ConversationSummary, strip_decision_block};
+use crate::gui::conversations::{strip_decision_block, ConversationSummary};
 use crate::gui::theme::*;
 use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, ViewedConversation};
 

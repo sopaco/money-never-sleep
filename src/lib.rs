@@ -33,3 +33,11 @@ pub mod agent;
 
 #[cfg(feature = "gui")]
 pub mod gui;
+
+/// Standalone CHM-style help viewer (`mns-help` binary).
+#[cfg(feature = "gui")]
+pub mod help;
+
+/// 进程级单实例守卫，供 `mns-gui` 与 `mns-help` 共用。
+#[cfg(feature = "gui")]
+pub mod single_instance;

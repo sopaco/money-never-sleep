@@ -1,214 +1,207 @@
-# MNS - Money Never Sleeps
+# MNS (Money Never Sleeps)
 
-> **AI-Powered Contrarian Investment Decision Assistant**  
-> Overcome human weaknesses, systematically execute "buy in fear, sell in greed"
+> A local investment companion: it keeps your positions and cash flows, maps market sentiment to a target exposure, and helps you act when it is warranted — and sit still when it is not.
 
-<p align="center">
-    <a href="https://github.com/sopaco/money-never-sleep/tree/main/.terrain/human"><img alt="Litho Docs" src="https://img.shields.io/badge/Litho-Docs-green?logo=Gitbook&color=%23008a60"/></a>
-    <a href="http://clawhub.ai/sopaco/money-never-sleep"><img alt="ClawHub" src="https://img.shields.io/badge/ClawHub-Certified-blue"/></a>
-    <a href="https://github.com/openclaw/openclaw"><img alt="OpenClaw Compatible" src="https://img.shields.io/badge/OpenClaw-Compatible-brightgreen"/></a>
-</p>
+MNS comes as a desktop app and a command-line tool. Both read the same local database and follow the same rules. It does not connect to a broker, place orders, or predict the market. Your data stays on your machine.
 
----
+It is meant for people running a long-term allocation who are willing to check in weekly or monthly and want to look back later at why a decision was made. If you mainly trade short-term, the rhythm probably will not suit you.
 
-> **Status update (2026-11-08)**: the default `mns backtest` is now a live-account audit
-> (real fund NAVs, point-in-time signals, channel-level settlement, account mirror), not the
-> 2016–2025 monthly-proxy strategy comparison described in the tables below. Those legacy
-> numbers are kept for history only and **must not be used for live decisions** — the old
-> engine is `mns backtest legacy`. Validation shows the sentiment signal has no statistically
-> significant timing contribution (63rd percentile in a permutation test, below the 80th
-> percentile threshold); constant 70–75% exposure is often equivalent or better with fewer
-> trades. See [`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md) and the
-> Chinese README for the current feature map and correct usage.
+## Why it exists
 
-## The biggest enemy of investing is not the market, but human nature
+The hardest part of investing is usually not the market. You hesitate to buy after a fall, you are reluctant to sell into strength, and a bit of volatility makes you want to do something. Those reactions are normal, but in a long-term portfolio they tend to turn into extra costs and worse decisions. There is also the memory problem: a few months later, you may no longer be able to explain why you bought or sold.
 
-Fear prevents buying when prices drop, greed prevents selling when prices rise—this is the instinctive dilemma every investor faces. MNS digitizes contrarian investment strategies, replacing emotion with rules, letting data drive decisions:
+MNS takes the opposite approach: it fixes the process. Hold a little less risk when sentiment is greedy and a little more when it is fearful. Check on a schedule, and leave things alone when the drift is small. Record every trade, archive every report, and review the decisions later. The rules will not necessarily make you more money, but they make the process repeatable and leave less room for impulse.
 
-- 🎯 **Automatically suggest buying during extreme fear**, not panic selling
-- ⚠️ **Warn when a position is more than 20% underwater**, with wording that depends on sentiment
-- ⚠️ **Smart alerts when positions are underwater**, not ignoring losses
-- 📊 **Honest backtest reporting**: better risk-adjusted than buy-and-hold (Calmar 1.17 vs 0.98), but **lower returns**
+## How it works
 
----
+MNS takes the CNN Fear & Greed Index as input and maps its 0–100 score onto a five-step target exposure curve. By default, risk assets may range from 35% to 85% of the portfolio: more fear allows more exposure, more greed allows less.
 
-## Core Advantages
+On each check, the program compares that target with what you actually hold. Only assets that drift outside the band (4 percentage points by default) enter the rebalance plan. Sells come before buys, and proceeds from sales count toward the buy budget.
 
-### 🧠 Based on Real Market Data
-Integrated CNN Fear & Greed Index, real-time market sentiment sensing, automatically saves historical snapshots for retrospective analysis.
+One thing worth being clear about: the sentiment score only sets how much risk exposure you are allowed to hold. It does not pick entry or exit points, and there is no take-profit rule. A trade is justified by something else — new money arriving, money needed out, or an asset drifting beyond its band. Most of the time, the report will tell you to do nothing.
 
-### 📈 Legacy Backtest Numbers (2026-11-08: demoted, do not use for live decisions)
-The tables in this section come from the **old monthly proxy engine** (`mns backtest legacy`):
-2016-2025 monthly bars, 3-month smoothing, month-end execution, ¥100k start plus ¥50k/year inflow.
-They do not match the live account or the current signal path. Current evidence and usage are in
-[`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md) and
-[`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md).
+## What it does
 
-Backtested on 2016-2025 **real total-return data** (CNY-denominated, dividends included), **net of transaction costs, tiered redemption fees and cash yield**.
-Default allocation: US 55%, CN 25%, Gold 20%; target risk-asset weight moves between 35% and 85% with sentiment.
+### A weekly decision report
 
-| Strategy | Annualized (XIRR) | Max Drawdown | Calmar | Trades/yr |
-|---|---|---|---|---|
-| Target-weight (trend anchor) | 12.75% | 10.91% | **1.17** | 8.0 |
-| Buy & hold | **14.60%** | 14.93% | 0.98 | 3.2 |
+Daily sentiment is noisy for a portfolio that is checked weekly or monthly. Before computing anything, MNS smooths the score over 7 days, requires a new zone to hold for 3 consecutive days, and only produces a full rebalance recommendation on the decision day (Friday by default).
 
-⚠️ **Read this first**: buy-and-hold beats this strategy by ~1.9pp annualized. The tool's value
-holds only on a risk-adjusted basis (~4pp lower drawdown), and prolonged bear markets
-(2000-2002, 2008) are not covered by the available data — yet "bear-market protection" is
-precisely this strategy's main selling point, so that claim remains untested.
+On that day it tells you what to buy, what to sell, and how much. On other days it produces an observation-only report that says no action is needed. If you really need a decision on another day, `mns report --decide` will generate one.
 
-**⚠️ More importantly — the 12.75%/Calmar 1.17 above is the "trend anchor" backtest result, but
-`mns report`'s live default is the "sentiment anchor" (no trend judgment, maps the Fear & Greed
-score straight to a target weight); its in-sample figures are 9.79%/Calmar 1.07. Out-of-sample
-(walk-forward) validation shows even that risk-adjusted edge is not robust:**
+Every report is saved to `~/.mns/reports/YYYY-MM-DD.txt`. Over time, those files are more reliable than your memory.
 
-| Out-of-sample (from 2022-11) | Annualized | Max Drawdown | Calmar |
-|---|---|---|---|
-| Default config (sentiment anchor — `mns report`'s live behavior) | 7.91% | 9.18% | 0.86 |
-| Default config (trend anchor — backtest-only, not wired into live report) | 10.79% | 11.47% | 0.94 |
-| In-sample-tuned best (sentiment anchor) | 6.76% | 7.36% | 0.92 |
-| **Buy & hold** | **12.23%** | 11.95% | **1.02** |
+### Position sizing and rebalancing
 
-Out-of-sample, buy-and-hold beats both anchor configs on **both return and Calmar** — the
-in-sample "risk-adjusted edge" does not extrapolate. The bootstrap distribution (printed by
-`mns backtest validate`) shows this gap sits well inside statistical noise. `mns backtest
-validate` also breaks out 2018 and 2022 — the only two clearly-down years in the dataset — year
-by year; both anchors do show a smaller drawdown than buy-and-hold in those two years, but that
-**cannot substitute for a multi-year bear-market stress test** like 2000-2002 or 2008 — that data
-isn't available, so "bear-market protection" remains an under-tested claim. Run `mns backtest
-validate` yourself to reproduce every number above — don't rely only on the in-sample
-trend-anchor numbers `mns backtest` shows by default.
+Target exposure comes from the five-step curve, and the drift band turns it into a concrete plan. Assets inside their bands are left alone; the rest are ordered sells first, then buys, with amounts and share counts spelled out. The report gives you amounts and share counts instead of a vague suggestion to "add some exposure."
 
-### 🌊 Daily Signal Smoothing (noise reduction for long-term investors)
+### Monthly contributions
 
-A daily Fear & Greed score is weekly-frequency noise driving a monthly-to-yearly portfolio.
-The live decision path therefore applies three filters (see `src/signal.rs`, configured under
-`[rebalance]` in `~/.mns/config.toml`):
+`mns plan --monthly 3000` spreads this month's new money across the allocation legs based on current sentiment and target exposure. It only buys; the point is to keep the savings rate and execution rhythm steady, not to generate extra return.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `signal_smooth_days` | `7` | Decision score = mean of the last N daily scores (raw score is display-only) |
-| `zone_confirm_days` | `3` | A zone switch takes effect only after the smoothed score holds the new zone for N consecutive days; otherwise the previous zone stays |
-| `decision_weekday` | `5` | `mns report` outputs a full "decision report" only on that weekday (1=Mon…7=Sun, 0=daily); other days output an observation-only report; `mns report --decide` forces a decision report |
+Both `plan` and `guard` read the local sentiment snapshot, so run `mns today` once before using them for the first time.
 
-The old in-sample smoothing comparison (14.8 → 10.2 → 6.4 trades/year) has been **retracted**:
-it used a non-active config with monthly signals and does not reproduce under the active
-configuration. Do not cite it as evidence. Daily snapshots are stored locally
-(`fear_greed_snapshots` in SQLite), so smoothing works offline and survives CNN API changes.
+### A cooling-off period before impulse buys
 
-### 🔄 Buy/Sell Awareness
-Cash recovered from selling automatically counts toward buying budget, calculate sell first then buy, maximizing capital utilization.
+When you feel like adding exposure, run `mns guard` first. If the market is overheated, it suggests waiting one trading day and writing down your reason before you decide.
 
-### 🛡️ No profit-taking rules in the current decision path
-The "dual profit-taking" description in older docs is obsolete. `mns report` does not sell to
-lock in profits: target weights depend only on the sentiment score, never on an individual
-position's P&L. The only return-related behaviour is that `mns portfolio` highlights a position
-whose annualized return crosses `settings.annualized_target_high`, and the decision report
-shows a risk warning for positions more than 20% underwater.
+It will not stop you or change your allocation. It just asks whether the trade is part of the plan or something the mood talked you into.
 
-### 🎯 Contrarian Buying Logic
-The more underwater, the more suggested to buy (with weight cap), truly achieving "be greedy when others are fearful".
+### A local ledger
 
----
-
-## AI-Era Human-Machine Collaboration: OpenClaw + SKILL
-
-MNS is designed for AI-assisted development, with two built-in knowledge systems:
-
-| System | For | Purpose |
-|--------|-----|---------|
-| `.agents/skills/` / `.claude/skills/` | AI Coding Agent | Skill definitions (e.g. `mns-backtest`) for the backtest workflow |
-| `.terrain/agent/` | AI Coding Agent | Project architecture, module boundaries, core flows (Terrain knowledge assets) |
-| `.terrain/human/` | Human Developers | Project overview, architecture, workflows, deep dives |
-
-### SKILL Synergy Effect
-
-When you speak keywords (like "backtest"), AI automatically activates the corresponding SKILL, instantly gaining complete contextual understanding:
-
-- ✅ **No need to explain project background**, AI already understands architecture and constraints
-- ✅ **Safe strategy parameter modifications**, AI knows where and how to change without breaking other modules
-- ✅ **Automatically follows existing patterns when adding features**, maintaining code consistency
-- ✅ **Quickly locate root causes when debugging**, AI has complete data flow and call relationships
-
-> 💡 **One sentence triggers SKILL**: Tell your AI "I want to optimize profit-taking parameters" or "help me backtest this strategy", and it will automatically read
-> [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md) and gain complete project knowledge.
-
----
-
-## Quick Start
+MNS does not connect to a broker. After you complete a trade, you record it yourself:
 
 ```bash
-# Install
+mns cash deposit 10000        # external inflow, tracked on an XIRR basis
+mns buy 018966 1000 1.234     # a completed buy
+mns sell 018966 500 1.456     # a completed sell
+mns cash withdraw 2000        # external outflow
+```
+
+Positions, cost basis, cash, and transaction history stay consistent. Insufficient cash or selling more than you hold fails immediately. `cash set` exists for corrections; do not use it as a deposit channel.
+
+`mns portfolio` shows each position's size, cost, and annualized return. `mns performance` shows portfolio XIRR and actual maximum drawdown; it is read-only and writes nothing.
+
+### Discipline review
+
+The review page counts your trades per calendar year against an annual trade budget (10 to 20 by default), so you can see whether you have been trading too often. If a buy triggered the cooling-off prompt, the reason is stored with a "planned-off-plan" or "overheated" prefix, and the review separates those buckets. Unmarked records are reported as unmarked; the program does not guess your intent.
+
+### Desktop app
+
+The desktop app runs the same engine as the CLI, just with a different presentation. The dashboard shows net value and the asset curve, the portfolio page shows cost and P&L, the plan page shows this month's contribution, the review page shows performance and discipline, the assistant page connects an external AI agent, and settings covers parameters, theme, and launch at login.
+
+With the tray running, you can bring the window back, start a review, stop a task, or quit. Launch at login writes the operating system's own login entry; it does not add a background daemon. The Windows release has no console window.
+
+### AI assistant
+
+The assistant page talks to an ACP-compatible coding agent you already have installed (`opencode` is discovered by default). MNS hands it the day's report as the single source of truth and asks for a structured conclusion.
+
+MNS ships no model and stores no API key; models and credentials stay in your own agent configuration. Conclusions are archived as JSON under `~/.mns/agent/` for read-only replay. The agent does not write to your ledger or execute trades.
+
+### Historical audit
+
+`mns backtest` runs a live-account audit by default: it uses the same signal path as `mns report`, real fund NAVs, real channel costs, and settlement rules, then reports an account mirror and a set of control experiments.
+
+```bash
+mns backtest update-data              # rebuild local daily datasets (needs Python 3)
+mns backtest                          # full audit
+mns backtest mirror                   # strict strategy vs your actual fills
+mns backtest asset --dataset hs300    # single-asset control experiment
+```
+
+`mns backtest legacy` is the older monthly engine. It has been demoted; treat it as historical reference, not guidance for live decisions.
+
+## A week with MNS
+
+| When | What you do | Command |
+|---|---|---|
+| First time | Initialize, deposit, register existing positions | `mns init` → `mns cash deposit` → `mns add` |
+| Every Friday | Refresh prices and generate the decision report | `mns today` |
+| Payday | Allocate the monthly contribution, record fills afterward | `mns plan --monthly 3000` → `mns buy` |
+| Impulse buy | Check the cooling-off hint | `mns guard` |
+| Quarterly | Refresh data and compare against the account mirror | `mns backtest update-data` → `mns backtest mirror` |
+| Anytime | Review performance, transactions, market overview | `mns performance` / `mns history` / `mns market` |
+| Daily | Open the desktop app | `mns-gui` |
+
+## Install
+
+Build the CLI from source:
+
+```bash
 cargo build --release
-or
-cargo build --release --target x86_64-unknown-linux-musl
+./target/release/mns --version
+```
 
-# Initialize
-mns init
-mns cash deposit 10000       # external inflow (XIRR basis); `cash set` is a correction tool only
+Build the desktop app. On macOS this produces a `.app` and a `.dmg`:
+
+```bash
+cargo build --release --features gui
+./scripts/make-dmg.sh
+# Output: target/dist/MNS.app, target/dist/MNS-<version>-<arch>.dmg
+```
+
+On Windows, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) first:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\make-installer.ps1
+# Output: target/dist/MNS-<version>-win-x64-setup.exe and a portable ZIP
+```
+
+The installer is per-user, needs no admin rights, and does not change `PATH`. The desktop app and the `mns` CLI sit in the same directory at the same version.
+
+You can also install a prebuilt CLI through npm:
+
+```bash
+npm install -g @never-sleeps/mns-cli
+```
+
+It supports macOS Apple Silicon, Linux x64, and Windows x64. The npm package may lag behind the repository; build from source if you need the latest features.
+
+First run:
+
+```bash
+mns init                        # create ~/.mns/config.toml and mns.db
+mns cash deposit 10000          # deposit
 mns add 018966 "Nasdaq 100 feeder" us_stocks
-mns buy 018966 <shares> <price>
-mns config params            # full list of tunable parameters
-
-# Weekly (default decision day: Friday)
-mns today                    # refresh prices + report; observation-only on other days
-mns performance              # read-only XIRR / actual max drawdown
-
-# Monthly
-mns plan --monthly 3000      # buy-only DCA allocation; --monthly is required if cashflow.monthly = 0
-mns guard                    # cooling-off hint: delay 1 trading day + write down the reason
-mns history 20               # review executions
-
-# Periodic audit
-mns backtest update-data     # rebuild 3 daily datasets + freshness SLA (default 30 days)
-mns backtest                 # full live audit: controls, holdout, regimes, walk-forward, mirror
-mns backtest mirror          # strict strategy vs actual transactions only
-mns backtest asset --dataset hs300   # single-asset control experiment
-
-# Demoted, do not use for live decisions
-mns backtest legacy          # old 2016-2025 monthly proxy comparison
-mns backtest validate        # old single-split walk-forward + bootstrap
+mns buy 018966 1000 1.234       # record a completed buy
+mns config params               # list all tunable parameters and defaults
+mns today                       # refresh prices and generate today's report
 ```
 
-`mns guard` is a process guardrail, not a timing signal: it does not block trades, change
-weights or issue buy/sell instructions. See [`docs/guardrail-experiment-2026-11-08.md`](docs/guardrail-experiment-2026-11-08.md).
+There are three asset classes: `us_stocks` (US broad market), `cn_stocks` (China A-share broad market), and `counter_cyclical` (gold and similar). Their internal weights are controlled by `allocation.*`.
 
-### Risk profiles
+Everything lives under `~/.mns/`:
 
-`steady` / `balanced` / `aggressive` shrink the target-weight curve toward
-full investment (`core_blend` 0.4 / 0.6 / 0.8); they do **not** rewrite your
-curve anchors. A profile is a risk-preference knob, not alpha: the strategy
-still does not guarantee beating buy-and-hold out of sample. Old configs
-without the field default to `core_blend = 0`, i.e. exactly the previous
-behavior.
+| Path | Contents |
+|---|---|
+| `config.toml` | Risk profile, exposure curve, drift band, costs |
+| `mns.db` | Positions, transactions, cash, sentiment snapshots |
+| `reports/` | Archived daily reports |
+| `agent/` | AI conversations and decision records |
+| `gui.toml` | Desktop settings |
 
----
+Backup is just copying that directory, and moving to another machine is the same. MNS uploads nothing.
 
-## Documentation Navigation
+## Boundaries
 
-| Documentation | Description |
-|---------------|-------------|
-| [.terrain/human/](.terrain/human/) | Human-friendly docs: project overview, architecture, workflows |
-| [.agents/skills/mns-backtest/SKILL.md](.agents/skills/mns-backtest/SKILL.md) | Backtest skill: AI-facing steps, parameters, data-file reference |
-| [README_zh.md](README_zh.md) | Current feature map and correct usage (Chinese, post-remediation) |
-| [docs/remediation-2026-11-08.md](docs/remediation-2026-11-08.md) | Live-audit remediation, dataset contracts, acceptance results |
-| [docs/guardrail-experiment-2026-11-08.md](docs/guardrail-experiment-2026-11-08.md) | Cooling-off guardrail significance experiment |
-| [docs/hs300-experiment-2026-11-08.md](docs/hs300-experiment-2026-11-08.md) | CSI 300 single-asset control experiment |
-| [AGENTS.md](AGENTS.md) | AI Coding Agent working guidelines |
+- No broker connection and no order placement. `buy` and `sell` only record fills; you execute the trade yourself.
+- No price targets and no return promises. Historical backtests are not live expectations.
+- Do not trade the daily signal. Decisions are compressed to a weekly rhythm, and the annual trade budget is only 10 to 20 by default. Trading every day burns both costs and discipline.
+- Sentiment does not decide whether to trade. It only sets how much risk exposure is allowed.
+- Cooling-off hints and trade budgets are prompts, not blocks.
+- `report` and `today` write local sentiment snapshots and report files; they are not read-only. `performance`, `history`, and `portfolio` are.
+- The final decision, and its consequences, remain yours.
 
----
+## For AI agents
 
-## Design Philosophy
+Two agent-facing skills ship with the repository:
 
-```
-Fear × Greed = Loss
-Rules × Discipline = Profit
-```
+| Skill | Purpose |
+|---|---|
+| [`mns-advisor`](.agents/skills/mns-advisor/SKILL.md) | Handles "when to buy, when to sell, why not to act": trigger detection, live verification of purchase limits and fees, auditable decision cards |
+| [`mns-backtest`](.agents/skills/mns-backtest/SKILL.md) | Backtests, dataset rebuilds, parameter comparisons, and result interpretation |
 
-MNS doesn't predict markets, doesn't execute trades, it does one thing: **at critical moments, provide systematic decision support**.
+To hand the workflow to an external agent, use the distributable [`distribution/skills/mns-advisor.zip`](distribution/skills/mns-advisor.zip). It assumes `mns` is on `PATH`, with no source tree or datasets, and only teaches the agent which commands to call and how to read their output.
 
-The rest, is up to you.
+Agents should prefer the `mns` binary shipped with the app (on macOS, `MNS.app/Contents/MacOS/mns`) so a stale copy on `PATH` cannot produce a different picture of the ledger.
 
----
+## Under the hood
 
-**With OpenClaw + MNS, let AI be your investment decision partner.**
+MNS is written in Rust 2024. The CLI builds into a single executable with no runtime or database service. The ledger is a single SQLite file, configuration is TOML, and everything stays local — no cloud sync, no telemetry.
+
+The desktop shell is built on GPUI with a system tray, not a wrapped web page. Reports, the desktop app, and historical audits share the same signal and strategy code, so what you see is what gets tested.
+
+Quotes and sentiment data have multiple sources with fallbacks. Once sentiment snapshots are stored, smoothing and zone confirmation work offline, even if an API is temporarily unavailable.
+
+External agents connect over ACP. MNS hosts no model, inference endpoint, or API key.
+
+## Documentation
+
+- [`README_zh.md`](README_zh.md): Chinese README
+- [`AGENTS.md`](AGENTS.md): working agreement for AI coding agents
+- [`.terrain/human/`](.terrain/human/): project overview, architecture, and workflows
+- [`.agents/skills/mns-advisor/SKILL.md`](.agents/skills/mns-advisor/SKILL.md): live buy/sell decision orchestration
+- [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md): backtesting and data contracts
+
+## License
+
+[MIT](LICENSE)

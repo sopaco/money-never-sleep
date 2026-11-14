@@ -40,6 +40,7 @@
 #define AppPublisher "Sopaco"
 #define AppExeName "mns-gui.exe"
 #define CliExeName "mns.exe"
+#define HelpExeName "mns-help.exe"
 #define AppUrl "https://github.com/sopaco/money-never-sleep"
 
 [Setup]
@@ -86,11 +87,16 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Source: "{#SourceDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; CLI 必须与 GUI 同目录：mns-gui 通过自身所在目录定位 mns.exe 并把它交给外部 Agent。
 Source: "{#SourceDir}\{#CliExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; 帮助中心与 GUI 同目录：托盘菜单「帮助中心」从自身所在目录启动 mns-help.exe。
+Source: "{#SourceDir}\{#HelpExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#IconFile}"; DestDir: "{app}"; DestName: "app.ico"; Flags: ignoreversion
+; 帮助截图（可选目录，没有图片时占位存在但为空，Inno 不会报错）。
+Source: "{#SourceDir}\help\*"; DestDir: "{app}\help"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#AppDisplayName} 帮助中心"; Filename: "{app}\{#HelpExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]

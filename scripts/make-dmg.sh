@@ -8,9 +8,10 @@
 # on the same team (they clear the quarantine flag once). Distributing outside
 # the team requires a Developer ID plus notarisation — see docs/gui-release.md.
 #
-# The bundle ships BOTH executables, at the same version:
+# The bundle ships all three executables, at the same version:
 #   Contents/MacOS/mns-gui   desktop shell
 #   Contents/MacOS/mns       CLI, the one an agent must call
+#   Contents/MacOS/mns-help  standalone help viewer (tray menu opens it)
 # Agents resolve the CLI from the installed app, never from a guessable path
 # such as ~/mns or a stale copy on PATH. $HOME/QuickBins/mns has already drifted
 # to 0.7.0 while the app was 0.8.0, so a PATH lookup is not a trustworthy
@@ -28,6 +29,7 @@ cd "$ROOT"
 APP_NAME="MNS"
 EXECUTABLE="mns-gui"
 CLI="mns"
+HELP="mns-help"
 BUNDLE_ID="${BUNDLE_ID:-com.sopaco.mns}"
 VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)"
 DIST="$ROOT/target/dist"
@@ -63,6 +65,9 @@ if [[ -n "${TARGET:-}" ]]; then
     echo "==> building $CLI $VERSION ($ARCH, release, $TARGET)"
     cargo build --release --bin "$CLI" --target "$TARGET"
     CLI_BIN="$ROOT/target/$TARGET/release/$CLI"
+    echo "==> building $HELP $VERSION ($ARCH, release, $TARGET)"
+    cargo build --release --features gui --bin "$HELP" --target "$TARGET"
+    HELP_BIN="$ROOT/target/$TARGET/release/$HELP"
 else
     echo "==> building $EXECUTABLE $VERSION ($ARCH, release)"
     cargo build --release --features gui --bin "$EXECUTABLE"
@@ -70,9 +75,12 @@ else
     echo "==> building $CLI $VERSION ($ARCH, release)"
     cargo build --release --bin "$CLI"
     CLI_BIN="$ROOT/target/release/$CLI"
+    echo "==> building $HELP $VERSION ($ARCH, release)"
+    cargo build --release --features gui --bin "$HELP"
+    HELP_BIN="$ROOT/target/release/$HELP"
 fi
 
-for artifact in "$BIN" "$CLI_BIN"; do
+for artifact in "$BIN" "$CLI_BIN" "$HELP_BIN"; do
     if [[ ! -x "$artifact" ]]; then
         echo "missing build artifact: $artifact" >&2
         exit 1
@@ -112,6 +120,11 @@ cp "$BIN" "$APP/Contents/MacOS/$EXECUTABLE"
 # Contents/MacOS is the one place macOS expects extra executables in a bundle,
 # and it means agents never have to guess a home-directory path or trust PATH.
 cp "$CLI_BIN" "$APP/Contents/MacOS/$CLI"
+# Help viewer + its runtime screenshots live beside the executables.
+cp "$HELP_BIN" "$APP/Contents/MacOS/$HELP"
+if [[ -d "$ROOT/help/images" ]]; then
+    cp -R "$ROOT/help/images" "$APP/Contents/MacOS/help/images"
+fi
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
