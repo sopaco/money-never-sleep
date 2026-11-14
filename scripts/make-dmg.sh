@@ -120,10 +120,13 @@ cp "$BIN" "$APP/Contents/MacOS/$EXECUTABLE"
 # Contents/MacOS is the one place macOS expects extra executables in a bundle,
 # and it means agents never have to guess a home-directory path or trust PATH.
 cp "$CLI_BIN" "$APP/Contents/MacOS/$CLI"
-# Help viewer + its runtime screenshots live beside the executables.
+# Help viewer + its runtime screenshots. Screenshots go to Contents/Resources:
+# Contents/MacOS must contain only Mach-O executables, otherwise codesign sees
+# each PNG as an unsigned nested code object and `--verify --strict` fails.
 cp "$HELP_BIN" "$APP/Contents/MacOS/$HELP"
 if [[ -d "$ROOT/help/images" ]]; then
-    cp -R "$ROOT/help/images" "$APP/Contents/MacOS/help/images"
+    mkdir -p "$APP/Contents/Resources/help"
+    cp -R "$ROOT/help/images" "$APP/Contents/Resources/help/images"
 fi
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 

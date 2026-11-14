@@ -64,6 +64,10 @@ impl ImageCache {
             let mut dir = exe.parent().map(PathBuf::from);
             for _ in 0..5 {
                 let Some(current) = dir else { break };
+                // A macOS bundle keeps screenshots in Contents/Resources/help:
+                // Contents/MacOS may only hold Mach-O executables, otherwise
+                // codesign treats every stray file as an unsigned subcomponent.
+                roots.push(current.join("Resources").join("help"));
                 roots.push(current.join("help"));
                 dir = current.parent().map(PathBuf::from);
             }

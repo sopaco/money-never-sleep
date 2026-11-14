@@ -49,10 +49,16 @@ gui = ["agent", "dep:gpui-kit", "dep:gpui-tray"]
 # resolve against gpui-pre at all.
 gui-test = ["gui", "gpui-pre/test-support"]
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 # 把 assets/app.ico 编成 exe 的 RT_GROUP_ICON #1 资源。GPUI 的 Windows 后端
 # 用 LoadImageW(GetModuleHandleW(None), MAKEINTRESOURCE(1)) 取标题栏/任务栏图标，
 # 没有资源时只能显示 Windows 默认图标（WindowOptions::icon 仅对 X11 生效）。
+#
+# 必须是无条件 build-dependency：build.rs 本身总是被编译（且是给宿主编译的），
+# 写成 [target.'cfg(windows)'.build-dependencies] 时在 macOS/Linux 上该 crate
+# 不会进入 build script 的 extern prelude，直接 E0433 编译失败。是否真正嵌入图标
+# 由 build.rs 里的 CARGO_CFG_TARGET_OS 运行时判断（这样从 macOS 交叉编译到
+# Windows 也能拿到图标）。
 winresource = "0.1"
 
 [dependencies]

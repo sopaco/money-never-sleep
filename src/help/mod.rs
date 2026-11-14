@@ -3,7 +3,8 @@
 //! Left sidebar is the contents tree, the right pane renders markdown pages
 //! embedded at compile time (see [`content`]). Back/forward history behaves
 //! like a browser. Screenshots resolve at runtime from a `help/` directory
-//! next to the executable (see [`render::ImageCache`]).
+//! next to the executable, or `Resources/help` inside a macOS bundle (see
+//! [`render::ImageCache`]).
 
 pub mod content;
 pub mod markdown;
