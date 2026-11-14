@@ -50,7 +50,7 @@ impl Mood {
                 ink: 0x2f6fe0,
                 wash: 0xe6eefd,
                 label: "机会区间",
-                note: "情绪偏冷，策略在分批买入；回撤容忍度可以高一些。",
+                note: "情绪偏冷，策略在分批买入。",
             },
             MoodKind::Balanced => Self {
                 kind,
@@ -59,7 +59,7 @@ impl Mood {
                 ink: ACCENT,
                 wash: 0xeaf0fc,
                 label: "中性区间",
-                note: "情绪在常态区间，按月度计划执行，不需要额外动作。",
+                note: "情绪常态，按月度计划执行。",
             },
             MoodKind::Caution => Self {
                 kind,
@@ -68,7 +68,7 @@ impl Mood {
                 ink: 0xb4681a,
                 wash: 0xfaeedb,
                 label: "贪婪区间",
-                note: "情绪偏热，策略在收缩仓位；新钱先停在现金里。",
+                note: "情绪偏热，策略在收缩仓位。",
             },
         }
     }
@@ -102,7 +102,7 @@ impl Mood {
             mood.ink = 0x8a4b8f;
             mood.wash = 0xf3e7f4;
             mood.label = "谨慎区间";
-            mood.note = "情绪偏热且账户浮亏，先按兵不动，等下一次决策日。";
+            mood.note = "情绪偏热且账户浮亏，先按兵不动。";
         }
         mood
     }

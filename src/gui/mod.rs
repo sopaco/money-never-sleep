@@ -144,17 +144,6 @@ impl Page {
             Page::Settings => IconName::Settings,
         }
     }
-
-    pub(crate) fn subtitle(self) -> &'static str {
-        match self {
-            Page::Dashboard => "账户全貌与今天该不该动手",
-            Page::Portfolio => "每一笔持仓的成本、现值与配置位置",
-            Page::Plan => "按情绪与偏离生成的定投分配",
-            Page::Performance => "金额加权收益、回撤与资金流水",
-            Page::Agent => "每天看一眼账户，有结论再找你",
-            Page::Settings => "风险档位、定投金额与外部 Agent",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1114,7 +1103,7 @@ impl AppShell {
         } else {
             self.show_toast(
                 if next {
-                    "已开启开机自启动：登录后只常驻托盘"
+                    "已开启开机自启动"
                 } else {
                     "已关闭开机自启动"
                 }
@@ -1214,7 +1203,7 @@ impl AppShell {
                 let text = if !model.is_empty() && !model.contains('/') {
                     format!("已保存；模型名通常写作 provider/model，当前是「{model}」")
                 } else {
-                    "外部 Agent 设置已保存".to_owned()
+                    "已保存".to_owned()
                 };
                 self.show_toast(text, ToastTone::Success, cx);
             }
@@ -1282,7 +1271,7 @@ impl AppShell {
             }
             JobEvent::Initialized => {
                 self.show_toast(
-                    "已创建默认配置（仅首次启动），可以直接开始记录".to_owned(),
+                    "已创建默认配置，可以直接开始记录".to_owned(),
                     ToastTone::Success,
                     cx,
                 );
@@ -1303,7 +1292,9 @@ impl AppShell {
             JobEvent::Brief(Ok(report)) => {
                 let now = chrono::Local::now();
                 let date = now.format("%Y-%m-%d").to_string();
-                let weekday = crate::app::weekday_label(now.weekday().num_days_from_monday());
+                // `weekday_label` uses 1..=7 (Monday..Sunday) to match the
+                // `decision_weekday` config, while chrono counts from 0.
+                let weekday = crate::app::weekday_label(now.weekday().num_days_from_monday() + 1);
                 let cli = crate::agent::cli_path();
                 let prompt = routine::daily_review_prompt(&date, weekday, &report, cli.as_deref());
                 self.begin_session(
@@ -1619,8 +1610,11 @@ impl AppShell {
         let Some(Dialog::Guardrail(form)) = self.dialog.as_ref() else {
             return;
         };
-        let (code, shares_text, price_text) =
-            (form.code.clone(), form.shares_text.clone(), form.price_text.clone());
+        let (code, shares_text, price_text) = (
+            form.code.clone(),
+            form.shares_text.clone(),
+            form.price_text.clone(),
+        );
         let code_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("资产代码，例如 007605")
@@ -2720,7 +2714,7 @@ impl AppShell {
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(TEXT_SECONDARY))
-                    .child("本地运行的投资决策与记账工具。只记录已成交的交易，不连接券商、不代为下单。"),
+                    .child("只记录已成交的交易，不连接券商、不代为下单。"),
             )
             .child(
                 div()
@@ -2729,19 +2723,15 @@ impl AppShell {
                     .child(format!("数据目录：{data_dir}")),
             )
             .child(
-                div()
-                    .h_flex()
-                    .justify_end()
-                    .pt(px(4.))
-                    .child(
-                        Button::new("about-close")
-                            .primary()
-                            .label("好")
-                            .on_click(cx.listener(|shell, _, _, cx| {
-                                shell.about_open = false;
-                                cx.notify();
-                            })),
-                    ),
+                div().h_flex().justify_end().pt(px(4.)).child(
+                    Button::new("about-close")
+                        .primary()
+                        .label("好")
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.about_open = false;
+                            cx.notify();
+                        })),
+                ),
             );
         Some(
             div()
@@ -2838,6 +2828,20 @@ fn dialog_shell(
     body: Vec<Div>,
     error: Option<String>,
 ) -> Div {
+    let mut heading = div().v_flex().gap(px(3.)).child(
+        div()
+            .text_size(px(18.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(title),
+    );
+    if !subtitle.is_empty() {
+        heading = heading.child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(subtitle),
+        );
+    }
     let mut card = div()
         .v_flex()
         .w(px(420.))
@@ -2848,23 +2852,7 @@ fn dialog_shell(
         .border_1()
         .border_color(rgb(BORDER))
         .shadow(shadow_overlay())
-        .child(
-            div()
-                .v_flex()
-                .gap(px(3.))
-                .child(
-                    div()
-                        .text_size(px(18.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child(subtitle),
-                ),
-        )
+        .child(heading)
         .children(body);
     if let Some(error) = error {
         card = card.child(
@@ -2884,7 +2872,7 @@ fn dialog_shell(
 fn trade_dialog(form: &TradeForm, _window: &mut Window, cx: &mut Context<AppShell>) -> Div {
     dialog_shell(
         form.side.label(),
-        "记录一笔已经成交的交易，现金与持仓会同步更新",
+        "现金与持仓将同步更新",
         vec![
             field("代码", Input::new(&form.code)),
             div()
@@ -2925,7 +2913,7 @@ fn guardrail_dialog(form: &GuardrailForm, _window: &mut Window, cx: &mut Context
     let v = &form.verdict;
     let mut reasons: Vec<String> = Vec::new();
     if v.out_of_plan {
-        reasons.push(format!("{} 不在本月计划内：定投与再平衡的条目里都没有它。", form.code));
+        reasons.push(format!("{} 不在本月计划内。", form.code));
     }
     if v.oversized && v.planned_amount > 0.0 {
         reasons.push(format!(
@@ -2943,27 +2931,22 @@ fn guardrail_dialog(form: &GuardrailForm, _window: &mut Window, cx: &mut Context
     let reason_label: &'static str = if v.reason_required() {
         "买入理由（必填，至少 6 个字）"
     } else {
-        "买入理由（选填，写了会记入流水供日后复盘）"
+        "买入理由（选填，记入流水）"
     };
 
     dialog_shell(
         "买入冷静期",
-        "不是拦截：写下理由照常记录，这里只是让你慢一步",
+        "写下理由后继续记录",
         vec![
-            div().v_flex().gap(px(6.)).children(reasons.into_iter().map(|line| {
-                div()
-                    .text_size(px(12.5))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(line)
-            })),
             div()
-                .px(px(10.))
-                .py(px(8.))
-                .rounded(px(RADIUS_SM))
-                .bg(rgb(WARNING_SOFT))
-                .text_size(px(12.))
-                .text_color(rgb(WARNING))
-                .child("本工具不替你决定是否买入，也不会阻断交易。"),
+                .v_flex()
+                .gap(px(6.))
+                .children(reasons.into_iter().map(|line| {
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(line)
+                })),
             field(reason_label, Input::new(&form.reason)),
         ],
         form.error.clone(),
@@ -2992,8 +2975,8 @@ fn guardrail_dialog(form: &GuardrailForm, _window: &mut Window, cx: &mut Context
 
 fn cash_dialog(form: &CashForm, _window: &mut Window, cx: &mut Context<AppShell>) -> Div {
     let (title, subtitle) = match form.kind {
-        CashKind::Deposit => ("入金", "外部资金进入账户，不计入收益，只抬高本金"),
-        CashKind::Withdraw => ("出金", "资金离开账户，XIRR 会把它当作已实现的回收"),
+        CashKind::Deposit => ("入金", "不计入收益，只抬高本金"),
+        CashKind::Withdraw => ("出金", "按回收计入 XIRR"),
     };
     dialog_shell(
         title,
@@ -3027,7 +3010,7 @@ fn cash_dialog(form: &CashForm, _window: &mut Window, cx: &mut Context<AppShell>
 fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShell>) -> Div {
     dialog_shell(
         "添加标的",
-        "先建标的，再用「记一笔」记录买入",
+        "",
         vec![
             field("代码", Input::new(&form.code)),
             field("名称", Input::new(&form.name)),

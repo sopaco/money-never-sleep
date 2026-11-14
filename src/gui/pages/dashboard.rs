@@ -5,22 +5,19 @@ use gpui_kit::base::StyledExt;
 use gpui_kit::*;
 
 use crate::app::{RebalanceView, Snapshot};
-use chrono::NaiveDate;
 use crate::gui::chart;
 use crate::gui::components::*;
 use crate::gui::mood::Mood;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, CashKind, Page, TradeSide};
+use chrono::NaiveDate;
 
-use super::{card_header, notice, page_lead, page_root, row};
+use super::{card_header, notice, page_root, row};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     // 720 首屏预算：首页比其它页更紧一档（顶部留白与卡片间距各收 3-6px），
     // 换来「资产曲线」标题能在四连指标卡下方露头，用户才知道下面还有内容。
-    let mut root = page_root("page-dashboard")
-        .pt(px(14.))
-        .gap(px(10.))
-        .child(page_lead(Page::Dashboard.subtitle()));
+    let mut root = page_root("page-dashboard").pt(px(14.)).gap(px(10.));
 
     match (&shell.data, &shell.load_error) {
         (Some(data), _) => {
@@ -39,7 +36,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         "金额加权收益 XIRR",
                         data.xirr.map(pct_signed).unwrap_or_else(|| "—".to_owned()),
                         Some((format!("追踪 {} 天", data.tracking_days), Tone::Muted)),
-                        Some("分批投入下比简单年化更可信".to_owned()),
+                        None,
                     ),
                     stat_tile(
                         IconName::TrendingDown,
@@ -52,7 +49,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         data.drawdown
                             .as_ref()
                             .map(|d| (d.recovery_note(), Tone::Muted)),
-                        Some("基于每日总资产快照".to_owned()),
+                        None,
                     ),
                     stat_tile(
                         IconName::Coins,
@@ -60,7 +57,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         "持仓浮动盈亏",
                         money_signed(data.holding_pnl()),
                         Some((format!("{} 个标的", data.positions.len()), Tone::Muted)),
-                        Some("按现价与成本价之差".to_owned()),
+                        None,
                     ),
                     stat_tile(
                         IconName::Gauge,
@@ -76,7 +73,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                                 Tone::Muted,
                             )
                         }),
-                        Some("用于决定目标仓位，不是买卖点".to_owned()),
+                        None,
                     ),
                 ]))
                 .child(curve_card(data))
@@ -221,15 +218,12 @@ fn hero(data: &Snapshot) -> Div {
 }
 
 fn curve_card(data: &Snapshot) -> Div {
-    let mut card = card_pad().child(card_header(
-        "资产曲线",
-        "每日快照；入金抬高曲线但不等于收益",
-    ));
+    let mut card = card_pad().child(card_header("资产曲线", "每日快照"));
     if data.series.len() < 2 {
         card = card.child(empty_state(
             IconName::ChartLine,
             "还画不出曲线",
-            "每天点一次「更新数据」，从第二个快照开始就能看到走势。",
+            "从第二个每日快照开始显示走势。",
         ));
     } else {
         let values: Vec<f64> = data.series.iter().map(|(_, value)| *value).collect();
@@ -270,7 +264,7 @@ fn allocation_card(data: &Snapshot) -> Div {
         return card.child(empty_state(
             IconName::Wallet,
             "还没有资产",
-            "先入金，再添加标的；这里会显示每条腿的偏离。",
+            "入金并添加标的后显示配置偏离。",
         ));
     }
     for category in &data.categories {
@@ -318,7 +312,7 @@ fn allocation_card(data: &Snapshot) -> Div {
                 ),
         );
     }
-    card.child(caption("偏离超过 5pp 的腿，在计划里会被优先补足。"))
+    card
 }
 
 /// F1 结论推导（纯函数，便于回归测试）。
@@ -381,7 +375,9 @@ fn weekly_conclusion(
             // 三条腿原因相同时去重（例如都没标的），避免同一句话抄三遍。
             let mut lines: Vec<String> = Vec::new();
             for leg in &rebal.legs {
-                let Some(reason) = &leg.hold_reason else { continue };
+                let Some(reason) = &leg.hold_reason else {
+                    continue;
+                };
                 if !lines.contains(reason) {
                     lines.push(reason.clone());
                 }
@@ -399,7 +395,10 @@ fn weekly_conclusion(
                     "今天不动，建池后下个决策日执行".to_owned(),
                 ]
             } else {
-                lines.iter().map(|line| crate::gui::hold_reason_text(line)).collect()
+                lines
+                    .iter()
+                    .map(|line| crate::gui::hold_reason_text(line))
+                    .collect()
             };
             ("本周不操作", Tone::Muted, lines)
         }
@@ -425,7 +424,11 @@ fn weekly_conclusion(
             .map(|leg| {
                 if leg.drift_pp.abs() > rebal.band_pp {
                     // 措辞与决策日分支一致：低配/超配，非专业用户不需要换算正负号。
-                    let direction = if leg.drift_pp < 0.0 { "低配" } else { "超配" };
+                    let direction = if leg.drift_pp < 0.0 {
+                        "低配"
+                    } else {
+                        "超配"
+                    };
                     format!(
                         "{}腿{} {:.1}pp，留到决策日再处理",
                         leg.category_cn,
@@ -455,12 +458,12 @@ fn conclusion_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
     let card = card_pad()
         .p(px(18.))
         .gap(px(12.))
-        .child(card_header("本周结论", "操作与否一次说清，情绪只是背景"));
+        .child(card_header("本周结论", ""));
     let Some(signal) = &data.signal else {
         return card.child(conclusion_empty(
             IconName::Gauge,
             "还没有情绪数据",
-            "点右上角「更新数据」抓取一次，这里就能给出本周的操作结论。",
+            "更新数据后生成本周结论。",
         ));
     };
     let conclusion = weekly_conclusion(
@@ -473,7 +476,7 @@ fn conclusion_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
         return card.child(conclusion_empty(
             IconName::Gauge,
             "还没有可执行的结论",
-            "情绪历史攒够区间确认后，这里会写明本周该不该动手。",
+            "情绪历史确认后生成。",
         ));
     };
 
@@ -501,7 +504,11 @@ fn conclusion_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
                                     .child(headline),
                             )
                             .child(pill(
-                                if signal.decision_day { "决策日" } else { "观察日" },
+                                if signal.decision_day {
+                                    "决策日"
+                                } else {
+                                    "观察日"
+                                },
                                 tone_color(Tone::Muted),
                                 tone_soft(Tone::Muted),
                             ))
@@ -527,20 +534,12 @@ fn conclusion_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
                                 "目标风险仓位 {}",
                                 pct_points(rebal_target_risk(data))
                             )))
-                            .child(
-                                Button::new("goto-plan")
-                                    .label("看本月计划")
-                                    .on_click(cx.listener(|shell, _, _, cx| {
-                                        shell.navigate(Page::Plan, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("goto-portfolio")
-                                    .label("看持仓")
-                                    .on_click(cx.listener(|shell, _, _, cx| {
-                                        shell.navigate(Page::Portfolio, cx)
-                                    })),
-                            ),
+                            .child(Button::new("goto-plan").label("看本月计划").on_click(
+                                cx.listener(|shell, _, _, cx| shell.navigate(Page::Plan, cx)),
+                            ))
+                            .child(Button::new("goto-portfolio").label("看持仓").on_click(
+                                cx.listener(|shell, _, _, cx| shell.navigate(Page::Portfolio, cx)),
+                            )),
                     ),
             )
             .child(
@@ -626,12 +625,12 @@ fn rebal_target_risk(data: &Snapshot) -> f64 {
 }
 
 fn activity_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
-    let mut card = card_pad().child(card_header("最近动作", "买卖与资金流水，最新在前"));
+    let mut card = card_pad().child(card_header("最近动作", "买卖与资金流水"));
     if data.trades.is_empty() && data.flows.is_empty() {
         card = card.child(empty_state(
             IconName::Receipt,
             "还没有记录",
-            "用「记一笔」登记入金或买卖，账户才开始积累可回溯的历史。",
+            "记一笔后开始积累历史。",
         ));
     }
 
@@ -718,7 +717,7 @@ fn activity_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
 /// "一页只有一条滚动条"的约定一致）。等宽字体是必须的：报告里的
 /// 分节线和对齐按固定宽度排版，比例字体会把它们排歪。
 fn report_card(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
-    let mut card = card_pad().child(card_header("最近报告", "每周决策的完整存档，只读"));
+    let mut card = card_pad().child(card_header("最近报告", "只读存档"));
     // 不用 and_then：闭包的匿名生命周期会把借用到闭包调用为止。
     let report = match shell.data.as_ref() {
         Some(data) => data.latest_report.as_ref(),
@@ -728,7 +727,7 @@ fn report_card(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
         return card.child(empty_state(
             IconName::CalendarCheck,
             "还没有报告",
-            "点右上角「更新数据」生成一次报告，这里就能随时回看全文。",
+            "更新数据后生成报告。",
         ));
     };
 
@@ -814,17 +813,16 @@ fn report_card(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
                 .children(text_rows),
         );
     } else {
-        card = card.child(
-            div()
-                .v_flex()
-                .mt(px(8.))
-                .children(text_rows)
-                .child(if lines.len() > 10 {
-                    div().text_size(px(12.)).text_color(rgb(TEXT_TERTIARY)).child("…")
-                } else {
-                    div()
-                }),
-        );
+        card = card.child(div().v_flex().mt(px(8.)).children(text_rows).child(
+            if lines.len() > 10 {
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_TERTIARY))
+                    .child("…")
+            } else {
+                div()
+            },
+        ));
     }
 
     card
@@ -858,34 +856,15 @@ fn start_card(cx: &mut Context<AppShell>) -> Div {
 
     card_pad()
         .gap(px(14.))
-        .child(
-            div()
-                .v_flex()
-                .gap(px(3.))
-                .child(section_title("三步开始"))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child("先把真实的钱和持仓记进来，再让它每天替你盯数据。"),
-                ),
-        )
+        .child(div().v_flex().gap(px(3.)).child(section_title("三步开始")))
         .child(
             div()
                 .h_flex()
                 .gap(px(20.))
                 .items_start()
-                .child(step(
-                    "01",
-                    "入金",
-                    "登记外部转进来的钱；这不是收益，只抬高本金。",
-                ))
-                .child(step(
-                    "02",
-                    "添加标的并买入",
-                    "先建标的，再按实际成交价记录份额。",
-                ))
-                .child(step("03", "更新数据", "抓价格与情绪，生成今天的目标仓位。")),
+                .child(step("01", "入金", "登记转入账户的资金。"))
+                .child(step("02", "添加标的并买入", "建标的后记录实际成交。"))
+                .child(step("03", "更新数据", "抓取价格与情绪。")),
         )
         .child(
             div()
@@ -981,11 +960,17 @@ mod tests {
         assert_eq!(headline, "本周操作");
         assert!(matches!(tone, Tone::Accent));
         assert!(
-            lines.iter().any(|l| l.contains("美股腿低配 6.2pp") && l.contains("补")),
+            lines
+                .iter()
+                .any(|l| l.contains("美股腿低配 6.2pp") && l.contains("补")),
             "{lines:?}"
         );
         // 带宽内的腿不进结论行
-        assert!(!lines.iter().any(|l| l.contains("A股") || l.contains("逆周期")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("A股") || l.contains("逆周期"))
+        );
     }
 
     #[test]
@@ -997,11 +982,15 @@ mod tests {
         let (headline, _, lines) = weekly_conclusion(true, Some(&rebal), None, 5).unwrap();
         assert_eq!(headline, "本周操作");
         assert!(
-            lines.iter().any(|l| l.contains("逆周期腿目标类别暂无可买标的")),
+            lines
+                .iter()
+                .any(|l| l.contains("逆周期腿目标类别暂无可买标的")),
             "缺标的的腿必须给出补齐指引: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("逆周期") && l.contains("建议补")),
+            !lines
+                .iter()
+                .any(|l| l.contains("逆周期") && l.contains("建议补")),
             "缺标的的腿不得报金额: {lines:?}"
         );
         // 三条腿里两条有金额、一条缺标的 → 三行封顶，卡高不变。
@@ -1020,7 +1009,10 @@ mod tests {
         assert_eq!(lines.len(), 2, "同一句原因不应抄三遍: {lines:?}");
         // 原因来自引擎常量（判等仍用它），动作句由 GUI 渲染层拼。
         assert!(lines[0].contains(crate::strategy::NO_INSTRUMENT_REASON));
-        assert!(lines[0].contains("去持仓页添加标的"), "应给出 GUI 的下一步: {lines:?}");
+        assert!(
+            lines[0].contains("去持仓页添加标的"),
+            "应给出 GUI 的下一步: {lines:?}"
+        );
         assert!(lines[1].contains("建池后下个决策日执行"));
         assert!(
             !lines.iter().any(|l| l.contains("建议补")),
@@ -1043,16 +1035,23 @@ mod tests {
     fn 非决策日永远先说不操作且金额不可执行() {
         let rebal = rebalance([-6.2, 0.5, 0.0], [1180.0, 0.0, 0.0], 4.0);
         let friday = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
-        let (headline, _, lines) =
-            weekly_conclusion(false, Some(&rebal), Some(friday), 5).unwrap();
+        let (headline, _, lines) = weekly_conclusion(false, Some(&rebal), Some(friday), 5).unwrap();
         assert_eq!(headline, "本周不操作");
         assert!(
-            !lines.iter().any(|l| l.contains("建议补") || l.contains("建议减")),
+            !lines
+                .iter()
+                .any(|l| l.contains("建议补") || l.contains("建议减")),
             "非决策日不得出现可执行金额建议: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("下次决策日 11-13") && l.contains("周五")));
         assert!(
-            lines.iter().any(|l| l.contains("美股腿低配 6.2pp") && l.contains("留到决策日再处理")),
+            lines
+                .iter()
+                .any(|l| l.contains("下次决策日 11-13") && l.contains("周五"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("美股腿低配 6.2pp") && l.contains("留到决策日再处理")),
             "超带偏离措辞须与决策日分支一致（低配/超配）: {lines:?}"
         );
     }

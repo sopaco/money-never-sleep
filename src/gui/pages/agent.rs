@@ -16,9 +16,9 @@ use crate::agent::{EntryKind, PermissionPolicy, RunState, TimelineEntry};
 use crate::gui::components::*;
 use crate::gui::conversations::{ConversationSummary, strip_decision_block};
 use crate::gui::theme::*;
-use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, Page, ViewedConversation};
+use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, ViewedConversation};
 
-use super::{card_header, notice, page_lead};
+use super::{card_header, notice};
 
 /// The assistant page is a fixed-height workspace, not a scrolling document:
 /// chrome on top, one scrollable conversation, composer pinned at the bottom.
@@ -94,7 +94,7 @@ fn header_bar(
         .items_center()
         .justify_between()
         .gap(px(12.))
-        .child(page_lead(Page::Agent.subtitle()))
+        .child(div().flex_1())
         .child(
             div()
                 .h_flex()
@@ -196,7 +196,7 @@ fn daily_bar(shell: &AppShell, cx: &mut Context<AppShell>, running: bool) -> Div
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(TEXT_TERTIARY))
-                            .child(format!("每天 {time} 自动取数并判断")),
+                            .child(format!("每天 {time}")),
                     ),
             )
             .child(
@@ -449,10 +449,7 @@ fn conversation_card(
     };
 
     let replay = shell.viewing_history.as_ref();
-    let subtitle: SharedString = match replay {
-        Some(view) => format!("历史回放 · {}", view.title).into(),
-        None => "结论在这里，执行细节在右侧抽屉".into(),
-    };
+    let subtitle = replay.map(|view| format!("历史回放 · {}", view.title));
     let right = if replay.is_some() {
         div()
             .h_flex()
@@ -494,14 +491,14 @@ fn conversation_card(
                 .items_baseline()
                 .gap(px(9.))
                 .child(section_title("对话"))
-                .child(
+                .children(subtitle.map(|subtitle| {
                     div()
                         .max_w(px(300.))
                         .overflow_hidden()
                         .text_size(px(12.))
                         .text_color(rgb(TEXT_TERTIARY))
-                        .child(subtitle),
-                ),
+                        .child(subtitle)
+                })),
         )
         .child(right);
 
@@ -593,7 +590,7 @@ fn empty_conversation() -> Stateful<Div> {
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_TERTIARY))
-                .child("点上方「立即巡检」，或在下面写一句话开始。"),
+                .child("点上方「立即巡检」，或直接提问。"),
         )
 }
 
@@ -715,17 +712,15 @@ fn trace_label(kind: EntryKind) -> &'static str {
 fn panel_layer(shell: &AppShell, cx: &mut Context<AppShell>) -> Option<Div> {
     let panel = shell.agent_panel?;
     let (title, hint) = match panel {
-        AgentPanel::Trace => (
-            "执行细节".to_owned(),
-            "工具调用、思考与系统消息，按时间顺序排列".to_owned(),
-        ),
-        AgentPanel::Settings => (
-            "高级设置".to_owned(),
-            "巡检时间、权限策略与外部 Agent".to_owned(),
-        ),
+        AgentPanel::Trace => ("执行细节".to_owned(), String::new()),
+        AgentPanel::Settings => ("高级设置".to_owned(), String::new()),
         AgentPanel::History => (
             "历史会话".to_owned(),
-            format!("共 {} 条 · 点击打开，可删除", shell.history.len()),
+            if shell.history.is_empty() {
+                String::new()
+            } else {
+                format!("共 {} 条", shell.history.len())
+            },
         ),
     };
     let body = match panel {
@@ -797,6 +792,20 @@ fn panel_header(
 ) -> Div {
     let title: SharedString = title.into();
     let hint: SharedString = hint.into();
+    let mut label = div().v_flex().gap(px(2.)).child(
+        div()
+            .text_size(px(15.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(title),
+    );
+    if !hint.is_empty() {
+        label = label.child(
+            div()
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT_TERTIARY))
+                .child(hint),
+        );
+    }
     div()
         .h_flex()
         .flex_none()
@@ -807,23 +816,7 @@ fn panel_header(
         .py(px(14.))
         .border_b_1()
         .border_color(rgb(DIVIDER))
-        .child(
-            div()
-                .v_flex()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(rgb(TEXT_TERTIARY))
-                        .child(hint),
-                ),
-        )
+        .child(label)
         .child(
             Button::new("agent-panel-close")
                 .compact()
@@ -857,20 +850,10 @@ fn trace_body(shell: &AppShell) -> Div {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT_TERTIARY))
-                    .child("开始一次巡检或提问后，工具调用、思考与系统消息会出现在这里。"),
+                    .child("巡检或提问后显示工具调用与系统消息。"),
             );
     }
-    div()
-        .v_flex()
-        .gap(px(2.))
-        .child(
-            div()
-                .pb(px(10.))
-                .text_size(px(11.5))
-                .text_color(rgb(TEXT_TERTIARY))
-                .child("仅用于核对，不影响对话。点击遮罩、关闭或按 Esc 收起。"),
-        )
-        .children(rows)
+    div().v_flex().gap(px(2.)).children(rows)
 }
 
 // ── Conversation archive drawer ───────────────────────────────────────
@@ -878,13 +861,7 @@ fn trace_body(shell: &AppShell) -> Div {
 /// Newest first, one row per run. Clicking a row replays it; the trash glyph
 /// asks for a second confirmation before its file is removed.
 fn history_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
-    let mut body = div().v_flex().gap(px(8.)).child(
-        div()
-            .pb(px(4.))
-            .text_size(px(11.5))
-            .text_color(rgb(TEXT_TERTIARY))
-            .child("每次巡检与提问都会自动归档。回放是只读快照，外部 Agent 的上下文不会恢复。"),
-    );
+    let mut body = div().v_flex().gap(px(8.));
     if let Some(error) = &shell.history_error {
         body = body.child(notice(error.clone(), (DANGER, DANGER_SOFT)));
     }
@@ -900,7 +877,7 @@ fn history_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
         return body.child(empty_state(
             IconName::Clock,
             "还没有历史会话",
-            "从现在起，开始一次巡检或提问后，记录会自动出现在这里。",
+            "巡检与提问会自动归档。",
         ));
     }
     let rows: Vec<Div> = shell
@@ -1076,14 +1053,6 @@ fn composer(shell: &AppShell, cx: &mut Context<AppShell>, running: bool) -> Div 
             .on_click(cx.listener(|shell, _, _, cx| shell.start_agent(cx)))
     };
 
-    let hint = if running {
-        "助手正在工作，完成后可以继续追问"
-    } else if open {
-        "接着问就行，助手会沿用刚才的数据与结论"
-    } else {
-        "写一句话开始；发送后会开启一个可以持续追问的会话"
-    };
-
     div()
         .v_flex()
         .flex_none()
@@ -1100,12 +1069,6 @@ fn composer(shell: &AppShell, cx: &mut Context<AppShell>, running: bool) -> Div 
                 .gap(px(9.))
                 .child(div().flex_1().min_w(px(0.)).child(input))
                 .child(action),
-        )
-        .child(
-            div()
-                .text_size(px(11.5))
-                .text_color(rgb(TEXT_TERTIARY))
-                .child(hint),
         )
 }
 
@@ -1144,7 +1107,7 @@ fn replay_composer(view: &ViewedConversation, cx: &mut Context<AppShell>) -> Div
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_TERTIARY))
-                                .child("这是只读归档，无法在旧会话里继续追问；返回当前对话即可接着问。"),
+                                .child("只读归档，无法继续追问。"),
                         ),
                 )
                 .child(
@@ -1165,7 +1128,7 @@ fn settings_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
     div()
         .v_flex()
         .gap(px(14.))
-        .child(card_header("巡检时间", "每天到点自动运行一次"))
+        .child(card_header("巡检时间", ""))
         .child(
             div()
                 .h_flex()
@@ -1180,10 +1143,7 @@ fn settings_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
                 ),
         )
         .child(divider())
-        .child(card_header(
-            "权限策略",
-            "默认「保护写入」，敏感操作会先问你",
-        ))
+        .child(card_header("权限策略", ""))
         .child(
             div().h_flex().gap(px(6.)).children(
                 PermissionPolicy::ALL
@@ -1192,10 +1152,7 @@ fn settings_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
             ),
         )
         .child(divider())
-        .child(card_header(
-            "外部 Agent",
-            "只填 CLI 路径；模型与凭据留在它自己的配置里",
-        ))
+        .child(card_header("外部 Agent", ""))
         .child(
             div()
                 .h_flex()
@@ -1231,7 +1188,7 @@ fn settings_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
             div()
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT_TERTIARY))
-                .child("MNS 会自动追加 acp 子命令，不需要填 URL 或 API Key。"),
+                .child("无需填写 URL 或 API Key。"),
         )
 }
 

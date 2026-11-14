@@ -5,15 +5,15 @@ use gpui_kit::base::StyledExt;
 use gpui_kit::*;
 
 use crate::app::Snapshot;
+use crate::gui::AppShell;
 use crate::gui::chart;
 use crate::gui::components::*;
 use crate::gui::theme::*;
-use crate::gui::{AppShell, Page};
 
-use super::{card_header, page_lead, page_root, row};
+use super::{card_header, page_root, row};
 
 pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
-    let mut root = page_root("page-performance").child(page_lead(Page::Performance.subtitle()));
+    let mut root = page_root("page-performance");
 
     let Some(data) = &shell.data else {
         return root
@@ -38,7 +38,7 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
                 "XIRR",
                 data.xirr.map(pct_signed).unwrap_or_else(|| "—".to_owned()),
                 Some((format!("追踪 {} 天", data.tracking_days), Tone::Muted)),
-                Some("现金流加权年化".to_owned()),
+                None,
             ),
             stat_tile(
                 IconName::PiggyBank,
@@ -46,7 +46,7 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
                 "累计净投入",
                 money(data.net_inflow),
                 Some((format!("{} 笔外部现金流", data.counts.flows), Tone::Muted)),
-                Some("买卖不算外部资金".to_owned()),
+                None,
             ),
             stat_tile(
                 IconName::Wallet,
@@ -64,7 +64,7 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
                     .map(|d| format!("-{:.1}%", d.max_dd * 100.0))
                     .unwrap_or_else(|| "—".to_owned()),
                 drawdown.map(|d| (d.recovery_note(), Tone::Muted)),
-                Some("每日快照口径".to_owned()),
+                None,
             ),
         ]))
         .child(discipline_card(data))
@@ -80,7 +80,7 @@ pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
                     card_pad()
                         .flex_1()
                         .gap(px(8.))
-                        .child(card_header("最大回撤的来路", "峰值到谷值，再看恢复"))
+                        .child(card_header("最大回撤的来路", ""))
                         .child(kv_row(
                             "峰值",
                             format!(
@@ -142,10 +142,7 @@ fn discipline_card(data: &Snapshot) -> Div {
     let accent = if over { WARNING } else { ACCENT };
 
     card_pad()
-        .child(card_header(
-            "纪律复盘",
-            "按交易流水的 note 前缀统计；不评价单笔对错",
-        ))
+        .child(card_header("纪律复盘", "按流水标记统计"))
         .child(
             div()
                 .v_flex()
@@ -169,7 +166,12 @@ fn discipline_card(data: &Snapshot) -> Div {
                                 .child(format!("{} 年操作次数", review.year)),
                         ),
                 )
-                .child(div().text_size(px(12.5)).text_color(rgb(TEXT_TERTIARY)).child(budget_line(review)))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(TEXT_TERTIARY))
+                        .child(budget_line(review)),
+                )
                 .child(hbar(track, accent, 8.))
                 .child(
                     div()
@@ -180,20 +182,15 @@ fn discipline_card(data: &Snapshot) -> Div {
                             "计划外冷静",
                             review.out_of_plan,
                             WARNING,
-                            "护栏判定不在计划内或金额异常",
+                            "计划外或金额异常",
                         ))
                         .child(bucket(
                             "过热冷静",
                             review.hot_calm,
                             ACCENT,
-                            "按计划买入，只是当时情绪过热",
+                            "情绪过热时买入",
                         ))
-                        .child(bucket(
-                            "未标记",
-                            review.unmarked,
-                            TEXT_TERTIARY,
-                            "没有护栏前缀，不推断是否计划内",
-                        )),
+                        .child(bucket("未标记", review.unmarked, TEXT_TERTIARY, "无标记")),
                 ),
         )
         .child(divider())
@@ -257,15 +254,12 @@ fn budget_line(review: &crate::discipline::YearReview) -> String {
 }
 
 fn curve_card(data: &Snapshot) -> Div {
-    let mut card = card_pad().child(card_header(
-        "总资产曲线",
-        "每点是一次「更新数据」；入金当日会跳升，不代表收益",
-    ));
+    let mut card = card_pad().child(card_header("总资产曲线", "每日快照"));
     if data.series.len() < 2 {
         return card.child(empty_state(
             IconName::ChartLine,
             "数据点不足",
-            "至少需要两个不同日期的快照才能看出走势与回撤。",
+            "至少需要两个每日快照。",
         ));
     }
     let values: Vec<f64> = data.series.iter().map(|(_, value)| *value).collect();
@@ -292,15 +286,12 @@ fn curve_card(data: &Snapshot) -> Div {
 }
 
 fn flows_card(data: &Snapshot) -> Div {
-    let card = card_pad().child(card_header(
-        "资金流水",
-        "只记外部进出：入金、出金、期初与校准",
-    ));
+    let card = card_pad().child(card_header("资金流水", "外部资金进出"));
     if data.flows.is_empty() {
         return card.child(empty_state(
             IconName::ArrowDownUp,
             "没有流水",
-            "入金或出金后，这里会形成可回溯的台账。",
+            "入金或出金后显示在这里。",
         ));
     }
     let rows: Vec<Div> = data
@@ -352,15 +343,12 @@ fn flows_card(data: &Snapshot) -> Div {
 }
 
 fn trades_card(data: &Snapshot) -> Div {
-    let card = card_pad().child(card_header(
-        "交易记录",
-        "买与卖是组合内部的现金转换，不进入收益口径",
-    ));
+    let card = card_pad().child(card_header("交易记录", ""));
     if data.trades.is_empty() {
         return card.child(empty_state(
             IconName::Receipt,
             "没有交易",
-            "记录第一笔买入后，这里会保留完整轨迹。",
+            "记录第一笔买入后显示在这里。",
         ));
     }
     let rows: Vec<Div> = data

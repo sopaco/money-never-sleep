@@ -29,33 +29,6 @@ pub(crate) fn page_root(id: &'static str) -> Stateful<Div> {
         .gap(px(14.))
 }
 
-/// The one-line reading guide that opens a page.
-///
-/// The page name lives in the window header, so repeating it here as a 26px
-/// title only ever read as an echo of itself. What the top of a page actually
-/// needs is the sentence that tells you what you are about to look at.
-pub(crate) fn page_lead(lead: &'static str) -> Div {
-    div()
-        .h_flex()
-        .flex_none()
-        .items_center()
-        .gap(px(9.))
-        .child(
-            div()
-                .w(px(2.))
-                .h(px(15.))
-                .flex_none()
-                .rounded(px(1.))
-                .bg(rgb(ACCENT).opacity(0.55)),
-        )
-        .child(
-            div()
-                .text_size(px(13.5))
-                .text_color(rgb(TEXT_SECONDARY))
-                .child(lead),
-        )
-}
-
 pub(crate) fn row(tiles: Vec<Div>) -> Div {
     div()
         .h_flex()
@@ -66,22 +39,25 @@ pub(crate) fn row(tiles: Vec<Div>) -> Div {
 }
 
 pub(crate) fn card_header(title: impl Into<SharedString>, hint: impl Into<SharedString>) -> Div {
-    div()
+    let hint: SharedString = hint.into();
+    let mut header = div()
         .h_flex()
         .items_baseline()
         .flex_none()
         .gap(px(9.))
-        .child(section_title(title))
-        .child(
+        .child(section_title(title));
+    if !hint.is_empty() {
+        header = header.child(
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(TEXT_TERTIARY))
-                .child(hint.into()),
-        )
-        // A rule running out of the header to the card edge. Without it the
-        // title floats in white space; with it the card reads as a printed
-        // page with a running head.
-        .child(div().flex_1().h(px(1.)).bg(rgb(DIVIDER)))
+                .child(hint),
+        );
+    }
+    // A rule running out of the header to the card edge. Without it the
+    // title floats in white space; with it the card reads as a printed
+    // page with a running head.
+    header.child(div().flex_1().h(px(1.)).bg(rgb(DIVIDER)))
 }
 
 pub(crate) fn notice(text: impl Into<SharedString>, tone: (u32, u32)) -> Div {

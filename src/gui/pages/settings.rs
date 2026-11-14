@@ -4,14 +4,14 @@ use gpui_kit::base::StyledExt;
 use gpui_kit::component::input::Input;
 use gpui_kit::*;
 
+use crate::gui::AppShell;
 use crate::gui::components::*;
 use crate::gui::theme::*;
-use crate::gui::{AppShell, Page};
 
-use super::{card_header, page_lead, page_root};
+use super::{card_header, page_root};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
-    let mut root = page_root("page-settings").child(page_lead(Page::Settings.subtitle()));
+    let mut root = page_root("page-settings");
 
     let Some(data) = &shell.data else {
         return root
@@ -88,10 +88,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     root = root.child(
         card_pad()
             .gap(px(12.))
-            .child(card_header(
-                "风险档位",
-                "抬高常驻仓位并收窄择时摆幅，不改变你配置的三条腿",
-            ))
+            .child(card_header("风险档位", ""))
             .child(
                 div()
                     .h_flex()
@@ -103,10 +100,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT_TERTIARY))
-                    .child(format!(
-                        "当前中性目标仓位 {:.0}%。档位越高，曲线越接近满仓，回撤也越大。",
-                        config.neutral_weight
-                    )),
+                    .child(format!("当前中性目标仓位 {:.0}%", config.neutral_weight)),
             ),
     );
 
@@ -144,7 +138,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 card_pad()
                     .flex_1()
                     .gap(px(10.))
-                    .child(card_header("每月定投", "只买不卖；未买完的钱留在现金里"))
+                    .child(card_header("每月定投", "只买不卖"))
                     .child(
                         div()
                             .h_flex()
@@ -177,10 +171,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 card_pad()
                     .flex_1()
                     .gap(px(10.))
-                    .child(card_header(
-                        "决策日",
-                        "非决策日只出观察报告，不产生买卖建议",
-                    ))
+                    .child(card_header("决策日", ""))
                     .child(div().v_flex().gap(px(6.)).children(weekday_rows))
                     .child(caption(format!("当前：{}", config.decision_label))),
             ),
@@ -190,10 +181,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     root = root.child(
         card_pad()
             .gap(px(10.))
-            .child(card_header(
-                "外部 Agent",
-                "只配置 CLI 路径与模型名；推理端点与凭据由 opencode 自己管理",
-            ))
+            .child(card_header("外部 Agent", ""))
             .child(
                 div()
                     .h_flex()
@@ -233,27 +221,24 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                     .child(Input::new(&shell.model)),
             )
             .child(caption(
-                "MNS 自动追加 `acp` 子命令。模型留空则沿用 opencode 自己配置的默认模型；\
-                 需要指定时按 provider/model 填写，例如 opencode/deepseek-v4.1-flash-free。\
-                 这里只保存名字、不内置清单——免费模型随时会变。",
+                "留空则使用 opencode 默认模型；按 provider/model 填写。",
             )),
     );
 
     // ── 启动与后台 ─────────────────────────────────────────────
     let launch = shell.agent_settings.launch_at_login;
-    let mut launch_toggle = Button::new("launch-at-login")
-        .compact()
-        .label(if launch { "已开启" } else { "已关闭" });
+    let mut launch_toggle = Button::new("launch-at-login").compact().label(if launch {
+        "已开启"
+    } else {
+        "已关闭"
+    });
     if launch {
         launch_toggle = launch_toggle.primary();
     }
     root = root.child(
         card_pad()
             .gap(px(8.))
-            .child(card_header(
-                "启动与后台",
-                "登录系统时静默启动，只常驻托盘，不打开窗口",
-            ))
+            .child(card_header("启动与后台", ""))
             .child(
                 div()
                     .h_flex()
@@ -271,32 +256,20 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                                     .text_size(px(13.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child("开机自启动"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(TEXT_TERTIARY))
-                                    .child("默认关闭，由你手动开启"),
                             ),
                     )
                     .child(launch_toggle.on_click(cx.listener(|shell, _, _, cx| {
                         shell.toggle_launch_at_login(cx);
                     }))),
             )
-            .child(caption(
-                "开启后：登录即启动并留在托盘，点托盘「打开 MNS」才出现窗口；\
-                 错过定时更新时会在启动后自动补一次。关闭后不会写入任何系统登录项。",
-            )),
+            .child(caption("登录后常驻托盘，不打开窗口。")),
     );
 
     // ── 数据与文件 ─────────────────────────────────────────────
     root = root.child(
         card_pad()
             .gap(px(6.))
-            .child(card_header(
-                "数据与文件",
-                "CLI 与桌面端共用同一份配置和数据库",
-            ))
+            .child(card_header("数据与文件", ""))
             .child(kv_row("配置文件", config.config_path.clone()))
             .child(kv_row("数据库", config.db_path.clone()))
             .child(kv_row("报告目录", config.report_dir.clone()))
@@ -321,10 +294,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT_TERTIARY))
-                    .child(format!(
-                        "数据新鲜度：{}。审计、历史回测等研究功能仍在 CLI，避免把桌面端做成研究终端。",
-                        data.freshness.summary()
-                    )),
+                    .child(format!("数据新鲜度：{}", data.freshness.summary())),
             ),
     );
 

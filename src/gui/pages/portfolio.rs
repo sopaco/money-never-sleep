@@ -7,12 +7,12 @@ use gpui_kit::*;
 use crate::app::Snapshot;
 use crate::gui::components::*;
 use crate::gui::theme::*;
-use crate::gui::{AppShell, CashKind, Page, TradeSide};
+use crate::gui::{AppShell, CashKind, TradeSide};
 
-use super::{card_header, page_lead, page_root, row};
+use super::{card_header, page_root, row};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
-    let mut root = page_root("page-portfolio").child(page_lead(Page::Portfolio.subtitle()));
+    let mut root = page_root("page-portfolio");
 
     match &shell.data {
         Some(data) => {
@@ -41,7 +41,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         ),
                         signed_tone(data.holding_pnl()),
                     )),
-                    Some("未计入申赎费用".to_owned()),
+                    None,
                 ),
                 stat_tile(
                     IconName::Wallet,
@@ -102,19 +102,18 @@ fn th_num(text: &'static str, width: f32) -> Div {
 }
 
 fn table_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
-    let card = card_pad()
-        .gap(px(0.))
-        .child(div().pb(px(10.)).child(card_header(
-            "全部持仓",
-            "现价缺失时按成本价估算市值，并在价格列标出",
-        )));
+    let card = card_pad().gap(px(0.)).child(
+        div()
+            .pb(px(10.))
+            .child(card_header("全部持仓", "缺价按成本估算")),
+    );
 
     if data.positions.is_empty() {
         return card
             .child(empty_state(
                 IconName::Briefcase,
                 "还没有持仓",
-                "先入金，再添加标的并记录第一笔买入。",
+                "入金、添加标的并记录买入。",
             ))
             .child(
                 div()
@@ -298,23 +297,13 @@ fn table_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
     card.child(header)
         .child(div().v_flex().children(rows))
         .child(
-            div()
-                .h_flex()
-                .justify_between()
-                .pt(px(12.))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(TEXT_TERTIARY))
-                        .child("权重 = 市值 / 总资产；年化在持仓不足门槛天数时留空。"),
-                )
-                .child(
-                    Button::new("portfolio-add")
-                        .label("添加标的")
-                        .on_click(cx.listener(|shell, _, window, cx| {
-                            shell.open_add_asset(window, cx);
-                        })),
-                ),
+            div().h_flex().justify_end().pt(px(12.)).child(
+                Button::new("portfolio-add")
+                    .label("添加标的")
+                    .on_click(cx.listener(|shell, _, window, cx| {
+                        shell.open_add_asset(window, cx);
+                    })),
+            ),
         )
 }
 

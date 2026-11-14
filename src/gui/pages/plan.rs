@@ -8,10 +8,10 @@ use crate::gui::components::*;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, Page};
 
-use super::{card_header, notice, page_lead, page_root};
+use super::{card_header, notice, page_root};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
-    let mut root = page_root("page-plan").child(page_lead(Page::Plan.subtitle()));
+    let mut root = page_root("page-plan");
 
     let Some(data) = &shell.data else {
         return root
@@ -46,21 +46,12 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                             .child(crate::gui::chart::gauge_aura(360., ACCENT, 0.22)),
                     )
                     .child(
-                        div()
-                            .v_flex()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .text_size(px(21.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("再补一步，计划就有数字了"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(TEXT_SECONDARY))
-                                    .child("计划由情绪分数与各腿的配置偏离共同生成，缺一个输入就不会出数。"),
-                            ),
+                        div().v_flex().gap(px(6.)).child(
+                            div()
+                                .text_size(px(21.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("还缺一步"),
+                        ),
                     )
                     .child(notice(
                         data.plan_blocked
@@ -91,23 +82,6 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                             )),
                     )
                     .child(divider())
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap(px(7.))
-                            .child(overline("生成后你会看到"))
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .items_center()
-                                    .gap(px(10.))
-                                    .child(caption("三条腿各买多少"))
-                                    .child(dot(0xc8cfdd))
-                                    .child(caption("预算用掉多少"))
-                                    .child(dot(0xc8cfdd))
-                                    .child(caption("每条腿为什么买或不买")),
-                            ),
-                    )
                     .child(
                         div()
                             .h_flex()
@@ -214,7 +188,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
 
     if plan.cash_constrained {
         root = root.child(notice(
-            "现金不足，买入金额已按比例缩减。先入金，或在设置里下调月投入。",
+            "现金不足，买入金额已按比例缩减。先入金，或下调月投入。",
             (WARNING, WARNING_SOFT),
         ));
     }
@@ -255,10 +229,7 @@ fn legs_card(data: &Snapshot) -> Div {
     };
     let mut card = card_pad()
         .gap(px(0.))
-        .child(div().pb(px(10.)).child(card_header(
-            "分腿分配",
-            "只买不卖；当前与偏离含本月新钱",
-        )));
+        .child(div().pb(px(10.)).child(card_header("分腿分配", "只买不卖")));
 
     let header = div()
         .h_flex()
@@ -384,18 +355,12 @@ fn explain_card(data: &Snapshot) -> Div {
     card_pad()
         .flex_1()
         .gap(px(8.))
-        .child(section_title("为什么是这个数"))
+        .child(section_title("计算依据"))
         .child(kv_row("决策分数", format!("{:.0}", plan.score)))
         .child(kv_row("目标风险仓位", pct_points(plan.target_risk_pct)))
         .child(kv_row("当前风险仓位", pct_points(plan.current_risk_pct)))
         .child(kv_row("需要补的仓位", pp_signed(gap)))
         .child(kv_row("再平衡带宽", format!("±{:.1}pp", plan.band_pp)))
-        .child(
-            div()
-                .text_size(px(11.5))
-                .text_color(rgb(TEXT_TERTIARY))
-                .child("分数只决定目标仓位；落在带宽内的腿不产生交易，避免碎单。"),
-        )
 }
 
 fn rules_card(data: &Snapshot) -> Div {
@@ -403,7 +368,7 @@ fn rules_card(data: &Snapshot) -> Div {
     card_pad()
         .flex_1()
         .gap(px(8.))
-        .child(section_title("这套规则的边界"))
+        .child(section_title("规则"))
         .child(kv_row("风险档位", config.profile_label.clone()))
         .child(kv_row("决策日", config.decision_label.clone()))
         .child(kv_row("单笔最小金额", money(config.min_trade_amount)))
@@ -411,12 +376,6 @@ fn rules_card(data: &Snapshot) -> Div {
             "卖出最短持有",
             format!("{} 天", config.min_holding_days_for_sell),
         ))
-        .child(
-            div()
-                .text_size(px(11.5))
-                .text_color(rgb(TEXT_TERTIARY))
-                .child("定投不产生超额收益，提升的是储蓄率与执行纪律。系统不会自动下单。"),
-        )
 }
 
 /// One row of the "finish setup" checklist: a numbered token, the promise, and
