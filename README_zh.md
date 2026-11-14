@@ -146,6 +146,14 @@ python3 .agents/skills/mns-backtest/data/guardrail_experiment.py
 
 要一个能双击安装的版本，执行 `./scripts/make-dmg.sh`，产物在 `target/dist/`（`.app` 与 `.dmg`）。签名、公证与分发边界见 [`docs/gui-release.md`](docs/gui-release.md)。
 
+Windows 下用 PowerShell 构建安装包（需先装 Inno Setup 6：`winget install -e --id JRSoftware.InnoSetup`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\make-installer.ps1
+```
+
+产物在 `target/dist/`：`MNS-<version>-win-x64-setup.exe` 与 `MNS-<version>-win-x64.zip`。安装包按用户安装到 `%LOCALAPPDATA%\Programs\MNS`，不弹 UAC，包含开始菜单快捷方式与可选桌面快捷方式；不修改系统 PATH。
+
 界面语言见 [`docs/gui-design.md`](docs/gui-design.md)：红绿只表示盈亏，情绪沿蓝↔琥珀轴影响背景与装饰；图标不再与文字并排，而是作为角落水印或按钮徽记。应用图标与托盘图标由 `swift scripts/make-icons.swift` 从 `assets/app_icon.png` 一次生成（`.icns` / `.ico` / PNG / 裸 RGBA）。
 
 当前验收状态：`cargo test` 116 passed / 0 failed / 3 ignored，`cargo check` 0 warning；三层数据集末日均 2026-11-06。

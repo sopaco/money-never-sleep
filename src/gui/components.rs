@@ -6,6 +6,8 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
+use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::Disableable;
 use gpui_kit::*;
 
 use super::theme::*;
@@ -348,5 +350,71 @@ pub fn mono_family() -> &'static str {
         "Menlo"
     } else {
         "DejaVu Sans Mono"
+    }
+}
+
+/// Every button in the app should read as clickable.
+///
+/// `gpui_component::button::Button` paints `cursor_default()` on its root, so a
+/// hand cursor set by a parent is overridden. Wrapping it and re-asserting
+/// `cursor_pointer()` on the button itself keeps the library's visuals, hover
+/// states, focus ring and keyboard activation while making the pointer explicit.
+#[derive(IntoElement)]
+pub struct Button {
+    inner: gpui_kit::component::button::Button,
+    disabled: bool,
+}
+
+impl Button {
+    pub fn new(id: impl Into<ElementId>) -> Self {
+        Self {
+            inner: gpui_kit::component::button::Button::new(id),
+            disabled: false,
+        }
+    }
+
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.inner = self.inner.label(label);
+        self
+    }
+
+    pub fn primary(mut self) -> Self {
+        self.inner = self.inner.primary();
+        self
+    }
+
+    pub fn outline(mut self) -> Self {
+        self.inner = self.inner.outline();
+        self
+    }
+
+    pub fn compact(mut self) -> Self {
+        self.inner = self.inner.compact();
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self.inner = Disableable::disabled(self.inner, disabled);
+        self
+    }
+
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.inner = self.inner.on_click(handler);
+        self
+    }
+}
+
+impl RenderOnce for Button {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        // 禁用态保持箭头，避免“看起来可点”的误导。
+        if self.disabled {
+            self.inner
+        } else {
+            self.inner.cursor_pointer()
+        }
     }
 }

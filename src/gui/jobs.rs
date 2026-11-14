@@ -13,6 +13,11 @@ use crate::gui::conversations::{self, ConversationRecord, ConversationSummary};
 pub enum Request {
     Load,
     Refresh,
+    /// 启动补更新：当天已过设定时间且今天还没有落过快照时，执行一次
+    /// `refresh_all`；否则什么都不做（判断放在 worker，避免 UI 线程读库）。
+    CatchUpRefresh {
+        target: String,
+    },
     SetProfile(String),
     SetMonthly(f64),
     SetWeekday(u32),
@@ -66,6 +71,8 @@ pub enum Request {
 
 pub enum Event {
     Loaded(Result<Snapshot, String>),
+    /// 首次启动补写了默认配置（仅一次）。
+    Initialized,
     Refreshed(Result<RefreshOutcome, String>),
     /// A write succeeded; the string is user-facing confirmation copy.
     Saved(String),
@@ -110,7 +117,21 @@ impl Jobs {
                 while let Some(request) = request_rx.blocking_recv() {
                     match request {
                         Request::Load => {
-                            let _ = event_tx.send(Event::Loaded(load()));
+                            // 新用户没有 `~/.mns/config.toml`：先按 `mns init`
+                            // 的默认结果补齐，避免首屏只显示一条“缺少配置”。
+                            match app::ensure_initialized() {
+                                Ok(initialized) => {
+                                    if initialized {
+                                        let _ = event_tx.send(Event::Initialized);
+                                    }
+                                    let _ = event_tx.send(Event::Loaded(load()));
+                                }
+                                Err(error) => {
+                                    let _ = event_tx.send(Event::Loaded(Err(format!(
+                                        "无法初始化本地数据：{error:#}"
+                                    ))));
+                                }
+                            }
                         }
                         Request::Refresh => {
                             let result = runtime
@@ -118,6 +139,21 @@ impl Jobs {
                                 .map_err(|error| format!("{error:#}"));
                             let _ = event_tx.send(Event::Refreshed(result));
                             let _ = event_tx.send(Event::Loaded(load()));
+                        }
+                        Request::CatchUpRefresh { target } => {
+                            let passed =
+                                chrono::Local::now().format("%H:%M").to_string().as_str()
+                                    >= target.as_str();
+                            // 读失败（例如还没有数据库）时保持沉默：宁可不补，
+                            // 也不在每次启动时重复一次无意义的网络请求。
+                            let updated = app::has_snapshot_today().unwrap_or(true);
+                            if passed && !updated {
+                                let result = runtime
+                                    .block_on(app::refresh_all())
+                                    .map_err(|error| format!("{error:#}"));
+                                let _ = event_tx.send(Event::Refreshed(result));
+                                let _ = event_tx.send(Event::Loaded(load()));
+                            }
                         }
                         Request::SetProfile(id) => finish(
                             &event_tx,
@@ -270,7 +306,7 @@ fn agent_brief(refresh: bool) -> Result<String, String> {
     };
     let data_dir = crate::config::app_data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
-    let output = std::process::Command::new(&cli)
+    let output = super::command(&cli)
         .args(args)
         // 显式指定，不依赖父进程 cwd：GUI 可能从 Finder 启动。
         .current_dir(&data_dir)

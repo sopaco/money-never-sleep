@@ -4,6 +4,7 @@
 //! comes from `crate::app`; every investment rule resolves to the same engine
 //! modules the CLI uses. Background work runs in `jobs` and in the ACP runtime.
 
+mod autostart;
 mod chart;
 mod components;
 pub(crate) mod conversations;
@@ -16,7 +17,6 @@ use chrono::Datelike;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::Disableable;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, TextareaState};
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
@@ -46,6 +46,24 @@ use components::*;
 use conversations::{ConversationMeta, ConversationRecord, ConversationSummary};
 use jobs::{Event as JobEvent, Jobs, Request};
 use theme::*;
+
+/// 构造 GUI 派生的子进程。
+///
+/// Release 版 GUI 是 windows 子系统程序，自身没有控制台；此时直接 spawn 一个
+/// 控制台程序（`reg.exe`、`mns.exe`），Windows 会为它新建一个终端窗口，命令
+/// 一结束窗口就消失——用户看到的就是「一闪而过的黑框」。统一从这里构造并
+/// 带上 `CREATE_NO_WINDOW`，子进程复用不存在的控制台而不是新建一个。
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 actions!(
     mns_gui,
@@ -424,6 +442,12 @@ pub(crate) struct ViewedConversation {
 
 struct GuiState {
     window: Option<AnyWindowHandle>,
+    /// Id of `window`, so the closed observer can ignore a window that is
+    /// being replaced (autostart creates a hidden one, then rebuilds it).
+    window_id: Option<WindowId>,
+    /// 启动时创建的是隐藏窗口（登录自启动只驻留托盘）。这类窗口没有跨平台
+    /// 的“显示”接口，用户点「打开 MNS」时按可见参数重建。
+    window_hidden: bool,
     view: Option<Entity<AppShell>>,
     tray: Option<Tray>,
     jobs: Option<Jobs>,
@@ -1074,6 +1098,60 @@ impl AppShell {
         self.persist_daily_setting(cx);
     }
 
+    /// 开机自启动开关：默认关闭。真正生效的是系统登录项，所以先写系统、
+    /// 成功后才落盘设置；任一步失败都回滚，避免界面与系统状态不一致。
+    pub(crate) fn toggle_launch_at_login(&mut self, cx: &mut Context<Self>) {
+        let next = !self.agent_settings.launch_at_login;
+        if let Err(error) = autostart::set_enabled(next) {
+            self.show_toast(format!("开机自启动设置失败：{error}"), ToastTone::Error, cx);
+            return;
+        }
+        self.agent_settings.launch_at_login = next;
+        if let Err(error) = save_settings(&self.agent_settings) {
+            let _ = autostart::set_enabled(!next);
+            self.agent_settings.launch_at_login = !next;
+            self.show_toast(error, ToastTone::Error, cx);
+        } else {
+            self.show_toast(
+                if next {
+                    "已开启开机自启动：登录后只常驻托盘"
+                } else {
+                    "已关闭开机自启动"
+                }
+                .to_owned(),
+                ToastTone::Success,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 启动补更新。定时任务只在进程存活期间触发；如果当天已过设定时间、
+    /// 且今天还没有任何更新，就趁启动补一次，避免开机较晚时一整天都停在
+    /// 昨天的价格。
+    fn startup_catch_up(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Local::now();
+        let target = self.agent_settings.daily_review_time.trim().to_owned();
+        if target.is_empty() || now.format("%H:%M").to_string().as_str() < target.as_str() {
+            return;
+        }
+        let today = now.format("%Y-%m-%d").to_string();
+        // 今天的巡检已经跑过：它内部执行 `mns today`，价格已是最新。
+        if self.last_daily.as_deref() == Some(today.as_str()) {
+            return;
+        }
+        if self.agent_settings.daily_review {
+            // 巡检链路会先更新价格再生成报告，这里直接补跑，不必等下一次
+            // 分钟轮询。
+            self.maybe_start_daily(cx);
+            return;
+        }
+        // 没有开启巡检时，只补价格与情绪数据（不生成报告、不调用 Agent）。
+        if let Err(error) = self.jobs.send(Request::CatchUpRefresh { target }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+    }
+
     pub(crate) fn save_daily_time(&mut self, cx: &mut Context<Self>) {
         let raw = self.daily_time.read(cx).value().trim().to_owned();
         if !valid_clock_time(&raw) {
@@ -1201,6 +1279,13 @@ impl AppShell {
             JobEvent::Saved(message) => {
                 self.show_toast(message, ToastTone::Success, cx);
                 self.dialog = None;
+            }
+            JobEvent::Initialized => {
+                self.show_toast(
+                    "已创建默认配置（仅首次启动），可以直接开始记录".to_owned(),
+                    ToastTone::Success,
+                    cx,
+                );
             }
             JobEvent::Failed(error) => {
                 if let Some(dialog) = self.dialog.as_mut() {
@@ -1587,6 +1672,17 @@ pub fn run() {
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::env::set_current_dir(&data_dir);
 
+    // 登录自启动带 `--tray`：只常驻托盘，不打开窗口。手动启动保持原行为。
+    let background = autostart::launched_in_background();
+
+    // 安装位置可能在升级后变化，启动时按当前 exe 路径刷新一次登录项；
+    // 关闭状态则不写入任何系统项。
+    if crate::agent::load_settings().launch_at_login
+        && let Err(error) = autostart::set_enabled(true)
+    {
+        eprintln!("[mns-gui] 无法同步开机自启动：{error}");
+    }
+
     let (agent, agent_events) = start_runtime();
     let (jobs, job_events) = Jobs::spawn();
     AGENT.with(|cell| *cell.borrow_mut() = Some(agent.clone()));
@@ -1599,6 +1695,8 @@ pub fn run() {
             theme::apply(cx);
             cx.set_global(GuiState {
                 window: None,
+                window_id: None,
+                window_hidden: background,
                 view: None,
                 tray: None,
                 jobs: Some(jobs.clone()),
@@ -1609,8 +1707,14 @@ pub fn run() {
             // Outside macOS the traffic lights and ctrl-w really destroy the
             // window; clear the handle so `ensure_window` can rebuild it from
             // the tray. macOS hides instead, so its handle stays valid.
-            cx.on_window_closed(|cx, _window_id| {
-                cx.global_mut::<GuiState>().window = None;
+            cx.on_window_closed(|cx, closed| {
+                let state = cx.global_mut::<GuiState>();
+                // Replacing the hidden startup window must not clobber the new
+                // visible one when the old window's close lands later.
+                if state.window_id == Some(closed) {
+                    state.window = None;
+                    state.window_id = None;
+                }
             })
             .detach();
 
@@ -1619,7 +1723,9 @@ pub fn run() {
             if let Err(error) = setup_tray(cx) {
                 eprintln!("[mns-gui] tray unavailable: {error}");
             }
-            if let Err(error) = open_main_window(cx, None) {
+            // 后台启动也创建窗口，只是不显示：定时巡检与托盘简报都依赖
+            // 窗口里的界面状态，隐藏窗口让它们保持可用，又不会弹到用户面前。
+            if let Err(error) = open_main_window(cx, None, !background) {
                 eprintln!("[mns-gui] failed to open window: {error}");
                 cx.quit();
                 return;
@@ -1834,11 +1940,28 @@ fn open_page(cx: &mut App, page: Page) {
 }
 
 fn ensure_window(cx: &mut App) {
-    if cx.global::<GuiState>().window.is_some() {
-        return;
+    if let Some(handle) = cx.global::<GuiState>().window.clone() {
+        if !cx.global::<GuiState>().window_hidden {
+            return;
+        }
+        // 登录自启动留下的隐藏窗口没有跨平台的“显示”接口：保留它的状态，
+        // 移除后按可见参数重建，用户点击「打开 MNS」即可看到窗口。
+        let snapshot = cx
+            .global::<GuiState>()
+            .view
+            .as_ref()
+            .map(|view| view.read(cx).agent_snapshot());
+        {
+            let state = cx.global_mut::<GuiState>();
+            state.snapshot = snapshot;
+            state.window = None;
+            state.window_id = None;
+            state.window_hidden = false;
+        }
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
     let snapshot = cx.global::<GuiState>().snapshot.clone();
-    if let Err(error) = open_main_window(cx, snapshot) {
+    if let Err(error) = open_main_window(cx, snapshot, true) {
         eprintln!("[mns-gui] failed to reopen window: {error}");
     }
 }
@@ -2218,7 +2341,7 @@ pub(crate) fn brand_mark(size: f32) -> impl IntoElement {
     img(Arc::new(image)).w(px(size)).h(px(size)).flex_none()
 }
 
-fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> {
+fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>, visible: bool) -> Result<()> {
     let jobs = cx
         .global::<GuiState>()
         .jobs
@@ -2230,6 +2353,9 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> 
             ..Default::default()
         }),
         window_bounds: Some(WindowBounds::centered(size(px(1180.), px(720.)), cx)),
+        // 登录自启动时窗口只作为界面状态的载体，不显示、不抢焦点。
+        focus: visible,
+        show: visible,
         ..Default::default()
     };
     let (window_handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
@@ -2246,6 +2372,7 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> 
             let state = cx.global_mut::<GuiState>();
             state.snapshot = snapshot;
             state.window = None;
+            state.window_id = None;
             true
         });
         let jobs_for_view = jobs.clone();
@@ -2256,11 +2383,14 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>) -> Result<()> 
             // index is a separate, small directory read on the same worker.
             shell.reload();
             shell.load_history(cx);
+            // 当天错过了定时更新且还没更新过时，启动即补一次。
+            shell.startup_catch_up(cx);
             shell
         })
     })?;
     let state = cx.global_mut::<GuiState>();
-    state.window = Some(window_handle);
+    state.window = Some(window_handle.clone());
+    state.window_id = Some(window_handle.window_id());
     state.view = Some(view);
     Ok(())
 }

@@ -93,6 +93,9 @@ pub struct AgentSettings {
     pub daily_review: bool,
     /// Local time of the daily review, `HH:MM`.
     pub daily_review_time: String,
+    /// 登录系统时静默启动（只常驻托盘）。默认关闭，由用户在设置里开启；
+    /// 系统侧登录项由 `gui::autostart` 写入/删除。
+    pub launch_at_login: bool,
 }
 
 impl Default for AgentSettings {
@@ -105,6 +108,7 @@ impl Default for AgentSettings {
             permission_policy: PermissionPolicy::Autonomous,
             daily_review: false,
             daily_review_time: "08:30".to_owned(),
+            launch_at_login: false,
         }
     }
 }

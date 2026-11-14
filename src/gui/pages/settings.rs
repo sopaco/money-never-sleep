@@ -1,7 +1,6 @@
 //! 设置：风险档位、定投金额、决策日与外部 Agent。
 
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::*;
 
@@ -240,6 +239,56 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
             )),
     );
 
+    // ── 启动与后台 ─────────────────────────────────────────────
+    let launch = shell.agent_settings.launch_at_login;
+    let mut launch_toggle = Button::new("launch-at-login")
+        .compact()
+        .label(if launch { "已开启" } else { "已关闭" });
+    if launch {
+        launch_toggle = launch_toggle.primary();
+    }
+    root = root.child(
+        card_pad()
+            .gap(px(8.))
+            .child(card_header(
+                "启动与后台",
+                "登录系统时静默启动，只常驻托盘，不打开窗口",
+            ))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .child(dot(if launch { SUCCESS } else { TEXT_TERTIARY }))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("开机自启动"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(TEXT_TERTIARY))
+                                    .child("默认关闭，由你手动开启"),
+                            ),
+                    )
+                    .child(launch_toggle.on_click(cx.listener(|shell, _, _, cx| {
+                        shell.toggle_launch_at_login(cx);
+                    }))),
+            )
+            .child(caption(
+                "开启后：登录即启动并留在托盘，点托盘「打开 MNS」才出现窗口；\
+                 错过定时更新时会在启动后自动补一次。关闭后不会写入任何系统登录项。",
+            )),
+    );
+
     // ── 数据与文件 ─────────────────────────────────────────────
     root = root.child(
         card_pad()
@@ -311,5 +360,5 @@ fn reveal_dir(path: &str) {
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(program).arg(path).spawn();
+    let _ = crate::gui::command(program).arg(path).spawn();
 }

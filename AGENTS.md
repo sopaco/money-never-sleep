@@ -44,6 +44,15 @@ mns backtest legacy   # 已降级，结论不可迁移到实盘
 使用 mns 辅助实盘决策前，先读 mns-advisor 的 `references/buy-sell-playbook.md` 与
 `references/evidence-boundary.md`：情绪信号已被证伪为择时依据，不得据新闻或 FGI 给出买卖点。
 
+### Package (Windows)
+```powershell
+# 需要 Inno Setup 6：winget install -e --id JRSoftware.InnoSetup
+powershell -ExecutionPolicy Bypass -File scripts\make-installer.ps1
+```
+产物在 `target/dist/`：`MNS-<version>-win-x64-setup.exe`（按用户安装，无 UAC）与便携
+ZIP。安装包把 `mns.exe` 放在 `mns-gui.exe` 同目录，不修改 PATH。
+加 `-SkipBuild` 复用已有 release 产物，`-PortableOnly` 只出 ZIP。
+
 ### Test a change
 ```bash
 cargo build --release

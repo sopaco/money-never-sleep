@@ -1,7 +1,6 @@
 //! 计划：本月该买什么、买多少，以及为什么某些腿不动作。
 
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::*;
 
 use crate::app::Snapshot;

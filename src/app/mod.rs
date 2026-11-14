@@ -389,6 +389,21 @@ impl Snapshot {
 
 // ───────────────────────────── Loading ─────────────────────────────
 
+/// 首次启动自愈初始化：结果与 `mns init` 的默认一致，但绝不删除已有数据
+/// （GUI 不该代替用户确认覆盖）。只在 `config.toml` 缺失时写默认配置与
+/// 报告目录；数据库缺失时 `Database::open` 会自动建表。返回是否初始化过。
+pub fn ensure_initialized() -> Result<bool> {
+    if AppConfig::config_path()?.exists() {
+        return Ok(false);
+    }
+    let mut config = AppConfig::default_config();
+    config.apply_profile(RiskProfile::Balanced);
+    config.save()?;
+    drop(Database::open()?);
+    std::fs::create_dir_all(config.report_dir())?;
+    Ok(true)
+}
+
 pub fn load_snapshot() -> Result<Snapshot> {
     let config = AppConfig::load()?;
     let db = Database::open()?;
