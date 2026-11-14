@@ -42,6 +42,12 @@ gui = ["agent", "dep:gpui-kit", "dep:gpui-tray"]
 # resolve against gpui-pre at all.
 gui-test = ["gui", "gpui-pre/test-support"]
 
+[target.'cfg(windows)'.build-dependencies]
+# 把 assets/app.ico 编成 exe 的 RT_GROUP_ICON #1 资源。GPUI 的 Windows 后端
+# 用 LoadImageW(GetModuleHandleW(None), MAKEINTRESOURCE(1)) 取标题栏/任务栏图标，
+# 没有资源时只能显示 Windows 默认图标（WindowOptions::icon 仅对 X11 生效）。
+winresource = "0.1"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

@@ -354,8 +354,12 @@ fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig
         args.push("acp".to_owned());
     }
 
-    let config = if base.chars().any(char::is_whitespace) {
-        // Tolerate a command string such as `npx opencode`.
+    // A command string such as `npx opencode` is split on whitespace, but a
+    // path may contain spaces too: `D:\Program Files (x86)\QuickBin\opencode.exe`
+    // split into `D:\Program` + `Files …` points at a file that does not exist,
+    // and the spawn fails with `os error 2` before any ACP traffic. Paths always
+    // contain a separator, so that is what tells the two cases apart.
+    let config = if base.chars().any(char::is_whitespace) && !base.contains(['/', '\\']) {
         let mut parts = base.split_whitespace();
         let command = parts.next().unwrap_or("opencode");
         AcpAgentConfig::new(command).args(parts).args(args)
@@ -1189,6 +1193,32 @@ mod tests {
     }
 
     #[test]
+    fn launch_config_keeps_a_path_with_spaces_intact() {
+        let settings = AgentSettings {
+            agent_cli: r"D:\Program Files (x86)\QuickBin\opencode.exe".to_owned(),
+            ..AgentSettings::default()
+        };
+        let config = launch_config(&settings, None);
+        assert_eq!(
+            config.command(),
+            std::path::Path::new(r"D:\Program Files (x86)\QuickBin\opencode.exe"),
+            "a Windows path with spaces is one executable, not a command string"
+        );
+        assert_eq!(config.arguments(), ["acp"]);
+
+        let mac = AgentSettings {
+            agent_cli: "/Applications/My Agents/opencode".to_owned(),
+            ..AgentSettings::default()
+        };
+        let config = launch_config(&mac, None);
+        assert_eq!(
+            config.command(),
+            std::path::Path::new("/Applications/My Agents/opencode")
+        );
+        assert_eq!(config.arguments(), ["acp"]);
+    }
+
+    #[test]
     fn launch_config_injects_the_cli_path_and_prepends_path() {
         let settings = AgentSettings {
             agent_cli: "opencode".to_owned(),
@@ -1205,8 +1235,9 @@ mod tests {
             .environment()
             .get("PATH")
             .expect("the agent must receive PATH");
+        let separator = if cfg!(windows) { ";" } else { ":" };
         assert!(
-            path.starts_with("/Applications/MNS.app/Contents/MacOS:"),
+            path.starts_with(&format!("/Applications/MNS.app/Contents/MacOS{separator}")),
             "the bundle directory must come first so a bare `mns` resolves to it, got {path}"
         );
     }
@@ -1260,10 +1291,11 @@ mod tests {
     #[test]
     fn agent_env_keeps_the_original_path_after_the_bundle() {
         let vars = agent_env(Path::new("/tmp/bin/mns"), "/usr/bin:/bin");
+        let separator = if cfg!(windows) { ";" } else { ":" };
         assert_eq!(vars[0].0, "MNS_BIN");
         assert_eq!(vars[0].1, "/tmp/bin/mns");
         assert_eq!(vars[1].0, "PATH");
-        assert_eq!(vars[1].1, "/tmp/bin:/usr/bin:/bin");
+        assert_eq!(vars[1].1, format!("/tmp/bin{separator}/usr/bin:/bin"));
 
         let empty = agent_env(Path::new("/tmp/bin/mns"), "");
         assert_eq!(empty[1].1, "/tmp/bin", "an empty PATH must not gain a separator");
