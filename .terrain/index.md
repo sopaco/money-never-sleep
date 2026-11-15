@@ -19,56 +19,84 @@ source: .
 
 ## Structure
 
-  - AGENTS.md
-  - assets/
-    - app.ico
-    - AppIcon.icns
-    - app_icon.png
-    - icon-128.png
-    - icon-512.png
-    - tray-22.rgba
-    - tray-32.rgba
-  - build.rs
-  - Cargo.lock
   - Cargo.toml
-  - CLAUDE.md
+  - LICENSE
   - distribution/
-    - bin-darwin-arm64/
+    - skill/
+    - bin-win-x64/
     - bin-linux-x64/
     - bin-mns-cli/
-    - bin-win-x64/
-    - skill/
+    - bin-darwin-arm64/
     - skills/
+  - Cargo.lock
+  - build.rs
+  - README.md
   - examples/
     - agent_smoke.rs
-  - LICENSE
-  - README.md
   - README_zh.md
   - scripts/
-    - installer/
-    - make-dmg.sh
-    - make-icons.swift
     - make-installer.ps1
+    - make-dmg.sh
+    - make-help-diagrams.sh
+    - make-icons.swift
+    - installer/
+  - AGENTS.md
+  - assets/
+    - tray-32.rgba
+    - app_icon.png
+    - tray-22.rgba
+    - AppIcon.icns
+    - app.ico
+    - icon-128.png
+    - icon-512.png
+  - CLAUDE.md
+  - help/
+    - cli-quickstart.md
+    - finance-concepts.md
+    - desktop-settings.md
+    - desktop-overview.md
+    - finance-intro.md
+    - desktop-portfolio.md
+    - images/
+    - strategy-rebalance.md
+    - finance-cash-deposit.md
+    - diagrams/
+    - finance-benchmarks.md
+    - cli-backtest.md
+    - finance-funds.md
+    - strategy-philosophy.md
+    - finance-bonds-wm.md
+    - strategy-sentiment.md
+    - finance-ladder.md
+    - desktop-plan.md
+    - finance-metrics.md
+    - desktop-agent.md
+    - cli-reference.md
+    - finance-guide.md
+    - start.md
+    - finance-insurance.md
+    - finance-mistakes.md
+    - finance-qdii.md
+    - finance-alternatives.md
   - src/
-    - agent/
+    - strategy.rs
+    - quote.rs
+    - market.rs
     - app/
-    - audit.rs
-    - backtest.rs
     - bin/
-    - cli.rs
+    - live_data.rs
+    - audit.rs
+    - signal.rs
     - config.rs
-    - db.rs
+    - lib.rs
+    - sentiment.rs
     - discipline.rs
+    - models.rs
+    - agent/
+    - db.rs
+    - metrics.rs
+    - report.rs
     - guardrail.rs
     - gui/
-    - lib.rs
-    - live_data.rs
-    - main.rs
-    - market.rs
-    - metrics.rs
-    - models.rs
-    - quote.rs
-    - report.rs
-    - sentiment.rs
-    - signal.rs
-    - strategy.rs
+    - backtest.rs
+  - …
