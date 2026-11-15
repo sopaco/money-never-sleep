@@ -15,7 +15,7 @@
 | 助手 | 外接 AI Agent 的对话界面 |
 | 设置 | 参数、主题、开机自启动 |
 
-![总览页截图](images/desktop-dashboard.png)
+![总览页：净值、资产曲线与今日结论都在首屏](images/desktop-dashboard.png)
 
 ## 总览页
 

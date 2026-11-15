@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="348" viewBox="0 0 792 348" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="348" fill="#ffffff"/>
+
+  <text x="24" y="32" font-size="11" fill="#8b94a6">溢价 = 场内价格 ÷ 基金净值 − 1：多付的钱不产生任何价值</text>
+
+  <!-- 左柱：净值 -->
+  <rect x="120" y="70" width="110" height="120" rx="4" fill="#1a5ce0"/>
+  <text x="175" y="84" font-size="10.5" fill="#cfdcf8" text-anchor="middle">1.000</text>
+  <text x="175" y="208" font-size="10.5" fill="#5b6577" text-anchor="middle">基金净值</text>
+
+  <!-- 右柱：场内价 -->
+  <rect x="260" y="48.4" width="110" height="21.6" rx="4" fill="#e8b64a"/>
+  <rect x="260" y="70" width="110" height="120" fill="#1a5ce0"/>
+  <text x="315" y="84" font-size="10.5" fill="#cfdcf8" text-anchor="middle">1.000</text>
+  <text x="315" y="63.5" font-size="8.5" fill="#7a4700" text-anchor="middle">0.180</text>
+  <text x="382" y="62" font-size="10.5" fill="#9a5b00">溢价 18%</text>
+  <text x="315" y="208" font-size="10.5" fill="#5b6577" text-anchor="middle">场内价格 1.180</text>
+
+  <line x1="100" y1="190" x2="410" y2="190" stroke="#c9d2e0"/>
+
+  <!-- 解释 -->
+  <text x="440" y="78" font-size="12.5" fill="#131a2a" font-weight="600">溢价从哪来：额度卡住了供给</text>
+  <text x="440" y="102" font-size="10.5" fill="#5b6577">场外申购一停，「净值申购 → 场内卖出」的套利</text>
+  <text x="440" y="118" font-size="10.5" fill="#5b6577">通道就失效了；买盘只能在场内互相抬价，溢价回不去。</text>
+  <text x="440" y="144" font-size="10.5" fill="#c42b1c">买入那一刻就承担了 18% 的回落风险：</text>
+  <text x="440" y="160" font-size="10.5" fill="#c42b1c">净值一动不动，溢价收敛到 0 也照样亏 18%。</text>
+
+  <line x1="24" y1="222" x2="768" y2="222" stroke="#edf1f7"/>
+
+  <!-- 溢价率纪律 -->
+  <text x="24" y="248" font-size="11.5" fill="#131a2a" font-weight="600">溢价率纪律</text>
+  <path d="M512.5 240 l-5 8 h10 z" fill="#c42b1c"/>
+  <text x="512.5" y="234" font-size="9.5" fill="#c42b1c" text-anchor="middle">当前：纳指 100 场内 13%~21%</text>
+
+  <rect x="90" y="256" width="97.5" height="44" fill="#dff6e4"/>
+  <rect x="187.5" y="256" width="65" height="44" fill="#fff3d6"/>
+  <rect x="252.5" y="256" width="162.5" height="44" fill="#fde7e9"/>
+  <rect x="415" y="256" width="325" height="44" fill="#f3c9c4"/>
+
+  <g text-anchor="middle">
+    <text x="138.8" y="274" font-size="10.5" fill="#0f7b3f" font-weight="600">＜3%</text>
+    <text x="138.8" y="291" font-size="9.5" fill="#0f7b3f">正常，可买入</text>
+
+    <text x="220" y="274" font-size="10.5" fill="#9a5b00" font-weight="600">3–5%</text>
+    <text x="220" y="291" font-size="9.5" fill="#9a5b00">警惕</text>
+
+    <text x="333.8" y="274" font-size="10.5" fill="#c42b1c" font-weight="600">5–10%</text>
+    <text x="333.8" y="291" font-size="9.5" fill="#c42b1c">安全边际受损，不建议买</text>
+
+    <text x="577.5" y="274" font-size="10.5" fill="#a8261a" font-weight="600">＞10%</text>
+    <text x="577.5" y="291" font-size="9.5" fill="#a8261a">情绪过热，坚决不追高</text>
+  </g>
+
+  <g font-size="9" fill="#b9c4d4" text-anchor="middle">
+    <text x="90" y="314">0</text>
+    <text x="187.5" y="314">3</text>
+    <text x="252.5" y="314">5</text>
+    <text x="415" y="314">10</text>
+    <text x="740" y="314">20%</text>
+  </g>
+
+  <text x="24" y="336" font-size="10" fill="#8b94a6">溢价率越高，越说明「想买的人远多于能买的额度」；这不是看涨信号，是流动性折价的反面。</text>
+</svg>

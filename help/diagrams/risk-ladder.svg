@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="534" viewBox="0 0 792 534" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="534" fill="#ffffff"/>
+
+  <g font-size="11" fill="#5b6577">
+    <text x="24" y="40">层级 · 品类</text>
+    <text x="198" y="40">典型最大回撤</text>
+    <text x="460" y="40">当前环境预期年化</text>
+  </g>
+  <text x="768" y="40" font-size="10" fill="#8b94a6" text-anchor="end">基准 2026-11</text>
+
+  <!-- L0 -->
+  <rect x="24" y="62" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="76" font-size="9.5" fill="#5b6577" text-anchor="middle">L0</text>
+  <text x="66" y="76" font-size="11.5" fill="#131a2a">货币基金 / 现金理财</text>
+  <text x="202" y="76" font-size="10" fill="#8b94a6">≈0</text>
+  <rect x="460" y="67" width="18" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="484" y="76" font-size="10" fill="#5b6577">1.1%</text>
+
+  <!-- L1 -->
+  <rect x="24" y="92" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="106" font-size="9.5" fill="#5b6577" text-anchor="middle">L1</text>
+  <text x="66" y="106" font-size="11.5" fill="#131a2a">定存 / 储蓄国债</text>
+  <text x="202" y="106" font-size="10" fill="#8b94a6">0（到期兑付）</text>
+  <rect x="460" y="97" width="24.5" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="490.5" y="106" font-size="10" fill="#5b6577">1.5%</text>
+
+  <!-- L2 -->
+  <rect x="24" y="122" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="136" font-size="9.5" fill="#5b6577" text-anchor="middle">L2</text>
+  <text x="66" y="136" font-size="11.5" fill="#131a2a">保险年金 / 增额寿</text>
+  <text x="202" y="136" font-size="10" fill="#8b94a6">退保亏本金</text>
+  <rect x="460" y="127" width="28.6" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="494.6" y="136" font-size="10" fill="#5b6577">1.75%</text>
+
+  <!-- L3 -->
+  <rect x="24" y="152" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="166" font-size="9.5" fill="#5b6577" text-anchor="middle">L3</text>
+  <text x="66" y="166" font-size="11.5" fill="#131a2a">纯债（短债 / 中长债）</text>
+  <rect x="198" y="157" width="10.3" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="214.3" y="166" font-size="10" fill="#c42b1c">−4.0%</text>
+  <rect x="460" y="157" width="32.7" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="498.7" y="166" font-size="10" fill="#5b6577">2.0%</text>
+
+  <!-- L4 -->
+  <rect x="24" y="182" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="196" font-size="9.5" fill="#5b6577" text-anchor="middle">L4</text>
+  <text x="66" y="196" font-size="11.5" fill="#131a2a">信用债 / 一级债基</text>
+  <rect x="198" y="187" width="16.8" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="220.8" y="196" font-size="10" fill="#c42b1c">−6.6%</text>
+  <rect x="460" y="187" width="40.9" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="506.9" y="196" font-size="10" fill="#5b6577">2.5%</text>
+
+  <!-- L5 -->
+  <rect x="24" y="212" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="226" font-size="9.5" fill="#5b6577" text-anchor="middle">L5</text>
+  <text x="66" y="226" font-size="11.5" fill="#131a2a">固收 +</text>
+  <rect x="198" y="217" width="56.6" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="260.6" y="226" font-size="10" fill="#c42b1c">−22%</text>
+  <rect x="460" y="217" width="65.4" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="531.4" y="226" font-size="10" fill="#5b6577">4.0%</text>
+
+  <!-- L6 -->
+  <rect x="24" y="242" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="256" font-size="9.5" fill="#5b6577" text-anchor="middle">L6</text>
+  <text x="66" y="256" font-size="11.5" fill="#131a2a">平衡混合</text>
+  <rect x="198" y="247" width="133.7" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="337.7" y="256" font-size="10" fill="#c42b1c">−52%</text>
+  <rect x="460" y="247" width="81.8" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="547.8" y="256" font-size="10" fill="#5b6577">5.0%</text>
+
+  <!-- L7 -->
+  <rect x="24" y="272" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="286" font-size="9.5" fill="#5b6577" text-anchor="middle">L7</text>
+  <text x="66" y="286" font-size="11.5" fill="#131a2a">偏股混合</text>
+  <rect x="198" y="277" width="146.6" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="350.6" y="286" font-size="10" fill="#c42b1c">−57%</text>
+  <rect x="460" y="277" width="106.3" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="572.3" y="286" font-size="10" fill="#5b6577">6.5%</text>
+
+  <!-- L8 -->
+  <rect x="24" y="302" width="34" height="20" rx="4" fill="#e8f0ff"/>
+  <text x="41" y="316" font-size="9.5" fill="#1a5ce0" text-anchor="middle">L8</text>
+  <text x="66" y="316" font-size="11.5" fill="#131a2a">红利低波</text>
+  <rect x="198" y="307" width="45.5" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="249.5" y="316" font-size="10" fill="#c42b1c">−17.7%</text>
+  <rect x="460" y="307" width="114.5" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="580.5" y="316" font-size="10" fill="#5b6577">7.0%</text>
+
+  <!-- L9 -->
+  <rect x="24" y="332" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="346" font-size="9.5" fill="#5b6577" text-anchor="middle">L9</text>
+  <text x="66" y="346" font-size="11.5" fill="#131a2a">宽基指数</text>
+  <rect x="198" y="337" width="118.3" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="322.3" y="346" font-size="10" fill="#c42b1c">−46%</text>
+  <rect x="460" y="337" width="90" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="556" y="346" font-size="10" fill="#5b6577">5.5%</text>
+
+  <!-- L10 -->
+  <rect x="24" y="362" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="376" font-size="9.5" fill="#5b6577" text-anchor="middle">L10</text>
+  <text x="66" y="376" font-size="11.5" fill="#131a2a">跨境 QDII</text>
+  <rect x="198" y="367" width="92.6" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="296.6" y="376" font-size="10" fill="#c42b1c">−36%</text>
+  <rect x="460" y="367" width="139.1" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="605.1" y="376" font-size="10" fill="#5b6577">8.5%</text>
+
+  <!-- L11 -->
+  <rect x="24" y="392" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="406" font-size="9.5" fill="#5b6577" text-anchor="middle">L11</text>
+  <text x="66" y="406" font-size="11.5" fill="#131a2a">黄金 / 商品</text>
+  <rect x="198" y="397" width="77.1" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="281.1" y="406" font-size="10" fill="#c42b1c">−30%</text>
+  <text x="460" y="406" font-size="10" fill="#8b94a6">不确定</text>
+
+  <!-- L12 -->
+  <rect x="24" y="422" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="436" font-size="9.5" fill="#5b6577" text-anchor="middle">L12</text>
+  <text x="66" y="436" font-size="11.5" fill="#131a2a">公募 REITs</text>
+  <rect x="198" y="427" width="102.8" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="306.8" y="436" font-size="10" fill="#c42b1c">−40%</text>
+  <rect x="460" y="427" width="81.8" height="10" rx="2" fill="#1a5ce0"/>
+  <text x="547.8" y="436" font-size="10" fill="#5b6577">5.0%</text>
+
+  <!-- L13 -->
+  <rect x="24" y="452" width="34" height="20" rx="4" fill="#f0f3f8"/>
+  <text x="41" y="466" font-size="9.5" fill="#5b6577" text-anchor="middle">L13</text>
+  <text x="66" y="466" font-size="11.5" fill="#131a2a">主题 / 行业</text>
+  <rect x="198" y="457" width="180" height="10" rx="2" fill="#c42b1c" fill-opacity="0.85"/>
+  <text x="384" y="466" font-size="10" fill="#c42b1c">−70%</text>
+  <text x="460" y="466" font-size="10" fill="#8b94a6">不确定</text>
+
+  <text x="24" y="500" font-size="10" fill="#8b94a6">回撤取各品类常见区间的最深一档；年化取当前环境预期区间的中值（按 10 年期国债 1.58% 重估）。</text>
+  <text x="24" y="516" font-size="10" fill="#8b94a6">两列刻度不同（收益 1% ≈ 16px，回撤 1% ≈ 2.6px），不要跨列比长短；红利低波是股票，回撤小于混合基金不代表更安全。</text>
+</svg>

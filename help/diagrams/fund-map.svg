@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="372" viewBox="0 0 792 372" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="372" fill="#ffffff"/>
+
+  <text x="24" y="34" font-size="11" fill="#8b94a6">决定风险的不是名字，是股票仓位的上下限</text>
+
+  <!-- 纯债 -->
+  <text x="136" y="76" font-size="11.5" fill="#131a2a" text-anchor="end">纯债 / 短债</text>
+  <rect x="150" y="65" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <circle cx="150" cy="71" r="4.5" fill="#1a5ce0"/>
+  <text x="162" y="76" font-size="10" fill="#5b6577">0%</text>
+
+  <!-- 一级债基 -->
+  <text x="136" y="106" font-size="11.5" fill="#131a2a" text-anchor="end">一级债基</text>
+  <rect x="150" y="95" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <rect x="150" y="95" width="116" height="12" rx="3" fill="#1a5ce0"/>
+  <text x="274" y="106" font-size="10" fill="#5b6577">0–20%</text>
+
+  <!-- 偏债混合 -->
+  <text x="136" y="136" font-size="11.5" fill="#131a2a" text-anchor="end">偏债混合</text>
+  <rect x="150" y="125" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <rect x="150" y="125" width="232" height="12" rx="3" fill="#1a5ce0"/>
+  <text x="390" y="136" font-size="10" fill="#5b6577">0–40%，多数合同写 ≤30%</text>
+
+  <!-- 平衡混合 -->
+  <text x="136" y="166" font-size="11.5" fill="#131a2a" text-anchor="end">平衡混合</text>
+  <rect x="150" y="155" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <rect x="382" y="155" width="116" height="12" rx="3" fill="#1a5ce0"/>
+  <text x="506" y="166" font-size="10" fill="#5b6577">40–60%</text>
+
+  <!-- 偏股混合 -->
+  <text x="136" y="196" font-size="11.5" fill="#131a2a" text-anchor="end">偏股混合</text>
+  <rect x="150" y="185" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <rect x="498" y="185" width="203" height="12" rx="3" fill="#1a5ce0"/>
+  <text x="709" y="196" font-size="10" fill="#5b6577">60–95%</text>
+
+  <!-- 股票指数 -->
+  <text x="136" y="226" font-size="11.5" fill="#131a2a" text-anchor="end">股票指数</text>
+  <rect x="150" y="215" width="580" height="12" rx="3" fill="#f0f3f8"/>
+  <rect x="701" y="215" width="29" height="12" rx="3" fill="#1a5ce0"/>
+  <text x="693" y="226" font-size="10" fill="#5b6577" text-anchor="end">95–100%</text>
+
+  <!-- 坐标轴 -->
+  <line x1="150" y1="248" x2="730" y2="248" stroke="#c9d2e0"/>
+  <g font-size="9" fill="#8b94a6" text-anchor="middle">
+    <text x="150" y="264">0</text>
+    <text x="266" y="264">20</text>
+    <text x="382" y="264">40</text>
+    <text x="498" y="264">60</text>
+    <text x="614" y="264">80</text>
+    <text x="730" y="264">100%</text>
+  </g>
+  <text x="24" y="264" font-size="10" fill="#8b94a6">股票仓位</text>
+
+  <!-- 灵活配置 -->
+  <text x="136" y="308" font-size="11.5" fill="#9a5b00" text-anchor="end">灵活配置</text>
+  <rect x="150" y="297" width="551" height="12" rx="3" fill="#fdefd0" stroke="#e0bd75" stroke-dasharray="3 3"/>
+  <text x="709" y="308" font-size="10" fill="#9a5b00">0–95%</text>
+  <text x="150" y="330" font-size="10" fill="#9a5b00">合同允许 0–95%：既可以空仓，也可以接近满仓，标签本身不说明当下的风险</text>
+
+  <text x="24" y="356" font-size="10" fill="#8b94a6">按招募说明书／基金合同的股票仓位上下限归类；指数基金实际仓位长期贴近上限。</text>
+</svg>

@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="320" viewBox="0 0 792 320" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="320" fill="#ffffff"/>
+
+  <text x="24" y="32" font-size="11" fill="#8b94a6">从原始分数到一条建议，中间有三次过滤</text>
+
+  <!-- 四个环节 -->
+  <g>
+    <rect x="24" y="56" width="160" height="92" rx="8" fill="#f7f9fc" stroke="#e4e9f2"/>
+    <text x="40" y="82" font-size="11" fill="#1a5ce0" font-weight="600">1</text>
+    <text x="40" y="105" font-size="13" fill="#131a2a" font-weight="600">情绪分数</text>
+    <text x="40" y="126" font-size="10.5" fill="#5b6577">CNN 恐惧贪婪 0–100</text>
+
+    <rect x="214" y="56" width="160" height="92" rx="8" fill="#f7f9fc" stroke="#e4e9f2"/>
+    <text x="230" y="82" font-size="11" fill="#1a5ce0" font-weight="600">2</text>
+    <text x="230" y="105" font-size="13" fill="#131a2a" font-weight="600">7 日平滑</text>
+    <text x="230" y="126" font-size="10.5" fill="#5b6577">削掉单日毛刺</text>
+
+    <rect x="404" y="56" width="160" height="92" rx="8" fill="#f7f9fc" stroke="#e4e9f2"/>
+    <text x="420" y="82" font-size="11" fill="#1a5ce0" font-weight="600">3</text>
+    <text x="420" y="105" font-size="13" fill="#131a2a" font-weight="600">连续 3 日确认</text>
+    <text x="420" y="126" font-size="10.5" fill="#5b6577">新档位要站稳才算</text>
+
+    <rect x="594" y="56" width="160" height="92" rx="8" fill="#e8f0ff" stroke="#b9cff7"/>
+    <text x="610" y="82" font-size="11" fill="#1a5ce0" font-weight="600">4</text>
+    <text x="610" y="105" font-size="13" fill="#131a2a" font-weight="600">决策日判定</text>
+    <text x="610" y="126" font-size="10.5" fill="#5b6577">默认周五出完整建议</text>
+  </g>
+
+  <!-- 箭头 -->
+  <g stroke="#b9c4d4" stroke-width="1.4" fill="none">
+    <line x1="188" y1="102" x2="208" y2="102"/>
+    <line x1="378" y1="102" x2="398" y2="102"/>
+    <line x1="568" y1="102" x2="588" y2="102"/>
+  </g>
+  <g fill="#b9c4d4">
+    <path d="M208 102 l-6 -3.4 v6.8 z"/>
+    <path d="M398 102 l-6 -3.4 v6.8 z"/>
+    <path d="M588 102 l-6 -3.4 v6.8 z"/>
+  </g>
+
+  <!-- 一周节奏 -->
+  <text x="24" y="186" font-size="11" fill="#8b94a6">但完整建议只在决策日输出，其余日期是观察版</text>
+  <g font-size="11" text-anchor="middle">
+    <rect x="24" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="72" y="223" fill="#5b6577">周一</text>
+    <text x="72" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+
+    <rect x="132" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="180" y="223" fill="#5b6577">周二</text>
+    <text x="180" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+
+    <rect x="240" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="288" y="223" fill="#5b6577">周三</text>
+    <text x="288" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+
+    <rect x="348" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="396" y="223" fill="#5b6577">周四</text>
+    <text x="396" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+
+    <rect x="456" y="200" width="96" height="52" rx="6" fill="#1a5ce0"/>
+    <text x="504" y="223" fill="#ffffff" font-weight="600">周五</text>
+    <text x="504" y="240" font-size="9.5" fill="#cfdcf8">完整建议</text>
+
+    <rect x="564" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="612" y="223" fill="#5b6577">周六</text>
+    <text x="612" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+
+    <rect x="672" y="200" width="96" height="52" rx="6" fill="#f7f9fc" stroke="#edf1f7"/>
+    <text x="720" y="223" fill="#5b6577">周日</text>
+    <text x="720" y="240" font-size="9.5" fill="#8b94a6">观察版</text>
+  </g>
+
+  <text x="24" y="284" font-size="10" fill="#8b94a6">观察版报告只说「今天不用动手」，它的档位行会同时印出中性档与今日档两个目标</text>
+  <text x="24" y="300" font-size="10" fill="#8b94a6">需要非决策日的完整建议：mns report --decide；决策日可通过 rebalance.decision_weekday 修改</text>
+</svg>

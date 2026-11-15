@@ -533,3 +533,39 @@ fn render_spans(spans: &[Span]) -> StyledText {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每张帮助图片都要能被 `image_aspect` 读出宽高比。
+    ///
+    /// 解析失败时 `render_image` 只给宽度、不给高度，元素会按图片固有高度
+    /// 撑开，画面上表现为图片上方一大片空白——肉眼很难归因到 PNG 头。
+    /// 帮助图片约定是 2 倍图，所以宽高比必然大于 1。
+    #[test]
+    fn every_help_image_yields_an_aspect_ratio() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("help")
+            .join("images");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("help/images 不存在") {
+            let path = entry.expect("读取 help/images 失败").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("读取帮助图片失败");
+            let aspect = image_aspect(&bytes)
+                .unwrap_or_else(|| panic!("{} 的 PNG 头解析不出宽高比", path.display()));
+            assert!(
+                aspect > 1.,
+                "{} 宽高比 {aspect:.3} 不像是横向截图或 2 倍图",
+                path.display()
+            );
+            checked += 1;
+        }
+
+        assert!(checked > 0, "help/images 里没有 PNG，检查图片是否被误删");
+    }
+}

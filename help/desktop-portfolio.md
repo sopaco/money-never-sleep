@@ -8,7 +8,7 @@
 - 市值、浮动盈亏、年化收益；
 - 当前仓位与目标仓位的偏离。
 
-![持仓页截图](images/desktop-portfolio.png)
+![持仓页：每只标的的成本、盈亏与仓位偏离同屏对照](images/desktop-portfolio.png)
 
 ## 本地账本：先成交，后登记
 

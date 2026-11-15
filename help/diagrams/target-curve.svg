@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="420" viewBox="0 0 792 420" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="420" fill="#ffffff"/>
+
+  <!-- 图例 -->
+  <line x1="64" y1="52" x2="96" y2="52" stroke="#8b94a6" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="104" y="56" font-size="11.5" fill="#5b6577">无档位（曲线原样）35%–85%</text>
+  <line x1="304" y1="52" x2="336" y2="52" stroke="#1a5ce0" stroke-width="2.2"/>
+  <text x="344" y="56" font-size="11.5" fill="#1a5ce0" font-weight="600">平衡档（init 默认）74%–94%</text>
+  <text x="744" y="56" font-size="10.5" fill="#8b94a6" text-anchor="end">纵轴：风险资产占总资产 %</text>
+
+  <!-- 纵向网格与刻度 -->
+  <g stroke="#edf1f7" stroke-width="1">
+    <line x1="64" y1="70" x2="744" y2="70"/>
+    <line x1="64" y1="144.3" x2="744" y2="144.3"/>
+    <line x1="64" y1="218.6" x2="744" y2="218.6"/>
+    <line x1="64" y1="292.9" x2="744" y2="292.9"/>
+  </g>
+  <g font-size="10" fill="#8b94a6" text-anchor="end">
+    <text x="54" y="73.5">100</text>
+    <text x="54" y="147.8">80</text>
+    <text x="54" y="222.1">60</text>
+    <text x="54" y="296.4">40</text>
+  </g>
+
+  <!-- 情绪区间分隔 -->
+  <g stroke="#e4e9f2" stroke-width="1" stroke-dasharray="3 4">
+    <line x1="268" y1="70" x2="268" y2="330"/>
+    <line x1="370" y1="70" x2="370" y2="330"/>
+    <line x1="438" y1="70" x2="438" y2="330"/>
+    <line x1="540" y1="70" x2="540" y2="330"/>
+  </g>
+
+  <!-- 档位带来的常驻增量 -->
+  <path d="M64 92.3 H268 V107.2 H370 V129.4 H438 V151.7 H540 V166.6 H744 V311.4 H540 V274.3 H438 V218.6 H370 V162.9 H268 V125.7 Z" fill="#1a5ce0" fill-opacity="0.055"/>
+
+  <!-- 无档位曲线 -->
+  <path d="M64 125.7 H268 V162.9 H370 V218.6 H438 V274.3 H540 V311.4 H744" fill="none" stroke="#8b94a6" stroke-width="1.6" stroke-dasharray="5 4"/>
+
+  <!-- 稳健档曲线 -->
+  <path d="M64 92.3 H268 V107.2 H370 V129.4 H438 V151.7 H540 V166.6 H744" fill="none" stroke="#1a5ce0" stroke-width="2.4" stroke-linejoin="round"/>
+
+  <!-- 右端取值 -->
+  <text x="750" y="170.5" font-size="10.5" fill="#1a5ce0" font-weight="600">74%</text>
+  <text x="750" y="315.5" font-size="10.5" fill="#8b94a6">35%</text>
+
+  <!-- 坐标轴 -->
+  <line x1="64" y1="330" x2="744" y2="330" stroke="#c9d2e0" stroke-width="1"/>
+  <line x1="64" y1="70" x2="64" y2="330" stroke="#c9d2e0" stroke-width="1"/>
+
+  <!-- 说明 -->
+  <text x="76" y="243" font-size="10.5" fill="#5b6577">同一情绪分数下：档位越高，常驻仓位越高</text>
+  <text x="76" y="259" font-size="10.5" fill="#5b6577">台阶越平，择时摆幅越小（50pp → 20pp）</text>
+
+  <!-- 横轴刻度 -->
+  <g font-size="9.5" fill="#8b94a6" text-anchor="middle">
+    <text x="64" y="346">0</text>
+    <text x="268" y="346">30</text>
+    <text x="370" y="346">45</text>
+    <text x="438" y="346">55</text>
+    <text x="540" y="346">70</text>
+    <text x="744" y="346">100</text>
+  </g>
+
+  <!-- 区间名 -->
+  <g font-size="10.5" fill="#5b6577" text-anchor="middle">
+    <text x="166" y="368">极度恐慌</text>
+    <text x="319" y="368">恐慌</text>
+    <text x="404" y="368">中性</text>
+    <text x="489" y="368">贪婪</text>
+    <text x="642" y="368">极度贪婪</text>
+  </g>
+
+  <text x="64" y="392" font-size="10" fill="#8b94a6">情绪分数：CNN 恐惧贪婪指数（0–100），切分点为默认阈值</text>
+  <text x="64" y="408" font-size="10" fill="#8b94a6">档位做的事：把整条曲线向满仓收缩（目标 = core_blend × 100 + 其余 × 原曲线）。四档区间见正文表格</text>
+</svg>

@@ -819,4 +819,53 @@ mod tests {
             "窄窗口的列宽 {narrow_column}px 应小于宽窗口"
         );
     }
+
+    /// 帮助里引用的每张图都要真实存在，图注也要能读。
+    ///
+    /// 图片在运行时从磁盘加载，缺文件不会编译失败，界面只会退化成
+    /// 「截图待补充」占位——只有测试能兜住这种静默失败。图注会成为图片
+    /// 下方那行「图：…」，所以它也按句子来要求，不接受 `xx.png` 这类写法。
+    #[test]
+    fn every_help_image_exists_and_has_a_readable_caption() {
+        use markdown::Block;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("help");
+        let mut count = 0;
+        let mut missing = Vec::new();
+        let mut terse = Vec::new();
+
+        for chapter in content::CHAPTERS {
+            for page in chapter.pages {
+                let mut found = 0;
+                for block in markdown::parse(page.body) {
+                    let Block::Image { path, alt } = block else {
+                        continue;
+                    };
+                    found += 1;
+                    count += 1;
+                    if !root.join(&path).is_file() {
+                        missing.push(format!("{} → {path}", page.title));
+                    }
+                    if alt.chars().count() < 10 {
+                        terse.push(format!("{} → {alt}", page.title));
+                    }
+                }
+                // 紧贴表格或引用块的图片曾被段落吞掉过：源文件里有 `![`，
+                // 解析结果里却没有 Image，界面上就只剩一行字。
+                let expected = page.body.match_indices("![").count();
+                assert_eq!(
+                    found, expected,
+                    "{} 有 {expected} 处图片语法，只解析出 {found} 张",
+                    page.title
+                );
+            }
+        }
+
+        assert!(
+            count > 0,
+            "帮助里一张图都没解析到，先检查 markdown 图片语法"
+        );
+        assert!(missing.is_empty(), "引用了磁盘上不存在的图片: {missing:?}");
+        assert!(terse.is_empty(), "图注太短，读不出信息: {terse:?}");
+    }
 }

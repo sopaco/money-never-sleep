@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="316" viewBox="0 0 792 316" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="316" fill="#ffffff"/>
+
+  <text x="24" y="30" font-size="11" fill="#8b94a6">同样的年化收益，过程可以完全不同</text>
+  <text x="768" y="30" font-size="10" fill="#8b94a6" text-anchor="end">卡玛比率 = 年化收益 ÷ 最大回撤</text>
+
+  <!-- 基准线与网格 -->
+  <line x1="56" y1="84" x2="720" y2="84" stroke="#e4e9f2" stroke-dasharray="4 4"/>
+  <line x1="56" y1="232" x2="720" y2="232" stroke="#c9d2e0"/>
+
+  <!-- 回撤区间填充 -->
+  <path d="M200 84 C236 96 262 124 286 148 C306 168 322 186 340 198 C362 212 382 178 400 156 C424 126 446 98 470 84 Z" fill="#c42b1c" fill-opacity="0.07"/>
+
+  <!-- 净值路径 -->
+  <path d="M56 172 C90 168 120 140 150 112 C172 92 186 86 200 84 C236 96 262 124 286 148 C306 168 322 186 340 198 C362 212 382 178 400 156 C424 126 446 98 470 84 C500 66 540 58 580 54 C620 50 660 56 700 52 L720 56"
+        fill="none" stroke="#1a5ce0" stroke-width="2.4" stroke-linecap="round"/>
+
+  <!-- 前高与底部标记 -->
+  <circle cx="200" cy="84" r="4" fill="#ffffff" stroke="#1a5ce0" stroke-width="2"/>
+  <circle cx="340" cy="198" r="4" fill="#ffffff" stroke="#c42b1c" stroke-width="2"/>
+  <text x="200" y="72" font-size="10" fill="#5b6577" text-anchor="middle">前高</text>
+  <text x="340" y="214" font-size="10" fill="#c42b1c" text-anchor="middle">底部</text>
+
+  <!-- 回撤深度 -->
+  <line x1="340" y1="88" x2="340" y2="192" stroke="#c42b1c" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M340 88 l-3.2 6 h6.4 z" fill="#c42b1c"/>
+  <text x="352" y="122" font-size="10.5" fill="#c42b1c" font-weight="600">最大回撤</text>
+
+  <!-- 修复天数 -->
+  <line x1="344" y1="228" x2="466" y2="228" stroke="#5b6577" stroke-width="1.2"/>
+  <path d="M344 228 l6 -3 v6 z" fill="#5b6577"/>
+  <path d="M466 228 l-6 -3 v6 z" fill="#5b6577"/>
+  <text x="405" y="245" font-size="10" fill="#5b6577" text-anchor="middle">回撤修复天数</text>
+
+  <!-- 右侧说明 -->
+  <text x="490" y="176" font-size="10" fill="#8b94a6">爬回前高之前，账面一直是亏的</text>
+  <text x="490" y="192" font-size="10" fill="#8b94a6">——这段才是真正熬人的地方</text>
+
+  <text x="24" y="272" font-size="10" fill="#8b94a6">示意图，非真实产品走势。最大回撤说明「最坏能亏多少」，修复天数说明「要亏多久」，两个数字一起看才够。</text>
+  <text x="24" y="290" font-size="10" fill="#8b94a6">夏普只看波动，所以「平时小赚、偶尔暴跌」的产品能拿到虚高的夏普；卡玛把分母换成最大回撤，专治拿不住。</text>
+</svg>

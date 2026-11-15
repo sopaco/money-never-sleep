@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="792" height="368" viewBox="0 0 792 368" font-family="PingFang SC, Helvetica Neue, Arial, sans-serif">
+  <rect width="792" height="368" fill="#ffffff"/>
+
+  <text x="24" y="30" font-size="11" fill="#8b94a6">四层就够用：先按「多久不用」分层，再谈买什么</text>
+
+  <!-- 时间轴 -->
+  <line x1="40" y1="304" x2="40" y2="70" stroke="#c9d2e0" stroke-width="1.2"/>
+  <path d="M40 62 l-3.6 7 h7.2 z" fill="#c9d2e0"/>
+  <text x="40" y="57" font-size="9.5" fill="#8b94a6" text-anchor="middle">长钱</text>
+  <text x="40" y="316" font-size="9.5" fill="#8b94a6" text-anchor="middle">短钱</text>
+
+  <!-- 增长 -->
+  <rect x="70" y="56" width="698" height="56" rx="6" fill="#fffaf0" stroke="#f0e0c0"/>
+  <rect x="70" y="56" width="4" height="56" rx="2" fill="#c98a1a"/>
+  <text x="88" y="78" font-size="13" fill="#131a2a" font-weight="600">增长</text>
+  <text x="88" y="96" font-size="10.5" fill="#9a5b00">长钱中的小部分 · ≤20%</text>
+  <text x="372" y="78" font-size="11" fill="#5b6577">宽基 / 红利低波指数 + 少量 QDII（定投）</text>
+  <text x="372" y="96" font-size="10" fill="#8b94a6">上限的判据：亏掉它的一半，生活计划和心情都不受影响</text>
+
+  <!-- 压舱石 -->
+  <rect x="70" y="122" width="698" height="56" rx="6" fill="#f4f8ff" stroke="#dbe6f8"/>
+  <rect x="70" y="122" width="4" height="56" rx="2" fill="#1a5ce0"/>
+  <text x="88" y="144" font-size="13" fill="#131a2a" font-weight="600">压舱石</text>
+  <text x="88" y="162" font-size="10.5" fill="#5b6577">长期不动的本金 · 剩余大头</text>
+  <text x="372" y="144" font-size="11" fill="#5b6577">国债 / 政金债指数基金、高保底储蓄型保险（若有）</text>
+  <text x="372" y="162" font-size="10" fill="#8b94a6">这一层承担「跟住时间」，不承担「跑赢市场」</text>
+
+  <!-- 安全垫 -->
+  <rect x="70" y="188" width="698" height="56" rx="6" fill="#f7fbfd" stroke="#dfeaf2"/>
+  <rect x="70" y="188" width="4" height="56" rx="2" fill="#4a80e8"/>
+  <text x="88" y="210" font-size="13" fill="#131a2a" font-weight="600">安全垫</text>
+  <text x="88" y="228" font-size="10.5" fill="#5b6577">1~3 年确定要用的钱 · 按需</text>
+  <text x="372" y="210" font-size="11" fill="#5b6577">定期存款、储蓄国债</text>
+  <text x="372" y="228" font-size="10" fill="#8b94a6">任务是「到点有钱」，不是收益</text>
+
+  <!-- 活钱 -->
+  <rect x="70" y="254" width="698" height="56" rx="6" fill="#f8f9fc" stroke="#e8ecf4"/>
+  <rect x="70" y="254" width="4" height="56" rx="2" fill="#8b94a6"/>
+  <text x="88" y="276" font-size="13" fill="#131a2a" font-weight="600">活钱</text>
+  <text x="88" y="294" font-size="10.5" fill="#5b6577">3~6 个月支出 · 按月支出算</text>
+  <text x="372" y="276" font-size="11" fill="#5b6577">货币基金 / 现金理财</text>
+  <text x="372" y="294" font-size="10" fill="#8b94a6">随时可取，收益 1% 上下，不指望它赚钱</text>
+
+  <text x="24" y="342" font-size="10" fill="#8b94a6">顺序不能倒：先填满下层，再往上。下层没到位就把钱放进增长层，是这类配置最常见的失败方式。</text>
+</svg>

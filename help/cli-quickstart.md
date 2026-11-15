@@ -28,7 +28,7 @@ mns config params               # 查看全部可调参数和默认值
 mns today                       # 刷价并生成今日报告
 ```
 
-![命令行查询持仓截图](images/cli-quickstart.png)
+![命令行输出：持仓、成本与仓位偏离在一张表里看完](images/cli-quickstart.png)
 
 ## 一周怎么用
 
