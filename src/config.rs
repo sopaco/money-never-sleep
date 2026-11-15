@@ -845,8 +845,30 @@ impl AppConfig {
             }
         };
         // 风险档位：把曲线向满仓收缩（core_blend=0 时完全等价旧行为）
+        self.blend_to_profile(base)
+    }
+
+    /// 把目标仓位锚点按风险档位向满仓收缩（core_blend=0 时原样返回）。
+    fn blend_to_profile(&self, base: f64) -> f64 {
         let blend = self.profile.core_blend.clamp(0.0, 1.0);
         blend * 100.0 + (1.0 - blend) * base
+    }
+
+    /// 五档目标仓位（已含档位收缩），顺序：极度恐慌 / 恐慌 / 中性 / 贪婪 / 极度贪婪。
+    ///
+    /// 取**各档上沿锚点**而不是区间中点：阶梯模式下两者完全相同，线性模式下中点
+    /// 插值会得出 (fear+neutral)/2 这类既不等于配置值、也不对应任何阈值的数，
+    /// 于是报告里的「中性档目标」和 `target_weight.neutral` 对不上。锚点口径与
+    /// `mode` 无关，报告里所有“某档目标仓位”都从这里取，保证同源。
+    pub fn zone_target_weights(&self) -> [f64; 5] {
+        let t = &self.target_weight;
+        [
+            self.blend_to_profile(t.extreme_fear),
+            self.blend_to_profile(t.fear),
+            self.blend_to_profile(t.neutral),
+            self.blend_to_profile(t.greed),
+            self.blend_to_profile(t.extreme_greed),
+        ]
     }
 
     /// 一键套用风险档位：只调整曲线向满仓的收缩程度，不改用户自己的曲线锚点、
@@ -867,10 +889,13 @@ impl AppConfig {
             .unwrap_or("自定义")
     }
 
-    /// “中性”区间的实际目标仓位（已含档位收缩），用于展示。
+    /// “中性”档的目标仓位（已含档位收缩），用于展示。
+    ///
+    /// 直接取配置锚点，**不**在曲线上采样区间中点：`target_weight.neutral` 才是
+    /// “中性”这一档的定义值，采样中点只在阶梯模式下碰巧与它相等；线性模式下
+    /// 中点插值会漂到 (fear+neutral)/2，展示值既不对应配置也不对应任何阈值。
     pub fn effective_neutral_weight(&self) -> f64 {
-        let mid = (self.thresholds.fear + self.thresholds.neutral) / 2.0;
-        self.target_weight_for(mid)
+        self.blend_to_profile(self.target_weight.neutral)
     }
 
     /// 风险资产内部的三腿目标权重（归一化后占风险资产的比例）
@@ -1072,6 +1097,33 @@ mod tests {
 
     fn cfg() -> AppConfig {
         AppConfig::default_config()
+    }
+
+    #[test]
+    fn 中性档目标取锚点且不随过渡模式漂移() {
+        let mut c = cfg();
+        c.target_weight.mode = WeightMode::Step;
+        let step = c.effective_neutral_weight();
+        c.target_weight.mode = WeightMode::Linear;
+        let linear = c.effective_neutral_weight();
+        assert!(
+            (step - linear).abs() < 1e-9,
+            "中性档目标应取配置锚点，不该随 mode 变化：step={step} linear={linear}"
+        );
+        // 与「目标仓位预案」表的中性档同源，否则同一份报告会出现两个“中性”数
+        assert!((step - c.zone_target_weights()[2]).abs() < 1e-9);
+
+        // 五档都直接取锚点（不再按区间中点插值），且都已叠加档位收缩
+        let blend = c.profile.core_blend;
+        let t = &c.target_weight;
+        let anchors = [t.extreme_fear, t.fear, t.neutral, t.greed, t.extreme_greed];
+        for (got, base) in c.zone_target_weights().iter().zip(anchors) {
+            let expect = blend * 100.0 + (1.0 - blend) * base;
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "档位目标应为 blend×100+(1-blend)×锚点：got={got} expect={expect}"
+            );
+        }
     }
 
     #[test]

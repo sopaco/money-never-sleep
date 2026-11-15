@@ -162,7 +162,7 @@ pub fn render_document(blocks: &[Block], images: &ImageCache, width: Pixels) -> 
     // `w_full` on the root and on every block below is deliberate: without it
     // a flex child sizes to max-content, so paragraphs would never wrap and
     // would run off the right edge of the reading column.
-    let mut doc = div().v_flex().w_full().gap(px(12.));
+    let mut doc = div().v_flex().w_full().gap(px(14.));
     for block in blocks {
         doc = doc.child(render_block(block, images, width));
     }
@@ -191,10 +191,10 @@ fn render_block(block: &Block, images: &ImageCache, width: Pixels) -> AnyElement
 
 fn render_heading(level: u8, spans: &[Span]) -> gpui_kit::Div {
     let (size, weight, top, bottom) = match level {
-        1 => (px(24.), FontWeight::SEMIBOLD, px(0.), px(4.)),
-        2 => (px(19.), FontWeight::SEMIBOLD, px(22.), px(6.)),
-        3 => (px(16.), FontWeight::SEMIBOLD, px(16.), px(4.)),
-        _ => (px(14.5), FontWeight::SEMIBOLD, px(12.), px(2.)),
+        1 => (px(26.), FontWeight::SEMIBOLD, px(0.), px(6.)),
+        2 => (px(20.), FontWeight::SEMIBOLD, px(30.), px(8.)),
+        3 => (px(17.), FontWeight::SEMIBOLD, px(22.), px(6.)),
+        _ => (px(15.), FontWeight::SEMIBOLD, px(16.), px(2.)),
     };
     let heading = div()
         .w_full()
@@ -221,14 +221,14 @@ fn render_heading(level: u8, spans: &[Span]) -> gpui_kit::Div {
 fn render_paragraph(spans: &[Span]) -> gpui_kit::Div {
     div()
         .w_full()
-        .text_size(px(14.))
-        .line_height(px(24.))
+        .text_size(px(15.))
+        .line_height(px(26.))
         .text_color(rgb(TEXT))
         .child(render_spans(spans))
 }
 
 fn render_list(items: &[ListItem]) -> gpui_kit::Div {
-    let mut list = div().v_flex().w_full().gap(px(5.)).pl(px(2.));
+    let mut list = div().v_flex().w_full().gap(px(7.)).pl(px(2.));
     for item in items {
         let marker = if item.ordered {
             format!("{}.", item.index)
@@ -240,13 +240,13 @@ fn render_list(items: &[ListItem]) -> gpui_kit::Div {
                 .h_flex()
                 .w_full()
                 .items_start()
-                .gap(px(8.))
-                .pl(px((item.level * 18) as f32))
+                .gap(px(9.))
+                .pl(px((item.level * 20) as f32))
                 .child(
                     div()
                         .flex_none()
-                        .w(px(20.))
-                        .text_size(px(14.))
+                        .w(px(22.))
+                        .text_size(px(15.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(marker),
                 )
@@ -257,8 +257,8 @@ fn render_list(items: &[ListItem]) -> gpui_kit::Div {
                         // without this, which made long bullets run past the
                         // reading column instead of wrapping.
                         .min_w_0()
-                        .text_size(px(14.))
-                        .line_height(px(24.))
+                        .text_size(px(15.))
+                        .line_height(px(26.))
                         .text_color(rgb(TEXT))
                         .child(render_spans(&item.spans)),
                 ),
@@ -270,14 +270,14 @@ fn render_list(items: &[ListItem]) -> gpui_kit::Div {
 fn render_code(text: &str) -> gpui_kit::Div {
     div()
         .w_full()
-        .p(px(12.))
+        .p(px(14.))
         .rounded(px(RADIUS_SM))
         .bg(rgb(LAYER))
         .border_1()
         .border_color(rgb(BORDER))
         .font_family(mono_family())
-        .text_size(px(12.5))
-        .line_height(px(20.))
+        .text_size(px(13.))
+        .line_height(px(21.))
         .text_color(rgb(TEXT))
         .child(SharedString::from(text.to_owned()))
 }
@@ -294,7 +294,7 @@ fn render_quote(
             .w_full()
             .border_l_2()
             .border_color(rgb(BORDER))
-            .pl(px(14.))
+            .pl(px(16.))
             .py(px(2.))
             .text_color(rgb(TEXT_SECONDARY))
             .child(render_document(blocks, images, width - px(16.))),
@@ -313,15 +313,15 @@ fn render_callout(
         Callout::Important => (IconName::TriangleAlert, "重要", WARNING, WARNING_SOFT),
         Callout::Warning => (IconName::OctagonAlert, "警告", DANGER, DANGER_SOFT),
     };
-    // Callout 自身有 14px 内边距，图片要按扣掉内边距后的列宽计算高度。
-    let inner_width = width - px(28.);
-    let mut body = div().v_flex().w_full().gap(px(6.));
+    // Callout 自身有 16px 内边距，图片要按扣掉内边距后的列宽计算高度。
+    let inner_width = width - px(32.);
+    let mut body = div().v_flex().w_full().gap(px(8.));
     for block in blocks {
         // Headings inside callouts render as emphasized lead-in text.
         if let Block::Heading { spans, .. } = block {
             body = body.child(
                 div()
-                    .text_size(px(14.))
+                    .text_size(px(15.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(fg))
                     .child(render_spans(spans)),
@@ -333,8 +333,8 @@ fn render_callout(
     div()
         .v_flex()
         .w_full()
-        .gap(px(8.))
-        .p(px(14.))
+        .gap(px(9.))
+        .p(px(16.))
         .rounded(px(RADIUS))
         .bg(rgb(bg))
         .child(
@@ -342,12 +342,12 @@ fn render_callout(
                 .h_flex()
                 .items_center()
                 .gap(px(7.))
-                .text_size(px(15.))
+                .text_size(px(16.))
                 .text_color(rgb(fg))
                 .child(icon)
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(px(13.5))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(fg))
                         .child(label.to_string()),
@@ -378,7 +378,7 @@ fn render_image(path: &str, alt: &str, images: &ImageCache, width: Pixels) -> An
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(12.5))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(format!("图：{alt}")),
                 )
@@ -450,10 +450,10 @@ fn render_table(aligns: &[Align], rows: &[Vec<Vec<Span>>]) -> gpui_kit::Div {
                 // Same flex-shrink floor as list rows: without it a wide cell
                 // forces the whole table past the column edge.
                 .min_w_0()
-                .px(px(10.))
-                .py(px(7.))
-                .text_size(px(12.5))
-                .line_height(px(19.))
+                .px(px(12.))
+                .py(px(8.))
+                .text_size(px(13.5))
+                .line_height(px(20.))
                 .text_color(rgb(TEXT));
             if header {
                 cell_el = cell_el.font_weight(FontWeight::SEMIBOLD);

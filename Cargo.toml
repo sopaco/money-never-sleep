@@ -49,6 +49,14 @@ gui = ["agent", "dep:gpui-kit", "dep:gpui-tray"]
 # resolve against gpui-pre at all.
 gui-test = ["gui", "gpui-pre/test-support"]
 
+# --- macOS-only helpers -----------------------------------------------------
+# The help viewer runs inside MNS.app, so AppKit draws CFBundleName ("MNS") in
+# the menu bar no matter what menu title we pass. Re-asserting the title on the
+# live NSMenu needs two msg_sends; `objc2` is already in the tree through
+# gpui-pre-macos, so this adds no extra compile unit.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [build-dependencies]
 # 把 assets/app.ico 编成 exe 的 RT_GROUP_ICON #1 资源。GPUI 的 Windows 后端
 # 用 LoadImageW(GetModuleHandleW(None), MAKEINTRESOURCE(1)) 取标题栏/任务栏图标，

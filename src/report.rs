@@ -301,15 +301,18 @@ pub fn generate_report(
     } else {
         "无档位：目标仓位完全由你的曲线决定，择时摆幅最大"
     };
+    report.push_str(&format!("【风险档位】{}\n", config.profile_label()));
+    // 两个数同源不同档：中性档是档位的中枢，今日档是当前情绪对应的台阶。
+    // 只印中枢会让读者把它当成"今天的目标"，与下方的调仓计划对不上。
     report.push_str(&format!(
-        "【风险档位】{}\n",
-        config.profile_label()
-    ));
-    report.push_str(&format!(
-        "  中性目标仓位 {:.0}%（{}）\n\n",
+        "  中性档（{:.0}–{:.0} 分）目标 {:.0}% · 今日{}档目标 {:.0}%\n",
+        config.thresholds.fear,
+        config.thresholds.neutral,
         config.effective_neutral_weight(),
-        profile_note
+        rating,
+        config.target_weight_for(score)
     ));
+    report.push_str(&format!("  {}\n\n", profile_note));
     report.push_str("【市场情绪】\n");
     report.push_str(&format!(
         "  CNN 恐贪指数(今日): {:.2} ({})\n",
@@ -428,10 +431,15 @@ pub fn generate_report(
     // ── 调仓计划（目标仓位 + 偏离带） ──
     report.push_str("【调仓计划】\n");
     report.push_str(&format!(
-        "  风险资产目标 {:.1}%  当前 {:.1}%  偏离 {:+.1}pp  (带宽 ±{:.1}pp)\n",
+        "  风险资产目标 {:.1}%  当前 {:.1}%  偏离 {:+.1}pp\n",
         plan.target_risk_weight,
         plan.current_risk_weight,
-        plan.current_risk_weight - plan.target_risk_weight,
+        plan.current_risk_weight - plan.target_risk_weight
+    ));
+    // 偏离带是逐腿判定的（strategy.rs: drift_pp.abs() <= band），与总仓位偏离无关。
+    // 并排印会让人以为“总偏离超过带宽就该补回目标”，实际只补超带宽的那条腿。
+    report.push_str(&format!(
+        "  偏离带 ±{:.1}pp 按腿判定（仅超带宽的腿才调仓，总仓位不必然回到目标）\n",
         plan.band_pp
     ));
     report.push_str(&format!(
@@ -524,6 +532,21 @@ pub fn generate_report(
         if plan.total_sell > 0.0 {
             report.push_str("  注: 赎回费按各标的最早买入日估算会偏低（近期定投份额可能仍在费率档内）\n");
         }
+        // 补齐“总偏离 vs 逐腿带宽”的口径差：不写明的话，「目标 83%、只买 ¥691」
+        // 看起来像算错了——差额来自未超带宽的腿，它们按设计不参与调仓。
+        let after = plan.risk_weight_after_rebalance();
+        let gap = after - plan.target_risk_weight;
+        if gap <= -0.5 {
+            report.push_str(&format!(
+                "  执行后风险资产 ≈ {:.1}%，仍低于目标 {:.1}pp（仅超带宽的腿被调仓，其余不动）\n",
+                after, -gap
+            ));
+        } else if gap >= 0.5 {
+            report.push_str(&format!(
+                "  执行后风险资产 ≈ {:.1}%，仍高于目标 {:.1}pp（仅超带宽的腿被调仓，其余不动）\n",
+                after, gap
+            ));
+        }
     } else {
         match &no_action {
             NoAction::EmptyAccount => {
@@ -586,11 +609,16 @@ pub fn generate_report(
         report.push_str("  注资后再运行 `mns report` 即可看到各情绪区间对应的目标仓位金额。\n\n");
     } else {
         report.push_str("  情绪进入各区间时的风险资产目标权重:\n");
+        if config.target_weight.mode == crate::config::WeightMode::Linear {
+            report.push_str("  （线性模式：区间内连续取值，此处取各档上沿锚点）\n");
+        }
+        // 与「风险档位」里的中性档目标同源，避免同一份报告出现两个“中性”数
+        let ladder = config.zone_target_weights();
         let zones = [
             (
                 "极度恐慌",
                 format!("指数 < {:.0}", config.thresholds.extreme_fear),
-                config.target_weight_for(0.0),
+                ladder[0],
             ),
             (
                 "恐慌",
@@ -598,7 +626,7 @@ pub fn generate_report(
                     "{:.0} ≤ 指数 < {:.0}",
                     config.thresholds.extreme_fear, config.thresholds.fear
                 ),
-                config.target_weight_for((config.thresholds.extreme_fear + config.thresholds.fear) / 2.0),
+                ladder[1],
             ),
             (
                 "中性",
@@ -606,7 +634,7 @@ pub fn generate_report(
                     "{:.0} ≤ 指数 < {:.0}",
                     config.thresholds.fear, config.thresholds.neutral
                 ),
-                config.target_weight_for((config.thresholds.fear + config.thresholds.neutral) / 2.0),
+                ladder[2],
             ),
             (
                 "贪婪",
@@ -614,12 +642,12 @@ pub fn generate_report(
                     "{:.0} ≤ 指数 < {:.0}",
                     config.thresholds.neutral, config.thresholds.greed
                 ),
-                config.target_weight_for((config.thresholds.neutral + config.thresholds.greed) / 2.0),
+                ladder[3],
             ),
             (
                 "极度贪婪",
                 format!("指数 ≥ {:.0}", config.thresholds.greed),
-                config.target_weight_for(100.0),
+                ladder[4],
             ),
         ];
         for (name, desc, weight) in &zones {
@@ -686,10 +714,15 @@ pub fn generate_observation_report(
         date_str, weekday
     ));
 
+    report.push_str(&format!("【风险档位】{}\n", config.profile_label()));
+    // 只印中性档会让 77% 看上去像“今天的目标”，与 `mns plan` 的今日档数值冲突。
+    // 两个数同源不同档（档位中枢 vs 当前情绪台阶），必须并排出现。
     report.push_str(&format!(
-        "【风险档位】{}（中性目标 {:.0}%）\n",
-        config.profile_label(),
-        config.effective_neutral_weight()
+        "  中性档目标 {:.0}% · 今日{}档（{:.1} 分）目标 {:.0}%\n",
+        config.effective_neutral_weight(),
+        signal.effective_zone,
+        signal.effective_score,
+        config.target_weight_for(signal.effective_score)
     ));
     report.push_str(&format!(
         "  {}\n\n",
@@ -908,6 +941,74 @@ mod tests {
         let s = crate::signal::compute(&c, 50.0, &hist, chrono::Local::now().date_naive());
         let r = generate_observation_report(&c, &s, 0.0, &[], None, None).unwrap();
         assert!(r.contains("【口径披露】"));
+    }
+
+    #[test]
+    fn 观察版报告同时给出中性档与今日档目标() {
+        // 只印中性档会让 77% 被读成“今天的目标”，与 `mns plan` 的今日档数值冲突。
+        // 两个数同源不同档，必须在同一行并排出现。
+        let c = AppConfig::default_config();
+        let hist = crate::signal::ScoreHistory::new();
+        let s = crate::signal::compute(&c, 50.0, &hist, chrono::Local::now().date_naive());
+        let r = generate_observation_report(&c, &s, 0.0, &[], None, None).unwrap();
+        let want = format!(
+            "中性档目标 {:.0}% · 今日{}档（{:.1} 分）目标 {:.0}%",
+            c.effective_neutral_weight(),
+            s.effective_zone,
+            s.effective_score,
+            c.target_weight_for(s.effective_score)
+        );
+        assert!(r.contains(&want), "观察版应并排给出两个档位目标，实际：\n{r}");
+    }
+
+    #[test]
+    fn 调仓计划声明带宽按腿判定() {
+        // 「目标 83%、偏离 -12.9pp、带宽 ±6pp」却只买 ¥691：不写明带宽是逐腿的，
+        // 读者会以为超带宽就该补回目标。
+        let report = make_report(&AppConfig::default_config());
+        assert!(report.contains("按腿判定"), "带宽口径必须写明是按腿判定");
+    }
+
+    #[test]
+    fn 执行后仍低于目标时给出残差() {
+        let config = AppConfig::default_config();
+        let mut p = plan(
+            100_000.0,
+            vec![leg("us_stocks", Some("偏离 -5.8pp 在带宽 ±4.0pp 内"))],
+        );
+        p.current_risk_weight = 70.0;
+        p.target_risk_weight = 83.0;
+        p.total_buy = 691.0;
+        p.legs[0].items = vec![LegItem {
+            asset_code: "007605".into(),
+            asset_name: "沪深300红利低波".into(),
+            amount: 691.0,
+            note: None,
+            holding_days: None,
+        }];
+        let r = generate_report(
+            &config,
+            37.0,
+            "恐慌",
+            38.0,
+            "恐慌",
+            "",
+            None,
+            None,
+            None,
+            None,
+            100_000.0,
+            &[],
+            &p,
+            &[],
+            &MonthActivity::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        // 70% + 691/100000 = 70.7%，离 83% 还差 12.3pp
+        assert!(r.contains("执行后风险资产"), "应给出执行后的总仓位：\n{r}");
+        assert!(r.contains("仍低于目标"), "残差方向应写明：\n{r}");
     }
 
     #[test]

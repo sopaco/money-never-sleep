@@ -2354,7 +2354,25 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
 
 /// Spawns the standalone `mns-help` viewer bundled next to this executable.
 /// In dev builds the sibling lives in `target/<profile>/` alongside `mns-gui`.
+///
+/// 帮助中心是独立进程，关窗即退出，所以「已经在看」这件事只能靠子进程句柄判断：
+/// Windows 上的 `mns-help` 自带单实例锁（第二次启动会唤醒已有窗口后自行退出），
+/// macOS 上没有任何锁，没有这一层的话连点两次就会开出两个帮助窗口。
 fn open_help_center() -> std::io::Result<()> {
+    use std::sync::Mutex;
+
+    static VIEWER: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+    let mut slot = VIEWER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = slot.as_mut() {
+        // `try_wait` 同时负责回收已退出的子进程：返回 `None` 说明还活着。
+        if child.try_wait()?.is_none() {
+            return Ok(());
+        }
+    }
+
     let exe = std::env::current_exe()?;
     let dir = exe
         .parent()
@@ -2365,7 +2383,7 @@ fn open_help_center() -> std::io::Result<()> {
     } else {
         "mns-help"
     };
-    command(dir.join(name)).spawn()?;
+    *slot = Some(command(dir.join(name)).spawn()?);
     Ok(())
 }
 
@@ -2529,6 +2547,18 @@ impl AppShell {
                     })),
             )
             .child(refresh)
+            // 帮助中心紧跟「更新数据」：这里是最常用的两个「我现在该干什么」，
+            // 一个是拉数据，一个是查这数据怎么读。
+            .child(
+                Button::new("open-help")
+                    .label("帮助")
+                    .icon(IconName::BookText)
+                    .on_click(cx.listener(|_, _, _, _| {
+                        if let Err(error) = open_help_center() {
+                            eprintln!("打开帮助中心失败：{error}");
+                        }
+                    })),
+            )
     }
 
     fn rail(&self, cx: &mut Context<Self>) -> Div {

@@ -378,6 +378,12 @@ impl Button {
         self
     }
 
+    /// 前置图标。名称取自应用图标集，和左侧导航栏用的是同一套。
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.inner = self.inner.icon(icon);
+        self
+    }
+
     pub fn primary(mut self) -> Self {
         self.inner = self.inner.primary();
         self

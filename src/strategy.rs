@@ -133,6 +133,18 @@ impl RebalancePlan {
         self.total_buy > 0.0 || self.total_sell > 0.0
     }
 
+    /// 执行本次调仓后的风险资产权重（%）。
+    ///
+    /// 买入增加风险资产、卖出减少，现金池不参与，总资产因而不变。只对
+    /// [`calculate_rebalance_plan`] 的结果有意义——月投计划的 `total_assets`
+    /// 含本月新钱，口径不同。
+    pub fn risk_weight_after_rebalance(&self) -> f64 {
+        if self.total_assets <= 0.0 {
+            return 0.0;
+        }
+        self.current_risk_weight + (self.total_buy - self.total_sell) / self.total_assets * 100.0
+    }
+
     /// 按当前费率估算本次调仓的总费用（买入费 + 卖出费 + 阶梯赎回费）。
     ///
     /// 赎回费按各标的**最早买入日**估算持有天数，因此长期定投账户会低估

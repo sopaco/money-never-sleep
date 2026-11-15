@@ -4268,6 +4268,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "gpui-tray",
+ "objc2 0.6.5",
  "reqwest",
  "rusqlite",
  "serde",

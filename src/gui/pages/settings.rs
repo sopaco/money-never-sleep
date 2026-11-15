@@ -100,7 +100,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT_TERTIARY))
-                    .child(format!("当前中性目标仓位 {:.0}%", config.neutral_weight)),
+                    .child(format!("当前中性档目标 {:.0}%", config.neutral_weight)),
             ),
     );
 

@@ -131,7 +131,7 @@ fn cmd_init(force: bool) -> Result<()> {
     println!("  数据库:   {}", db_path.display());
     println!("  报告目录: {}", report_dir.display());
     println!(
-        "  风险档位: {}（中性目标 {:.0}%，用 `mns config profile <none|steady|balanced|aggressive>` 切换）",
+        "  风险档位: {}（中性档目标 {:.0}%，用 `mns config profile <none|steady|balanced|aggressive>` 切换）",
         config.profile_label(),
         config.effective_neutral_weight()
     );
@@ -1089,12 +1089,16 @@ fn cmd_plan(monthly_arg: Option<f64>) -> Result<()> {
     println!("   定投计划：每月 ¥{:.0}（只买不卖）", monthly);
     println!("=================================================================");
     println!();
+    // 与报告同口径：今日档目标 + 中性档目标并排，避免读者把 77% 当成今天的目标
     println!(
-        "风险档位: {} | 决策分数 {:.1} | 目标风险仓位 {:.0}% | 当前与偏离按含本月新钱的总资产计",
+        "风险档位: {} | 决策分数 {:.1} | 今日{}档目标 {:.0}%（中性档 {:.0}%）",
         config.profile_label(),
         score,
-        plan.target_risk_weight
+        signal.effective_zone,
+        plan.target_risk_weight,
+        config.effective_neutral_weight()
     );
+    println!("当前与偏离按含本月新钱的总资产计");
     println!();
 
     let mut table = Table::new();
