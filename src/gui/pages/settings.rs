@@ -6,9 +6,10 @@ use gpui_kit::*;
 
 use crate::gui::AppShell;
 use crate::gui::components::*;
+use crate::gui::help_links;
 use crate::gui::theme::*;
 
-use super::{card_header, page_root};
+use super::{card_header, card_header_linked, page_root};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     let mut root = page_root("page-settings");
@@ -88,7 +89,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     root = root.child(
         card_pad()
             .gap(px(12.))
-            .child(card_header("风险档位", ""))
+            .child(card_header_linked("风险档位", "", help_links::RISK_PROFILE))
             .child(
                 div()
                     .h_flex()

@@ -4,12 +4,14 @@
 //! one saturated brand colour, and a type scale that keeps numbers louder than
 //! labels. Primitives live here so six pages cannot drift apart.
 
+use gpui_kit::StatefulInteractiveElement;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::Disableable;
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::*;
 
+use super::help_links::HelpLink;
 use super::theme::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,6 +353,60 @@ pub fn mono_family() -> &'static str {
     } else {
         "DejaVu Sans Mono"
     }
+}
+
+/// 一个 16px 的问号徽标：点开就跳到对应帮助页。
+///
+/// 刻意做得比按钮轻——无阴影、细描边、字重中等，只靠一层极浅的底色
+/// 区别于正文，悬停时才染上品牌色。帮助入口的价值在于「需要时找得到」，
+/// 不在于「一直在喊」；把它做成实心按钮会让每张卡片多一个视觉噪音，
+/// 最后谁都不点。
+///
+/// 悬停提示不是装饰：同一个「总览」页上，页名旁和「配置位置」卡旁的问号
+/// 去往不同的页，得先告诉用户会打开什么。
+pub fn help_badge(link: HelpLink) -> gpui_kit::Stateful<Div> {
+    let HelpLink { slug, tip } = link;
+    let tip = SharedString::from(tip);
+    div()
+        .id(SharedString::from(format!("help-badge-{slug}")))
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .flex_none()
+        // 中文墨迹的中心比 15px 行盒的中心低约 1px（盒高按上伸/下伸对称分配，
+        // 而汉字重心压在基线上），圆环本身没有下伸部分，按盒居中就会整体偏高，
+        // 视觉上像浮在文字右上角。align-self: center 居中 margin box，
+        // 因此 2px 上外边距正好把圆压下去 1px。
+        .mt(px(2.))
+        .self_center()
+        .rounded(px(999.))
+        .border_1()
+        // BORDER 是分隔线用的，画在白色卡片上只剩一道影子；问号要能被一眼找到，
+        // 描边和字形都上调一档，并用极浅的品牌蓝底说明它是可点的。
+        .border_color(rgb(0xc4d2e6))
+        .bg(rgb(ACCENT_TINT))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(TEXT_SECONDARY))
+        .cursor_pointer()
+        .hover(|style| {
+            // 悬停必须比待机更深：描边刚从 e4e9f2 提到 c4d2e6，若还沿用旧的
+            // bfd4f7，鼠标一上去反而变淡，看着像被禁用。
+            style
+                .bg(rgb(ACCENT_SOFT))
+                .border_color(rgb(0x8fb2ea))
+                .text_color(rgb(ACCENT))
+        })
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .on_click(move |_, _, _| {
+            if let Err(error) = crate::gui::open_help_center(Some(slug)) {
+                eprintln!("打开帮助失败：{error}");
+            }
+        })
+        .child("?")
 }
 
 /// Every button in the app should read as clickable.

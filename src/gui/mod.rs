@@ -9,6 +9,7 @@ mod chart;
 // Theme and small building blocks are shared with the mns-help viewer.
 pub(crate) mod components;
 pub(crate) mod conversations;
+pub(crate) mod help_links;
 mod jobs;
 mod mood;
 mod pages;
@@ -143,6 +144,21 @@ impl Page {
             Page::Performance => IconName::ChartLine,
             Page::Agent => IconName::Sparkles,
             Page::Settings => IconName::Settings,
+        }
+    }
+
+    /// 顶栏问号指向的帮助页：回答「这一屏怎么用」。
+    ///
+    /// 复盘页没有同名文档，它的内容（曲线、回撤、流水）对应的其实是
+    /// 「收益与风险指标」，所以落到理财百科而不是硬造一页。
+    pub(crate) fn help_link(self) -> help_links::HelpLink {
+        match self {
+            Page::Dashboard => help_links::OVERVIEW,
+            Page::Portfolio => help_links::PORTFOLIO,
+            Page::Plan => help_links::PLAN,
+            Page::Performance => help_links::REVIEW,
+            Page::Agent => help_links::AGENT,
+            Page::Settings => help_links::SETTINGS,
         }
     }
 }
@@ -1923,7 +1939,7 @@ fn register_actions(cx: &mut App) {
         }
     });
     cx.on_action(|_: &OpenHelpCenter, _| {
-        if let Err(error) = open_help_center() {
+        if let Err(error) = open_help_center(None) {
             eprintln!("启动 mns-help 失败：{error}");
         }
     });
@@ -2355,13 +2371,23 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
 /// Spawns the standalone `mns-help` viewer bundled next to this executable.
 /// In dev builds the sibling lives in `target/<profile>/` alongside `mns-gui`.
 ///
+/// `target` 是要直接翻到的那一页（`None` = 首页，或把已开着的窗口提到前面）。
 /// 帮助中心是独立进程，关窗即退出，所以「已经在看」这件事只能靠子进程句柄判断：
 /// Windows 上的 `mns-help` 自带单实例锁（第二次启动会唤醒已有窗口后自行退出），
 /// macOS 上没有任何锁，没有这一层的话连点两次就会开出两个帮助窗口。
-fn open_help_center() -> std::io::Result<()> {
+///
+/// 窗口开着时没有别的通道能把参数送进去，因此**先写请求文件再判断**：
+/// 冷启动那条路同时还会把 slug 放进 argv，热路径靠
+/// [`crate::help::deeplink::Watcher`] 在 400ms 内把页面翻过去。
+fn open_help_center(target: Option<&str>) -> std::io::Result<()> {
     use std::sync::Mutex;
 
     static VIEWER: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+    // 空串表示「只置前」：顶栏的「帮助」按钮不该把用户从正在读的一页拽回首页。
+    if let Err(error) = crate::help::deeplink::request(target.unwrap_or("")) {
+        eprintln!("写入帮助跳页请求失败（窗口仍会打开）：{error}");
+    }
 
     let mut slot = VIEWER
         .lock()
@@ -2378,13 +2404,23 @@ fn open_help_center() -> std::io::Result<()> {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
+    *slot = Some(help_command(&dir, target).spawn()?);
+    Ok(())
+}
+
+/// 冷启动时交给 `mns-help` 的命令行：目标页只能从 argv 这一条路进去
+/// （窗口还没建，没人能读请求文件）。
+fn help_command(dir: &std::path::Path, target: Option<&str>) -> std::process::Command {
     let name = if cfg!(target_os = "windows") {
         "mns-help.exe"
     } else {
         "mns-help"
     };
-    *slot = Some(command(dir.join(name)).spawn()?);
-    Ok(())
+    let mut child = command(dir.join(name));
+    if let Some(slug) = target {
+        child.arg("--page").arg(slug);
+    }
+    child
 }
 
 fn tray_icon() -> gpui_tray::Result<Icon> {
@@ -2517,12 +2553,21 @@ impl AppShell {
                     .v_flex()
                     .gap(px(3.))
                     // The window title already names the product; here we only
-                    // say where you are inside it.
+                    // say where you are inside it. The `?` rides along with the
+                    // page name: it answers "这一屏怎么用", which is a different
+                    // question from the 帮助 button's "打开帮助中心".
                     .child(
                         div()
-                            .text_size(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.page.label()),
+                            .h_flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.page.label()),
+                            )
+                            .child(help_badge(self.page.help_link())),
                     )
                     .child(
                         div()
@@ -2554,7 +2599,7 @@ impl AppShell {
                     .label("帮助")
                     .icon(IconName::BookText)
                     .on_click(cx.listener(|_, _, _, _| {
-                        if let Err(error) = open_help_center() {
+                        if let Err(error) = open_help_center(None) {
                             eprintln!("打开帮助中心失败：{error}");
                         }
                     })),
@@ -3291,5 +3336,81 @@ mod tray_tests {
             tray_review_line(&agent, &settings, None, "2026-11-09"),
             "每日巡检：未开启"
         );
+    }
+}
+
+#[cfg(test)]
+mod help_link_tests {
+    // 同上：显式导入，避免 `gpui_kit::test` 这个属性宏盖住内建的 `#[test]`。
+    use super::{Page, help_command, help_links};
+    use crate::help::content;
+
+    /// 冷启动那条路得把目标页放进 argv：窗口还不存在，没人读得到请求文件。
+    #[test]
+    fn cold_start_passes_the_page_on_the_command_line() {
+        let dir = std::path::Path::new("/tmp");
+        let args = |target| -> Vec<String> {
+            help_command(dir, target)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(Some("desktop-plan")), ["--page", "desktop-plan"]);
+        assert!(
+            args(None).is_empty(),
+            "不带目标页时不该塞参数，否则 mns-help 会把标志当成 slug"
+        );
+    }
+
+    /// 每个 `?` 都必须落到一页真实存在的帮助内容上。
+    ///
+    /// 这类断链在运行时只表现为「点了没反应或跳首页」，肉眼很难归因；
+    /// 而 slug 是纯字符串，编译器也管不着。测试是唯一会响的地方。
+    #[test]
+    fn every_badge_points_at_an_existing_help_page() {
+        for page in Page::ALL {
+            let link = page.help_link();
+            assert!(
+                content::page_id(link.slug).is_some(),
+                "「{}」顶栏的问号指向不存在的帮助页 `{}`",
+                page.label(),
+                link.slug
+            );
+            assert!(!link.tip.is_empty(), "`{}` 的悬停提示不能为空", link.slug);
+        }
+
+        for link in help_links::ALL {
+            assert!(
+                content::page_id(link.slug).is_some(),
+                "帮助链接 `{}` 指向不存在的页",
+                link.slug
+            );
+            assert!(
+                link.tip.starts_with("帮助："),
+                "`{}` 的提示要说明会打开什么，当前为 `{}`",
+                link.slug,
+                link.tip
+            );
+        }
+    }
+
+    /// 顶栏问号是「这一屏怎么用」，应该落在桌面端章节；落到理财百科就说明
+    /// 映射写错了（复盘页是唯一的例外：它没有同名文档）。
+    #[test]
+    fn page_badges_prefer_the_desktop_chapter() {
+        for page in Page::ALL {
+            let slug = page.help_link().slug;
+            let in_desktop = content::page_id(slug)
+                .is_some_and(|(chapter, _)| content::CHAPTERS[chapter].title == "桌面端使用");
+            if page == Page::Performance {
+                assert!(!in_desktop, "复盘页本就没有桌面端文档，不该硬指过去");
+            } else {
+                assert!(
+                    in_desktop,
+                    "「{}」顶栏的问号落到了 `{slug}`，不在桌面端章节",
+                    page.label()
+                );
+            }
+        }
     }
 }

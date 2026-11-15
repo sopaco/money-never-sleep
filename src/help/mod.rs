@@ -7,6 +7,7 @@
 //! [`render::ImageCache`]).
 
 pub mod content;
+pub mod deeplink;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod markdown;
@@ -72,7 +73,40 @@ struct HelpGlobals {
 impl Global for HelpGlobals {}
 
 /// Runs the mns-help application (called from `src/bin/mns-help.rs`).
+///
+/// 命令行只做一件事：决定第一页。
+///
+/// ```text
+/// mns-help                         打开首页
+/// mns-help --page strategy-rebalance  直接翻到该页（slug 见 help/<slug>.md）
+/// ```
 pub fn run() {
+    // 启动时刻同时是「哪些跳页请求还算数」的分界线。
+    let started = std::time::SystemTime::now();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("用法: mns-help [--page <slug>]\n\n不带参数时打开帮助首页。");
+        return;
+    }
+    let requested = page_arg(&args);
+    let start = requested
+        .as_deref()
+        .and_then(content::page_id)
+        .unwrap_or((0, 0));
+    if let Some(slug) = requested.as_deref() {
+        match content::page(slug) {
+            // 冷启动的落点只能靠日志确认（窗口本身不说话），调试版留一行。
+            Some(page) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[mns-help] 起始页 {slug}（{}）", page.title);
+                #[cfg(not(debug_assertions))]
+                let _ = &page;
+            }
+            // 从 GUI 的 `?` 点进来时，这条日志就是「链接写错了」的唯一线索。
+            None => eprintln!("未知帮助页 `{slug}`，已打开首页"),
+        }
+    }
+
     // 单实例：已经在看帮助时再次双击，应该把已有窗口提到前面，而不是多开一个。
     let instance = match crate::single_instance::acquire("mns-help") {
         crate::single_instance::Acquired::Primary(guard) => guard,
@@ -138,7 +172,7 @@ pub fn run() {
                 ..Default::default()
             };
             let (window, view) =
-                gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| HelpShell::new()))
+                gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| HelpShell::new(start)))
                     .expect("open help window");
             // The viewer is a standalone process: nothing else will bring it to
             // the front (the tray spawns it as a child), and the menu bar only
@@ -179,7 +213,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             sync_app_menu_name(cx);
 
-            spawn_instance_watcher(cx, instance);
+            spawn_link_watcher(cx, instance, started);
         });
 }
 
@@ -242,17 +276,48 @@ fn help_menus() -> Vec<Menu> {
     ]
 }
 
-/// 轮询「二次启动」信号，把帮助窗口还原并置前。
-fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
+/// 轮询两件事：别处要求「唤起窗口」，以及别处要求「翻到某一页」。
+///
+/// Windows 上第二实例只留得下一个信号，翻页意图由 [`deeplink`] 的文件补足；
+/// macOS 没有单实例锁，GUI 靠子进程句柄保证不重复启动，翻页同样走文件。
+/// 两条来源合在一个循环里，是为了让「置前」和「翻页」发生在同一帧：先翻页
+/// 再置前，窗口被看见时已经停在目标页。
+fn spawn_link_watcher(
+    cx: &mut App,
+    guard: crate::single_instance::Guard,
+    started: std::time::SystemTime,
+) {
     cx.spawn(async move |cx| {
+        let mut watcher = deeplink::Watcher::since(deeplink::path(), started);
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(400))
                 .await;
-            if !guard.wakeup_requested() {
+            let requested = watcher.poll();
+            if requested.is_none() && !guard.wakeup_requested() {
                 continue;
             }
             let _ = cx.update(|cx| {
+                if let Some(slug) = requested.as_deref() {
+                    // 空串 = 只置前（GUI 顶栏的「帮助」按钮），不改变阅读位置。
+                    if let Some(target) = content::page_id(slug) {
+                        // 「点了问号没反应」是这条链路最可能的故障，留一行
+                        // 可追踪的痕迹：调试版从终端启动就能看见跳转发生了。
+                        #[cfg(debug_assertions)]
+                        eprintln!("[mns-help] 跳转到 {slug}");
+                        if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
+                            view.update(cx, |shell, cx| {
+                                shell.navigate(target);
+                                cx.notify();
+                            });
+                        }
+                    } else if !slug.is_empty() {
+                        eprintln!("[mns-help] 请求的页面 `{slug}` 不存在，停在当前页");
+                    }
+                }
+                // 从别的应用（例如 GUI）触发时，只有窗口层的 `activate_window`
+                // 未必能把整个应用带到前台，菜单栏还会留在原处。
+                cx.activate(true);
                 if let Some(window) = cx.global::<HelpGlobals>().window {
                     let _ = window.update(cx, |_, window, _| window.activate_window());
                 }
@@ -260,6 +325,27 @@ fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
         }
     })
     .detach();
+}
+
+/// 从命令行参数里取出目标页 slug。
+///
+/// 接受 `--page <slug>`、`--page=<slug>`，以及把 slug 直接作为第一个位置参数
+/// （方便在终端里 `mns-help strategy-sentiment` 试链接）。未知标志忽略，
+/// 校验留给调用方：那里才能决定「回首页并告警」还是别的降级。
+fn page_arg(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--page" {
+            return iter.next().cloned();
+        }
+        if let Some(slug) = arg.strip_prefix("--page=") {
+            return Some(slug.to_owned());
+        }
+        if !arg.starts_with('-') {
+            return Some(arg.clone());
+        }
+    }
+    None
 }
 
 /// A `(chapter, page)` index into [`content::CHAPTERS`].
@@ -276,7 +362,8 @@ pub(crate) struct HelpShell {
 }
 
 impl HelpShell {
-    fn new() -> Self {
+    /// `start` 是深链落点：从 GUI 的 `?` 或 `--page` 进来时不再是首页。
+    fn new(start: PageId) -> Self {
         let docs = content::CHAPTERS
             .iter()
             .map(|chapter| {
@@ -289,8 +376,9 @@ impl HelpShell {
             .collect();
         Self {
             expanded: content::CHAPTERS.iter().map(|_| true).collect(),
-            current: (0, 0),
-            history: vec![(0, 0)],
+            current: start,
+            // 历史从落点开始：用户按「后退」不该退到一份他没去过的首页。
+            history: vec![start],
             cursor: 0,
             docs,
             images: render::ImageCache::default(),
@@ -867,5 +955,32 @@ mod tests {
         );
         assert!(missing.is_empty(), "引用了磁盘上不存在的图片: {missing:?}");
         assert!(terse.is_empty(), "图注太短，读不出信息: {terse:?}");
+    }
+
+    /// 三种写法都要认，否则 GUI 的 `?` 与手工排查会走到两套行为。
+    #[test]
+    fn page_argument_accepts_the_documented_forms() {
+        fn parse(list: &[&str]) -> Option<String> {
+            let owned: Vec<String> = list.iter().map(|item| item.to_string()).collect();
+            page_arg(&owned)
+        }
+
+        assert_eq!(parse(&["--page", "start"]).as_deref(), Some("start"));
+        assert_eq!(parse(&["--page=start"]).as_deref(), Some("start"));
+        assert_eq!(parse(&["start"]).as_deref(), Some("start"));
+        assert_eq!(parse(&[]), None);
+        // 只有标志没有值时不该 panic，也不该把标志本身当成 slug。
+        assert_eq!(parse(&["--page"]), None);
+        assert_eq!(parse(&["--verbose", "start"]).as_deref(), Some("start"));
+    }
+
+    /// 深链落点要真的落在那一页，历史也从那里开始。
+    #[test]
+    fn deep_link_starts_on_the_requested_page() {
+        let target = content::page_id("strategy-rebalance").expect("slug 应能解析");
+        let shell = HelpShell::new(target);
+        assert_eq!(shell.current, target);
+        assert_eq!(shell.history, vec![target]);
+        assert_eq!(shell.page(shell.current).slug, "strategy-rebalance");
     }
 }

@@ -8,9 +8,10 @@ use crate::app::Snapshot;
 use crate::gui::AppShell;
 use crate::gui::chart;
 use crate::gui::components::*;
+use crate::gui::help_links;
 use crate::gui::theme::*;
 
-use super::{card_header, page_root, row};
+use super::{card_header, card_header_linked, page_root, row};
 
 pub fn render(shell: &AppShell, _cx: &mut Context<AppShell>) -> AnyElement {
     let mut root = page_root("page-performance");
@@ -142,7 +143,11 @@ fn discipline_card(data: &Snapshot) -> Div {
     let accent = if over { WARNING } else { ACCENT };
 
     card_pad()
-        .child(card_header("纪律复盘", "按流水标记统计"))
+        .child(card_header_linked(
+            "纪律复盘",
+            "按流水标记统计",
+            help_links::DISCIPLINE,
+        ))
         .child(
             div()
                 .v_flex()

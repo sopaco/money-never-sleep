@@ -7,12 +7,13 @@ use gpui_kit::*;
 use crate::app::{RebalanceView, Snapshot};
 use crate::gui::chart;
 use crate::gui::components::*;
+use crate::gui::help_links;
 use crate::gui::mood::Mood;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, CashKind, Page, TradeSide};
 use chrono::NaiveDate;
 
-use super::{card_header, notice, page_root, row};
+use super::{card_header, card_header_linked, notice, page_root, row};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     // 720 首屏预算：首页比其它页更紧一档（顶部留白与卡片间距各收 3-6px），
@@ -259,7 +260,11 @@ fn category_color(key: &str) -> u32 {
 fn allocation_card(data: &Snapshot) -> Div {
     // 独占满宽后不再需要 flex_1：那一份伸缩是给「与结论卡并排」准备的，
     // 放进纵向页面里会让卡片被拉高。
-    let mut card = card_pad().child(card_header("配置位置", "当前权重 / 目标权重"));
+    let mut card = card_pad().child(card_header_linked(
+        "配置位置",
+        "当前权重 / 目标权重",
+        help_links::TARGET_WEIGHT,
+    ));
     if data.total_assets <= 0.0 {
         return card.child(empty_state(
             IconName::Wallet,

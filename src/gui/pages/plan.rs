@@ -5,10 +5,11 @@ use gpui_kit::*;
 
 use crate::app::Snapshot;
 use crate::gui::components::*;
+use crate::gui::help_links;
 use crate::gui::theme::*;
 use crate::gui::{AppShell, Page};
 
-use super::{card_header, notice, page_root};
+use super::{card_header_linked, notice, page_root};
 
 pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     let mut root = page_root("page-plan");
@@ -229,7 +230,11 @@ fn legs_card(data: &Snapshot) -> Div {
     };
     let mut card = card_pad()
         .gap(px(0.))
-        .child(div().pb(px(10.)).child(card_header("分腿分配", "只买不卖")));
+        .child(div().pb(px(10.)).child(card_header_linked(
+            "分腿分配",
+            "只买不卖",
+            help_links::BAND_PER_LEG,
+        )));
 
     let header = div()
         .h_flex()
