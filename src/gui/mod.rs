@@ -1966,11 +1966,30 @@ thread_local! {
 }
 
 pub fn run() {
+    // 登录自启动带 `--tray`：只常驻托盘，不打开窗口。手动启动保持原行为。
+    let background = autostart::launched_in_background();
+    // 点通知拉起 / 守护进程 `launch_gui`：用户要的是管家会话，不是主界面。
+    let open_butler_at_start = std::env::args().any(|arg| arg == "--butler");
+
     // 单实例：常驻托盘的程序被重复双击时，用户要的是「把已有窗口提到前面」，
-    // 不是第二个进程。后启动的进程通知 Primary 后直接退出。
-    let instance = match crate::single_instance::acquire("mns-gui") {
+    // 不是第二个进程。后启动的进程通知 Primary 后直接退出；`--butler` 的
+    // 通知会落到「打开管家窗口」那条事件上，而不是只把主界面提到前面。
+    let intent = if open_butler_at_start {
+        crate::single_instance::Intent::OpenButler
+    } else {
+        crate::single_instance::Intent::Open
+    };
+    let instance = match crate::single_instance::acquire_with_intent("mns-gui", intent) {
         crate::single_instance::Acquired::Primary(guard) => guard,
-        crate::single_instance::Acquired::AlreadyRunning => return,
+        crate::single_instance::Acquired::AlreadyRunning => {
+            // 命名事件是主路径（Primary 还没建好事件或跑的是旧版本时可能落空），
+            // 本地通道再补一枪：新版本对重复的 OpenButler 只会把已有管家窗口
+            // 置前，不会开出第二个。普通启动保持只走事件，行为与之前一致。
+            if open_butler_at_start {
+                let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::OpenButler);
+            }
+            return;
+        }
     };
 
     // Finder 启动时进程 cwd 是 `/`（macOS 系统卷只读）。所有自有路径都已
@@ -1979,11 +1998,6 @@ pub fn run() {
     let data_dir = crate::config::app_data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::env::set_current_dir(&data_dir);
-
-    // 登录自启动带 `--tray`：只常驻托盘，不打开窗口。手动启动保持原行为。
-    let background = autostart::launched_in_background();
-    // 点通知拉起 / 守护进程 `launch_gui`：用户要的是管家会话，不是主界面。
-    let open_butler_at_start = std::env::args().any(|arg| arg == "--butler");
 
     // 安装位置可能在升级后变化，启动时按当前 exe 路径刷新一次登录项；
     // 关闭状态则不写入任何系统项。
@@ -2023,6 +2037,10 @@ pub fn run() {
         );
     }
 
+    // `--butler` 冷启动同样把主窗口建成隐藏载体：用户要的是管家会话，
+    // 不该先弹一次主界面。
+    let hidden = background || open_butler_at_start;
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .with_quit_mode(QuitMode::Explicit)
@@ -2032,7 +2050,7 @@ pub fn run() {
             cx.set_global(GuiState {
                 window: None,
                 window_id: None,
-                window_hidden: background,
+                window_hidden: hidden,
                 view: None,
                 butler_window: None,
                 butler_view: None,
@@ -2075,7 +2093,7 @@ pub fn run() {
             let open_requests = notify::init();
             // 后台启动也创建窗口，只是不显示：定时巡检与托盘简报都依赖
             // 窗口里的界面状态，隐藏窗口让它们保持可用，又不会弹到用户面前。
-            if let Err(error) = open_main_window(cx, None, !background) {
+            if let Err(error) = open_main_window(cx, None, !hidden) {
                 eprintln!("[mns-gui] failed to open window: {error}");
                 cx.quit();
                 return;
@@ -2104,12 +2122,13 @@ pub fn run() {
         });
 }
 
-/// 等待「又有人启动了 mns-gui」的信号，并把主窗口带回前台。
+/// 等待「又有人启动了 mns-gui」的信号，并按那次启动的意图唤起窗口。
 ///
-/// 与托盘菜单「打开 MNS」走同一条路径：窗口被关到托盘时 `ensure_window`
-/// 会按快照重建一个可见窗口；窗口只是被最小化或被压在后面时
-/// `Window::activate_window` 负责还原并置前（Windows 上 `App::activate`
-/// 是空实现）。
+/// `Intent::Open` 与托盘菜单「打开 MNS」走同一条路径：窗口被关到托盘时
+/// `ensure_window` 会按快照重建一个可见窗口；窗口只是被最小化或被压在后面
+/// 时 `Window::activate_window` 负责还原并置前（Windows 上 `App::activate`
+/// 是空实现）。`Intent::OpenButler`（`mns-gui --butler`）直接打开管家窗口，
+/// 与托盘里的「管家」入口共用 `open_butler_window`。
 ///
 /// 等待发生在专用线程上，阻塞在内核事件里：命中才醒，不做周期轮询。
 #[cfg(windows)]
@@ -2118,20 +2137,23 @@ fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
     let _ = std::thread::Builder::new()
         .name("mns-instance-watch".to_owned())
         .spawn(move || {
-            while guard.wait_wakeup() {
-                if tx.send(()).is_err() {
+            while let Some(intent) = guard.wait_wakeup() {
+                if tx.send(intent).is_err() {
                     return;
                 }
             }
         });
     cx.spawn(async move |cx| {
-        while requests.recv().await.is_some() {
-            let _ = cx.update(|cx| {
-                ensure_window(cx);
-                if let Some(handle) = cx.global::<GuiState>().window.clone() {
-                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+        while let Some(intent) = requests.recv().await {
+            let _ = cx.update(|cx| match intent {
+                crate::single_instance::Intent::Open => {
+                    ensure_window(cx);
+                    if let Some(handle) = cx.global::<GuiState>().window.clone() {
+                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    }
+                    cx.activate(true);
                 }
-                cx.activate(true);
+                crate::single_instance::Intent::OpenButler => open_butler_window(cx),
             });
         }
     })

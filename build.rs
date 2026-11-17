@@ -8,9 +8,11 @@
 //!
 //! Most binaries use `assets/app.ico`. `mns-help.exe` uses
 //! `assets/icon_help.ico` instead — the help viewer is a separate process and
-//! should not look like the main app in the taskbar. (The butler window lives
-//! inside `mns-gui.exe`, so it shares that process's icon; its avatar is drawn
-//! in the GUI itself and is not a system icon.)
+//! should not look like the main app in the taskbar. `mns-butler.exe` and
+//! `mns-butlerd.exe` use `assets/icon_butler.ico`: they are the butler's own
+//! processes, so Explorer / the task manager should show the butler face.
+//! (The butler *window* lives inside `mns-gui.exe`, so it shares that process's
+//! icon; its avatar is drawn in the GUI itself and is not a system icon.)
 //!
 //! Why not just call `WindowsResource::compile()` twice? Because that prints
 //! *global* link directives (`rustc-link-lib=static=resource` on GNU,
@@ -27,8 +29,10 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.ico");
     println!("cargo:rerun-if-changed=assets/icon_help.ico");
+    println!("cargo:rerun-if-changed=assets/icon_butler.ico");
     println!("cargo:rerun-if-changed=assets/app_icon.png");
     println!("cargo:rerun-if-changed=assets/icon_help.png");
+    println!("cargo:rerun-if-changed=assets/icon_butler.png");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -39,7 +43,8 @@ fn main() {
 
     let app_icon = manifest_dir.join("assets/app.ico");
     let help_icon = manifest_dir.join("assets/icon_help.ico");
-    for icon in [&app_icon, &help_icon] {
+    let butler_icon = manifest_dir.join("assets/icon_butler.ico");
+    for icon in [&app_icon, &help_icon, &butler_icon] {
         assert!(
             icon.is_file(),
             "missing Windows icon resource: {} (regenerate with scripts/make-icons.swift / scripts/make-help-ico.swift)",
@@ -50,12 +55,16 @@ fn main() {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV");
     let app_obj = compile_icon(&target_env, &out_dir, &app_icon, "app");
     let help_obj = compile_icon(&target_env, &out_dir, &help_icon, "help");
+    let butler_obj = compile_icon(&target_env, &out_dir, &butler_icon, "butler");
 
     // Attach exactly one icon to each binary. Keep this list in sync with the
     // [[bin]] targets in Cargo.toml: a binary with no link-arg gets Windows'
     // generic icon.
-    for bin in ["mns", "mns-gui", "mns-butler", "mns-butlerd"] {
+    for bin in ["mns", "mns-gui"] {
         println!("cargo:rustc-link-arg-bin={}={}", bin, app_obj.display());
+    }
+    for bin in ["mns-butler", "mns-butlerd"] {
+        println!("cargo:rustc-link-arg-bin={}={}", bin, butler_obj.display());
     }
     println!("cargo:rustc-link-arg-bin=mns-help={}", help_obj.display());
 }
