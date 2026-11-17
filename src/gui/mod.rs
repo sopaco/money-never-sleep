@@ -5,6 +5,7 @@
 //! modules the CLI uses. Background work runs in `jobs` and in the ACP runtime.
 
 mod autostart;
+mod butler;
 mod chart;
 // Theme and small building blocks are shared with the mns-help viewer.
 pub(crate) mod components;
@@ -28,6 +29,8 @@ use crate::agent::{
     save_settings, start_runtime,
 };
 use crate::app::{BuyGuardrail, PlanView, Snapshot};
+use crate::notify;
+use crate::quote::FundCandidate;
 
 /// 「缺标的」在 GUI 侧的下一步动作。引擎只存原因，去处由各界面拼：
 /// 持仓页一定有「添加标的」入口（空态与非空态各一处），计划页没有；
@@ -73,12 +76,14 @@ actions!(
         RunDefaultGoal,
         StopCurrentTask,
         QuitApplication,
+        StopButlerDaemon,
         CloseAgentPanel,
         CloseMainWindow,
         ShowAbout,
         RefreshData,
         OpenPlanPage,
         OpenAgentPage,
+        OpenButlerWindow,
         RunTodayReview,
         OpenHelpCenter
     ]
@@ -130,6 +135,18 @@ impl Page {
             Page::Performance => "复盘",
             Page::Agent => "助手",
             Page::Settings => "设置",
+        }
+    }
+
+    /// 稳定机器键。行为日志用它而不是中文标签：标签会改，日志要长期可读。
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Page::Dashboard => "dashboard",
+            Page::Portfolio => "portfolio",
+            Page::Plan => "plan",
+            Page::Performance => "performance",
+            Page::Agent => "agent",
+            Page::Settings => "settings",
         }
     }
 
@@ -217,10 +234,31 @@ pub(crate) struct GuardrailForm {
 }
 
 pub(crate) struct AssetForm {
+    /// 搜索框：代码或名称。
+    pub query: Entity<InputState>,
+    /// 已发出的关键词。worker 结果回来时按它对齐：慢响应不能覆盖后一次搜索。
+    pub searched: Option<String>,
+    pub searching: bool,
+    pub results: Vec<FundCandidate>,
+    /// 选中的候选。gpui-component 的 `InputState` 没有公开 setter，回填只能
+    /// 靠这份权威选择，不能把文字塞回输入框。
+    pub selected: Option<FundCandidate>,
+    /// 手填代码是一等入口：不搜索也能直接添加。
     pub code: Entity<InputState>,
     pub name: Entity<InputState>,
-    pub category: Entity<InputState>,
+    /// 三选一；None = 用户还没表态，提交会被退回。
+    pub category: Option<&'static str>,
     pub error: Option<String>,
+}
+
+/// 三条腿的短标签。「添加标的」的 chip 与建议文案共用一套说法。
+pub(crate) fn category_label(key: &str) -> &'static str {
+    match key {
+        "us_stocks" => "美股",
+        "cn_stocks" => "A 股",
+        "counter_cyclical" => "逆周期",
+        _ => "未归类",
+    }
 }
 
 pub(crate) enum Dialog {
@@ -455,6 +493,15 @@ struct GuiState {
     /// 的“显示”接口，用户点「打开 MNS」时按可见参数重建。
     window_hidden: bool,
     view: Option<Entity<AppShell>>,
+    /// 管家独立窗口与视图。与主窗口各存一份句柄，关闭其中一个不影响另一个。
+    butler_window: Option<AnyWindowHandle>,
+    butler_view: Option<Entity<butler::ButlerView>>,
+    /// 最近一条已授权但用户还没在窗口里看到的管家结论，用于托盘菜单。
+    butler_notice: Option<String>,
+    /// 管家守护进程是否在跑。在跑时巡检归它，GUI 只负责算事实与显示。
+    butler_daemon: bool,
+    /// 守护进程那条连接的 id；断开时要能辨认出是它，而不是别的临时连接。
+    butler_daemon_conn: Option<u64>,
     tray: Option<Tray>,
     jobs: Option<Jobs>,
     snapshot: Option<ShellSnapshot>,
@@ -487,6 +534,18 @@ pub(crate) struct AppShell {
     pub(crate) model: Entity<InputState>,
     pub(crate) daily_time: Entity<InputState>,
     pub(crate) monthly: Entity<InputState>,
+    /// 本地行为记录是否开启（设置页可关，见 `butler::events`）。
+    pub(crate) behavior_enabled: bool,
+    /// 管家主动开口是否开启（设置页可关，落到 `butler/state.json` 的策略里）。
+    pub(crate) butler_proactive: bool,
+    /// 管家频控的编辑框。数值落在 `config.toml` 的 `[butler]` 节。
+    pub(crate) butler_daily: Entity<InputState>,
+    pub(crate) butler_weekly: Entity<InputState>,
+    pub(crate) butler_dedupe: Entity<InputState>,
+    pub(crate) butler_quiet_start: Entity<InputState>,
+    pub(crate) butler_quiet_end: Entity<InputState>,
+    /// 记账成功后等新快照到达再唤醒管家；记的是那条行为日志的毫秒时间戳。
+    pending_ledger_wake: Option<String>,
     /// Date (`YYYY-MM-DD`) of the last scheduled review this process started.
     /// Set when the run is dispatched, not when it finishes: a failing review
     /// must not retry every minute for the rest of the day.
@@ -570,7 +629,9 @@ impl AppShell {
 
         // A config read is a single small TOML file; loading the whole account
         // here would put a database read on the UI thread.
-        let monthly_value = crate::config::AppConfig::load()
+        let config = crate::config::AppConfig::load().ok();
+        let monthly_value = config
+            .as_ref()
             .map(|config| {
                 if config.cashflow.monthly > 0.0 {
                     format!("{:.0}", config.cashflow.monthly)
@@ -585,7 +646,29 @@ impl AppShell {
                 .default_value(monthly_value)
         });
 
-        Self {
+        // 管家频控：启动时读一次配置。保存后由 worker 重写 config.toml 并
+        // 刷新快照；守护进程下一次判定会自己重新加载，不需要重启。
+        let butler_policy = config
+            .as_ref()
+            .map(|config| config.butler.clone())
+            .unwrap_or_default();
+        let butler_daily = cx.new(|cx| {
+            InputState::new(window, cx).default_value(butler_policy.daily_cap.to_string())
+        });
+        let butler_weekly = cx.new(|cx| {
+            InputState::new(window, cx).default_value(butler_policy.weekly_cap.to_string())
+        });
+        let butler_dedupe = cx.new(|cx| {
+            InputState::new(window, cx).default_value(butler_policy.dedupe_days.to_string())
+        });
+        let butler_quiet_start = cx.new(|cx| {
+            InputState::new(window, cx).default_value(butler_policy.quiet_start_hour.to_string())
+        });
+        let butler_quiet_end = cx.new(|cx| {
+            InputState::new(window, cx).default_value(butler_policy.quiet_end_hour.to_string())
+        });
+
+        let shell = Self {
             page: std::env::var("MNS_GUI_PAGE")
                 .ok()
                 .and_then(|key| {
@@ -611,6 +694,16 @@ impl AppShell {
             model,
             daily_time,
             monthly,
+            butler_daily,
+            butler_weekly,
+            butler_dedupe,
+            butler_quiet_start,
+            butler_quiet_end,
+            behavior_enabled: crate::butler::events::BehaviorSettings::load().enabled,
+            butler_proactive: crate::butler::Butler::load()
+                .map(|butler| butler.state.policy.enabled)
+                .unwrap_or(true),
+            pending_ledger_wake: None,
             last_daily: read_last_daily(),
             agent_panel: None,
             conversation_scroll: ScrollHandle::new(),
@@ -625,7 +718,18 @@ impl AppShell {
             viewing_history: None,
             report_expanded: false,
             live_agent: None,
-        }
+        };
+        // 启动即记一条：管家要能区分「今天开过应用」和「今天完全没看」。
+        // 开关关闭时 `append` 自己会跳过，这里不必再判一次。窗口重建也属于
+        // 同一次启动，所以用 `Once` 保证每个进程只记一次。
+        static APP_OPEN_ONCE: std::sync::Once = std::sync::Once::new();
+        APP_OPEN_ONCE.call_once(|| {
+            let _ = crate::butler::events::append(&crate::butler::events::BehaviorEvent::new(
+                crate::butler::events::kind::APP_OPEN,
+                serde_json::json!({}),
+            ));
+        });
+        shell
     }
 
     fn agent_snapshot(&self) -> ShellSnapshot {
@@ -686,6 +790,11 @@ impl AppShell {
     }
 
     pub(crate) fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page != page {
+            let _ = crate::butler::events::append(
+                &crate::butler::events::BehaviorEvent::page_view(page.key()),
+            );
+        }
         self.page = page;
         // A drawer belongs to the page that opened it; leaving must not leave
         // it hanging around when the user comes back.
@@ -877,6 +986,10 @@ impl AppShell {
         self.current_conversation = Some(ConversationMeta::new(match source {
             GoalSource::Manual => "手动",
             GoalSource::DailyReview => "每日巡检",
+            // Not reached from this shell today (the butler window owns its
+            // own session), but the enum is exhaustive on purpose: a new
+            // source must decide what the archive calls it.
+            GoalSource::Conversation => "管家对话",
         }));
         self.agent.timeline.clear();
         self.agent.streaming = None;
@@ -889,6 +1002,7 @@ impl AppShell {
         self.agent.detail = match source {
             GoalSource::Manual => "目标已提交，正在连接外部 Agent".to_owned(),
             GoalSource::DailyReview => "正在准备今日巡检".to_owned(),
+            GoalSource::Conversation => "正在连接管家 Agent".to_owned(),
         };
         // The user's own words stay in the transcript; a scheduled run shows a
         // label instead of dumping a several-thousand-character prompt.
@@ -1039,6 +1153,35 @@ impl AppShell {
         cx.notify();
     }
 
+    /// 保存管家频控。参数先在这里做粗校验，真正的合法性（每周 ≥ 每天、
+    /// 静音 0-24）由 `app::set_butler_policy` 与 `AppConfig::validate` 兜住，
+    /// 这样错误信息能落在 toast 上，而不是等下次启动才暴露。
+    pub(crate) fn save_butler_policy(&mut self, cx: &mut Context<Self>) {
+        let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
+        let daily = value(&self.butler_daily).parse::<usize>();
+        let weekly = value(&self.butler_weekly).parse::<usize>();
+        let dedupe = value(&self.butler_dedupe).parse::<i64>();
+        let quiet_start = value(&self.butler_quiet_start).parse::<u32>();
+        let quiet_end = value(&self.butler_quiet_end).parse::<u32>();
+        let (Ok(daily), Ok(weekly), Ok(dedupe), Ok(quiet_start), Ok(quiet_end)) =
+            (daily, weekly, dedupe, quiet_start, quiet_end)
+        else {
+            self.show_toast("频控参数必须是非负整数".to_owned(), ToastTone::Error, cx);
+            cx.notify();
+            return;
+        };
+        if let Err(error) = self.jobs.send(Request::SetButlerPolicy {
+            daily_cap: daily,
+            weekly_cap: weekly,
+            dedupe_days: dedupe,
+            quiet_start_hour: quiet_start,
+            quiet_end_hour: quiet_end,
+        }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
+    }
+
     fn agent_send(&self, command: AgentCommand) -> Result<(), String> {
         let handle = self
             .agent_handle()
@@ -1128,6 +1271,95 @@ impl AppShell {
                 ToastTone::Success,
                 cx,
             );
+        }
+        cx.notify();
+    }
+
+    /// 行为记录开关。只影响本机埋点，不影响记账与报告。
+    pub(crate) fn toggle_behavior_logging(&mut self, cx: &mut Context<Self>) {
+        let next = !self.behavior_enabled;
+        let settings = crate::butler::events::BehaviorSettings { enabled: next };
+        if let Err(error) = settings.save() {
+            self.show_toast(format!("行为记录设置失败：{error:#}"), ToastTone::Error, cx);
+            return;
+        }
+        self.behavior_enabled = next;
+        self.show_toast(
+            if next {
+                "已开启本地行为记录"
+            } else {
+                "已关闭本地行为记录"
+            }
+            .to_owned(),
+            ToastTone::Success,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 管家主动开口开关。关掉后唤醒与自整理照常，只是不再产生通知。
+    pub(crate) fn toggle_butler_proactive(&mut self, cx: &mut Context<Self>) {
+        let next = !self.butler_proactive;
+        // 守护进程在跑时 `state.json` 归它写：GUI 只发意图，不落盘——两个
+        // 进程同时写一份 JSON 会互相覆盖。
+        if cx.global::<GuiState>().butler_daemon {
+            let signal = crate::ipc::Signal::SetProactive { enabled: next };
+            if crate::ipc::poke("mns-butlerd", &signal).is_ok() {
+                self.butler_proactive = next;
+                self.show_toast(
+                    if next {
+                        "管家已开启主动开口"
+                    } else {
+                        "管家已停止主动开口"
+                    }
+                    .to_owned(),
+                    ToastTone::Success,
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+            // 连接刚断、`Disconnected` 事件还没到：当作没有守护进程处理。
+            let state = cx.global_mut::<GuiState>();
+            state.butler_daemon = false;
+            state.butler_daemon_conn = None;
+        }
+
+        let mut butler = match crate::butler::Butler::load() {
+            Ok(butler) => butler,
+            Err(error) => {
+                self.show_toast(
+                    format!("管家状态读取失败：{error:#}"),
+                    ToastTone::Error,
+                    cx,
+                );
+                return;
+            }
+        };
+        butler.state.policy.enabled = next;
+        if let Err(error) = butler.save() {
+            self.show_toast(format!("管家设置保存失败：{error:#}"), ToastTone::Error, cx);
+            return;
+        }
+        self.butler_proactive = next;
+        self.show_toast(
+            if next {
+                "管家已开启主动开口"
+            } else {
+                "管家已停止主动开口"
+            }
+            .to_owned(),
+            ToastTone::Success,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 清除行为记录。只删 `agent/events.jsonl`，不碰账本、报告与助手存档。
+    pub(crate) fn clear_behavior_log(&mut self, cx: &mut Context<Self>) {
+        match crate::butler::events::clear() {
+            Ok(()) => self.show_toast("已清除本地行为记录".to_owned(), ToastTone::Success, cx),
+            Err(error) => self.show_toast(format!("清除失败：{error:#}"), ToastTone::Error, cx),
         }
         cx.notify();
     }
@@ -1262,6 +1494,11 @@ impl AppShell {
                 self.data = Some(snapshot);
                 self.load_error = None;
                 self.loading = false;
+                // 每次加载都刷新管家事实：这是唯一一次「账户画面变了」，而
+                // 守护进程只读这份快照。没有账本事件时走定时巡检（`None`），
+                // 它会被 `WakeScheduler` 按间隔拦下，不会多说话。
+                let ledger = self.pending_ledger_wake.take();
+                cx.defer(move |cx| run_butler_wake_from(cx, ledger));
             }
             JobEvent::Loaded(Err(error)) => {
                 self.load_error = Some(error);
@@ -1285,6 +1522,11 @@ impl AppShell {
             JobEvent::Saved(message) => {
                 self.show_toast(message, ToastTone::Success, cx);
                 self.dialog = None;
+            }
+            JobEvent::LedgerRecorded(at) => {
+                // 记账成功后由随后的 `Loaded` 带着新快照触发一次判定：
+                // 在这里立即跑会读到上一笔的余额。
+                self.pending_ledger_wake = Some(at);
             }
             JobEvent::Initialized => {
                 self.show_toast(
@@ -1327,6 +1569,24 @@ impl AppShell {
                 self.agent.error = Some(error.clone());
                 self.agent
                     .push(EntryKind::Error, format!("无法生成今日报告：{error}"));
+            }
+            JobEvent::FundSearch { keyword, result } => {
+                // 只认当前这轮搜索：用户改词再搜后，上一轮慢响应直接丢弃。
+                if let Some(Dialog::AddAsset(form)) = self.dialog.as_mut()
+                    && form.searched.as_deref() == Some(keyword.as_str())
+                {
+                    form.searching = false;
+                    match result {
+                        Ok(rows) => {
+                            form.results = rows;
+                            form.error = None;
+                        }
+                        Err(error) => {
+                            form.results.clear();
+                            form.error = Some(error);
+                        }
+                    }
+                }
             }
             JobEvent::Conversations(Ok(rows)) => {
                 self.history = rows;
@@ -1510,19 +1770,44 @@ impl AppShell {
                 }
             }
             Dialog::AddAsset(form) => {
-                let code = form.code.read(cx).value().trim().to_owned();
-                let name = form.name.read(cx).value().trim().to_owned();
-                let category = form.category.read(cx).value().trim().to_owned();
-                if code.is_empty() || name.is_empty() {
-                    Err("代码与名称都要填写".to_owned())
-                } else if !crate::app::CATEGORY_KEYS.contains(&category.as_str()) {
-                    Err("分类填 us_stocks / cn_stocks / counter_cyclical".to_owned())
+                let (code, name, exchange_traded) = match &form.selected {
+                    Some(candidate) => (
+                        candidate.code.clone(),
+                        candidate.name.clone(),
+                        candidate.exchange_traded,
+                    ),
+                    None => (
+                        form.code.read(cx).value().trim().to_owned(),
+                        form.name.read(cx).value().trim().to_owned(),
+                        false,
+                    ),
+                };
+                // 类别不静默猜：建议只高亮 chip，提交必须由用户亲自选。
+                if code.is_empty() {
+                    Err("请搜索并选择一只基金，或直接填写代码".to_owned())
+                } else if exchange_traded {
+                    // 账本只记场外基金：场内 ETF/LOF 走证券账户，成本、份额、
+                    // 分红都不在 MNS 的口径里，硬塞进来只会让偏离算错。
+                    Err(
+                        "MNS 只记场外基金。场内 ETF/LOF 请在证券账户单独管理，\
+                         这里可以添加它对应的场外联接基金"
+                            .to_owned(),
+                    )
+                } else if name.is_empty()
+                    && !(code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()))
+                {
+                    // 6 位基金代码的名称允许留空，由 worker 自动带出；
+                    // 其它代码（如美股 ETF）没有可解析的名称来源。
+                    Err("非 6 位基金代码需要填写名称".to_owned())
                 } else {
-                    Ok(Request::AddAsset {
-                        code,
-                        name,
-                        category,
-                    })
+                    match form.category {
+                        Some(category) => Ok(Request::AddAsset {
+                            code,
+                            name,
+                            category: category.to_owned(),
+                        }),
+                        None => Err("请选择归属类别：美股 / A 股 / 逆周期".to_owned()),
+                    }
                 }
             }
         };
@@ -1585,6 +1870,11 @@ impl AppShell {
             self.send_buy(&code, shares, price, None, cx);
             return;
         }
+        // 护栏命中本身就是「计划外行为」信号：管家不阻断，但要记得发生过。
+        let _ = crate::butler::events::append(&crate::butler::events::BehaviorEvent::new(
+            crate::butler::events::kind::GUARD_HIT,
+            serde_json::json!({ "code": code.clone(), "amount": amount }),
+        ));
         let reason = cx.new(|cx| InputState::new(window, cx).placeholder("这笔买入和计划的关系？"));
         self.open_dialog(
             Dialog::Guardrail(GuardrailForm {
@@ -1692,6 +1982,8 @@ pub fn run() {
 
     // 登录自启动带 `--tray`：只常驻托盘，不打开窗口。手动启动保持原行为。
     let background = autostart::launched_in_background();
+    // 点通知拉起 / 守护进程 `launch_gui`：用户要的是管家会话，不是主界面。
+    let open_butler_at_start = std::env::args().any(|arg| arg == "--butler");
 
     // 安装位置可能在升级后变化，启动时按当前 exe 路径刷新一次登录项；
     // 关闭状态则不写入任何系统项。
@@ -1705,6 +1997,32 @@ pub fn run() {
     let (jobs, job_events) = Jobs::spawn();
     AGENT.with(|cell| *cell.borrow_mut() = Some(agent.clone()));
 
+    // 本地唤醒通道：管家守护进程与「二次启动」都从这条流进来。监听失败
+    // 只影响这两件事，不应挡住主流程（例如同一台机器上另一个用户的实例
+    // 已经占住了通道）。
+    let (ipc_listener, ipc_events) = match crate::ipc::listen("mns-gui") {
+        Ok((listener, events)) => (Some(listener), Some(events)),
+        Err(error) => {
+            eprintln!("[mns-gui] 本地唤醒通道不可用：{error}");
+            (None, None)
+        }
+    };
+    let _ipc_listener = ipc_listener;
+
+    // 管家守护进程：把「判定」放到独立进程里，主窗口关掉之后它继续守着
+    // （账本事件、到点任务、定时巡检）。已经在跑时不重复启动。没有守护
+    // 进程时（单文件开发构建、通道被占）才退回 GUI 内巡检。
+    let daemon_present = ensure_butler_daemon();
+
+    // GUI 重启后要立刻重新握手：守护进程上次连接已经断了，只有它主动
+    // `Hello` 才知道「现在有 GUI 可以投递」。这条 poke 触发它重连。
+    if daemon_present {
+        let _ = crate::ipc::poke(
+            "mns-butlerd",
+            &crate::ipc::Signal::Wake { ledger: None },
+        );
+    }
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .with_quit_mode(QuitMode::Explicit)
@@ -1716,6 +2034,11 @@ pub fn run() {
                 window_id: None,
                 window_hidden: background,
                 view: None,
+                butler_window: None,
+                butler_view: None,
+                butler_notice: None,
+                butler_daemon: daemon_present,
+                butler_daemon_conn: None,
                 tray: None,
                 jobs: Some(jobs.clone()),
                 snapshot: None,
@@ -1733,6 +2056,14 @@ pub fn run() {
                     state.window = None;
                     state.window_id = None;
                 }
+                if state
+                    .butler_window
+                    .as_ref()
+                    .is_some_and(|handle| handle.window_id() == closed)
+                {
+                    state.butler_window = None;
+                    state.butler_view = None;
+                }
             })
             .detach();
 
@@ -1741,6 +2072,7 @@ pub fn run() {
             if let Err(error) = setup_tray(cx) {
                 eprintln!("[mns-gui] tray unavailable: {error}");
             }
+            let open_requests = notify::init();
             // 后台启动也创建窗口，只是不显示：定时巡检与托盘简报都依赖
             // 窗口里的界面状态，隐藏窗口让它们保持可用，又不会弹到用户面前。
             if let Err(error) = open_main_window(cx, None, !background) {
@@ -1750,10 +2082,25 @@ pub fn run() {
             }
             refresh_tray(cx);
 
+            if open_butler_at_start {
+                open_butler_window(cx);
+            }
+
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
             spawn_daily_scheduler(cx);
+            spawn_butler_loop(cx);
+            spawn_notification_clicks(cx, open_requests);
+            if let Some(events) = ipc_events {
+                spawn_ipc_bridge(cx, events);
+            }
+            // 单实例的「有人又启动了」信号：Windows 用命名事件（互斥体 + 事件
+            // 在进程启动早期就判定完了，早于本地唤醒通道建好），macOS/Linux 由
+            // 系统保证不重复启动。两者都不再靠 400ms 轮询。
+            #[cfg(windows)]
             spawn_instance_watcher(cx, instance);
+            #[cfg(not(windows))]
+            drop(instance);
         });
 }
 
@@ -1763,15 +2110,22 @@ pub fn run() {
 /// 会按快照重建一个可见窗口；窗口只是被最小化或被压在后面时
 /// `Window::activate_window` 负责还原并置前（Windows 上 `App::activate`
 /// 是空实现）。
+///
+/// 等待发生在专用线程上，阻塞在内核事件里：命中才醒，不做周期轮询。
+#[cfg(windows)]
 fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(400))
-                .await;
-            if !guard.wakeup_requested() {
-                continue;
+    let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let _ = std::thread::Builder::new()
+        .name("mns-instance-watch".to_owned())
+        .spawn(move || {
+            while guard.wait_wakeup() {
+                if tx.send(()).is_err() {
+                    return;
+                }
             }
+        });
+    cx.spawn(async move |cx| {
+        while requests.recv().await.is_some() {
             let _ = cx.update(|cx| {
                 ensure_window(cx);
                 if let Some(handle) = cx.global::<GuiState>().window.clone() {
@@ -1817,8 +2171,382 @@ fn spawn_daily_scheduler(cx: &mut App) {
     .detach();
 }
 
-fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {
+/// 管家巡检循环。与每日巡检分开：管家有自己的 ≥4h 间隔与开口频控，状态
+/// 持久化在 `~/.mns/agent/butler/state.json`，重启不会重复开口。
+fn spawn_butler_loop(cx: &mut App) {
     cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(60))
+                .await;
+            let _ = cx.update(|cx| {
+                // 到点任务是独立唤醒源：4 小时的巡检间隔不该决定一条「到点
+                // 提醒」迟多久。有守护进程时这里会各自被它接管。
+                for id in due_task_ids() {
+                    run_butler_wake_with(cx, crate::butler::WakeSource::Task { id });
+                }
+                run_butler_wake(cx);
+            });
+        }
+    })
+    .detach();
+}
+
+/// 到点且还没被唤醒过的任务 id。去重由 `WakeScheduler` 兜底，这里只负责
+/// 「有哪些任务到点了」。
+fn due_task_ids() -> Vec<String> {
+    crate::butler::tasks::TaskBoard::load()
+        .map(|board| board.due(chrono::Local::now()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|task| task.id)
+        .collect()
+}
+
+/// 通知点击回调只置位，窗口由主线程打开——回调线程不能直接碰 GPUI。
+fn spawn_notification_clicks(
+    cx: &mut App,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    cx.spawn(async move |cx| {
+        // 挂起等事件，不做定时轮询：一次点击唤醒一次，空闲时零开销。
+        while requests.recv().await.is_some() {
+            cx.update(|cx| open_butler_window(cx));
+        }
+    })
+    .detach();
+}
+
+/// 本地唤醒通道的消费端。
+///
+/// `Open` 来自二次启动（等价于点托盘里的「打开 MNS」），`OpenButler` 来自
+/// 管家守护进程。连接断开会在 `Disconnected` 里体现——守护进程崩溃时这条
+/// 事件立刻到达，不需要心跳阈值。
+fn spawn_ipc_bridge(
+    cx: &mut App,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<crate::ipc::Event>,
+) {
+    cx.spawn(async move |cx| {
+        while let Some(event) = events.recv().await {
+            match event {
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Open) => {
+                    let _ = cx.update(|cx| {
+                        ensure_window(cx);
+                        cx.activate(true);
+                        refresh_tray(cx);
+                    });
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenButler) => {
+                    let _ = cx.update(|cx| open_butler_window(cx));
+                }
+                // 守护进程上线：它接手巡检与系统通知。GUI 让出通知 delegate，
+                // 否则同一 bundle 里会有两个 delegate，点击落到谁家是未定义的。
+                crate::ipc::Event::Signal(id, crate::ipc::Signal::Hello { role })
+                    if role == "daemon" =>
+                {
+                    let _ = cx.update(|cx| {
+                        eprintln!("[mns-gui] 管家守护进程上线，判定交给它");
+                        cx.global_mut::<GuiState>().butler_daemon = true;
+                        cx.global_mut::<GuiState>().butler_daemon_conn = Some(id);
+                        // GUI 关着的时候守护进程可能已经开口过：补齐会话。
+                        consume_pending(cx);
+                    });
+                }
+                // 守护进程刚开口，来读 `pending.jsonl`。
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Pending) => {
+                    let _ = cx.update(|cx| consume_pending(cx));
+                }
+                crate::ipc::Event::Disconnected(id) => {
+                    let _ = cx.update(|cx| {
+                        let state = cx.global_mut::<GuiState>();
+                        if state.butler_daemon_conn == Some(id) {
+                            eprintln!("[mns-gui] 管家守护进程离线，判定回到本进程");
+                            state.butler_daemon = false;
+                            state.butler_daemon_conn = None;
+                            run_butler_wake(cx);
+                        }
+                    });
+                }
+                crate::ipc::Event::Signal(_, _) | crate::ipc::Event::Connected(_) => {}
+            }
+        }
+    })
+    .detach();
+}
+
+/// 已消费到的 `pending.jsonl` 偏移。丢了就当 0，重读会去重。
+fn read_pending_offset() -> u64 {
+    std::fs::read_to_string(crate::butler::orchestrator::pending_offset_path())
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_pending_offset(offset: u64) {
+    let _ = crate::butler::store::write_json(
+        &crate::butler::orchestrator::pending_offset_path(),
+        &offset,
+    );
+}
+
+/// 把守护进程判定过的开口并进会话。
+///
+/// `conversation.json` 始终只有 GUI 一个写者：守护进程只往 `pending.jsonl`
+/// 追加，投递与去重都在这里完成。
+fn consume_pending(cx: &mut App) {
+    let offset = read_pending_offset();
+    let Ok((new_offset, notices)) = crate::butler::orchestrator::take_pending(offset) else {
+        return;
+    };
+    if notices.is_empty() {
+        return;
+    }
+
+    let now = chrono::Local::now();
+    let open = cx.global::<GuiState>().butler_view.clone();
+    let window_open = open.is_some();
+
+    // 先落盘、再推进偏移。反过来写的话，会话保存失败就等于消息永久丢失：
+    // 偏移已经越过它，下次也不会重投。
+    let persisted = match open {
+        Some(view) => {
+            // 窗口开着：用户看得见，直接进会话并算已读。
+            let saved = view.update(cx, |view, cx| {
+                let mut saved = true;
+                for notice in &notices {
+                    saved &= view.receive_notice(notice);
+                }
+                cx.notify();
+                saved
+            });
+            cx.global_mut::<GuiState>().butler_notice = None;
+            saved
+        }
+        None => match crate::butler::Session::load() {
+            Ok(mut session) => {
+                for notice in &notices {
+                    session.push(crate::butler::Message {
+                        at: notice.at,
+                        role: crate::butler::Role::Butler,
+                        text: notice.draft.clone(),
+                        reason: Some(notice.reason),
+                        trigger: Some(notice.trigger.clone()),
+                    });
+                }
+                match session.save() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("[mns-gui] butler session save failed: {error:#}");
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                // 存档读不出来：重投也读不出来，推进偏移避免每次启动都卡在
+                // 同一条上；原文件不覆盖，用户仍可自行修复。
+                eprintln!("[mns-gui] butler session unreadable: {error:#}");
+                true
+            }
+        },
+    };
+
+    if !persisted {
+        // 不推进偏移：下次启动重投这几条，总比静默丢掉强。
+        return;
+    }
+    write_pending_offset(new_offset);
+
+    if !window_open {
+        if let Some(last) = notices.last() {
+            cx.global_mut::<GuiState>().butler_notice = Some(last.draft.clone());
+        }
+        // 系统通知只能由本进程发（守护进程发会被系统拒绝），所以横幅在
+        // 这里补。只对刚产生的开口弹：启动时补齐的积压不该再响一遍。
+        if let Some(fresh) = notices
+            .iter()
+            .rev()
+            .find(|notice| now.signed_duration_since(notice.at) < chrono::Duration::minutes(5))
+        {
+            crate::notify::send(&fresh.draft);
+        }
+    }
+    refresh_tray(cx);
+}
+
+fn run_butler_wake(cx: &mut App) {
+    run_butler_wake_with(cx, crate::butler::WakeSource::Scheduled)
+}
+
+/// 账本事件用时间戳（毫秒）定位，构造唤醒源后走同一条判定路径。账本事件
+/// 不受定时巡检的 4 小时间隔约束——买完就该被看见，而不是等下一次巡检。
+fn run_butler_wake_from(cx: &mut App, ledger: Option<String>) {
+    let source = match ledger {
+        Some(id) => crate::butler::WakeSource::Ledger { id },
+        None => crate::butler::WakeSource::Scheduled,
+    };
+    run_butler_wake_with(cx, source)
+}
+
+fn run_butler_wake_with(cx: &mut App, source: crate::butler::WakeSource) {
+    let now = chrono::Local::now();
+    let facts = {
+        let Some(view) = cx.global::<GuiState>().view.clone() else {
+            return;
+        };
+        let shell = view.read(cx);
+        // 首屏还没加载完时不判定：空账户不是「没有偏离」，是「还不知道」。
+        if shell.data.is_none() {
+            return;
+        }
+        butler::facts_for(&shell, now)
+    };
+
+    // 事实先落盘：守护进程只读这一份，不碰数据库。GUI 自己做判定时也写，
+    // 因为「谁在判定」随时可能交接，事实不该有两份来源。
+    if let Err(error) = crate::butler::orchestrator::write_facts(now, &facts) {
+        eprintln!("[mns-gui] 管家事实落盘失败：{error:#}");
+    }
+
+    // 守护进程在跑：巡检归它，GUI 只负责算事实和显示。事实刚变过，叫它
+    // 立刻看一眼——它自己 5 分钟一次的 tick 太慢，用户刚记完账不该再等。
+    // 巡检间隔由它的 `WakeScheduler` 兜着，叫早了不会多说一句。
+    if cx.global::<GuiState>().butler_daemon {
+        let ledger = match &source {
+            crate::butler::WakeSource::Ledger { id } => Some(id.clone()),
+            _ => None,
+        };
+        if let Err(error) = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger }) {
+            eprintln!("[mns-gui] 管家守护进程暂不可达：{error}");
+        }
+        return;
+    }
+
+    let mut butler = match crate::butler::Butler::load() {
+        Ok(butler) => butler,
+        Err(error) => {
+            eprintln!("[mns-gui] butler state unreadable: {error:#}");
+            return;
+        }
+    };
+    let report = butler.wake(&source, now, &facts);
+    if report.wake != crate::butler::WakeVerdict::Wake {
+        return;
+    }
+    if let Err(error) = butler.save() {
+        eprintln!("[mns-gui] butler state save failed: {error:#}");
+    }
+
+    let Some(crate::butler::SpeakDecision::Speak(candidate)) = report.speak else {
+        return;
+    };
+
+    // 出站队列是「已授权开口」的审计记录：GUI 直接送达，也要留下同一行。
+    if let Err(error) = crate::butler::orchestrator::enqueue_notice(now, &candidate) {
+        eprintln!("[mns-gui] butler outbox append failed: {error:#}");
+    }
+
+    let open = cx.global::<GuiState>().butler_view.clone();
+    match open {
+        Some(view) => {
+            // 窗口开着，用户看得见，直接进会话并算已读。
+            view.update(cx, |view, cx| {
+                view.receive(&candidate);
+                cx.notify();
+            });
+            cx.global_mut::<GuiState>().butler_notice = None;
+        }
+        None => {
+            // 窗口没开：落进会话存档但不标已读，托盘菜单作为可点击的提示面。
+            if let Ok(mut session) = crate::butler::Session::load() {
+                session.push(crate::butler::Message {
+                    at: now,
+                    role: crate::butler::Role::Butler,
+                    text: candidate.draft.clone(),
+                    reason: Some(candidate.reason),
+                    trigger: Some(candidate.trigger.clone()),
+                });
+                if let Err(error) = session.save() {
+                    eprintln!("[mns-gui] butler session save failed: {error:#}");
+                }
+            }
+            cx.global_mut::<GuiState>().butler_notice = Some(candidate.draft.clone());
+            // 托盘是第一提示面，系统通知负责把话送到用户眼前；点击通知
+            // 回到管家窗口（`spawn_notification_clicks`）。
+            notify::send(&candidate.draft);
+        }
+    }
+    refresh_tray(cx);
+}
+
+fn open_butler_window(cx: &mut App) {
+    // 守护进程可能在 GUI 关着时已经开口：先把待投递的条目并进会话，
+    // 窗口打开时才能看到完整对话。
+    consume_pending(cx);
+    if let Some(handle) = cx.global::<GuiState>().butler_window.clone() {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+    } else {
+        let now = chrono::Local::now();
+        let facts = cx
+            .global::<GuiState>()
+            .view
+            .as_ref()
+            .map(|view| butler::facts_for(&view.read(cx), now))
+            .unwrap_or_default();
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("MNS · 管家".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::centered(size(px(760.), px(640.)), cx)),
+            ..Default::default()
+        };
+        match gpui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| butler::ButlerView::new(facts, window, cx))
+        }) {
+            Ok((handle, view)) => {
+                // 点击通知会让系统把整个 app 激活，隐藏的主窗口也会被一并还原；
+                // 管家窗口必须自己拿到焦点，否则用户点的是「管家」却看到主界面。
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+                // 对话走 ACP：事件流要在拿到 Entity 之后才能挂，构造期还
+                // 拿不到 weak。窗口关掉时 view 被 drop，runtime 随之 Shutdown。
+                if let Some(mut events) = view.update(cx, |view, _| view.take_chat_events()) {
+                    let weak = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        while let Some(event) = events.recv().await {
+                            if weak
+                                .update(cx, |view, cx| view.on_chat_event(event, cx))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                }
+                let state = cx.global_mut::<GuiState>();
+                state.butler_window = Some(handle);
+                state.butler_view = Some(view);
+            }
+            Err(error) => {
+                eprintln!("[mns-gui] failed to open butler window: {error}");
+                return;
+            }
+        }
+    }
+
+    // 打开即已读：托盘提示与未读数都清掉。
+    if let Ok(mut session) = crate::butler::Session::load() {
+        session.mark_read(chrono::Local::now());
+        let _ = session.save();
+    }
+    cx.global_mut::<GuiState>().butler_notice = None;
+    if let Some(view) = cx.global::<GuiState>().butler_view.clone() {
+        view.update(cx, |_, cx| cx.notify());
+    }
+    refresh_tray(cx);
+}
+
+fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {    cx.spawn(async move |cx| {
         while let Some(event) = events.recv().await {
             let _ = cx.update(|cx| {
                 let view = cx.global::<GuiState>().view.clone();
@@ -1881,8 +2609,12 @@ fn register_actions(cx: &mut App) {
     cx.set_menus(app_menus());
 
     cx.on_action(|_: &ShowMainWindow, cx| {
-        ensure_window(cx);
-        cx.activate(true);
+        // 从管家通知点进来时，用户要的是会话窗口，不是主界面：跳过还原主窗口，
+        // 让 `spawn_notification_clicks` 那只手去开管家。
+        if !notify::take_click_pending() {
+            ensure_window(cx);
+            cx.activate(true);
+        }
         refresh_tray(cx);
     });
     cx.on_action(|_: &CloseMainWindow, cx| {
@@ -1916,6 +2648,7 @@ fn register_actions(cx: &mut App) {
     });
     cx.on_action(|_: &OpenPlanPage, cx| open_page(cx, Page::Plan));
     cx.on_action(|_: &OpenAgentPage, cx| open_page(cx, Page::Agent));
+    cx.on_action(|_: &OpenButlerWindow, cx| open_butler_window(cx));
     cx.on_action(|_: &RunTodayReview, cx| {
         ensure_window(cx);
         cx.activate(true);
@@ -1941,6 +2674,12 @@ fn register_actions(cx: &mut App) {
     cx.on_action(|_: &OpenHelpCenter, _| {
         if let Err(error) = open_help_center(None) {
             eprintln!("启动 mns-help 失败：{error}");
+        }
+    });
+    cx.on_action(|_: &StopButlerDaemon, _| {
+        // 守护进程收到就退出；它的连接断开后 GUI 会收回通知与巡检。
+        if let Err(error) = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Shutdown) {
+            eprintln!("[mns-gui] 没有在运行的管家进程：{error}");
         }
     });
     cx.on_action(|_: &QuitApplication, cx| {
@@ -1978,10 +2717,44 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("本月计划", OpenPlanPage),
             MenuItem::action("助手结论", OpenAgentPage),
+            MenuItem::action("管家", OpenButlerWindow),
             MenuItem::separator(),
             MenuItem::action("帮助中心", OpenHelpCenter),
         ]),
     ]
+}
+
+/// 确认管家守护进程在跑；不在就拉起来。返回「现在有人判定」。
+///
+/// 用本地通道探活而不是查进程名：同名进程可能属于另一个干净的环境（例如
+/// 测试实例），认错了就会把判定权交空。
+fn ensure_butler_daemon() -> bool {
+    if crate::ipc::connect("mns-butlerd").is_ok() {
+        return true;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let daemon = dir.join(format!("mns-butlerd{}", std::env::consts::EXE_SUFFIX));
+    if !daemon.exists() {
+        // 单文件开发构建里可能没有这个二进制：退化成 GUI 内巡检，不报错。
+        return false;
+    }
+    if let Err(error) = command(&daemon).spawn() {
+        eprintln!("[mns-gui] 无法启动管家守护进程：{error}");
+        return false;
+    }
+    // 等它开始监听：判定权交早了会在两边各说一次，交晚了会漏一轮。
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if crate::ipc::connect("mns-butlerd").is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn open_page(cx: &mut App, page: Page) {
@@ -2360,10 +3133,33 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
     }
 
     items.push(MenuItem::separator());
+    let notice = cx.global::<GuiState>().butler_notice.clone();
+    if let Some(notice) = notice {
+        items.push(MenuItem::action(
+            format!("管家：{}", tray_line(&notice, 44)),
+            OpenButlerWindow,
+        ));
+    } else {
+        let unread = crate::butler::Session::load()
+            .map(|session| session.unread())
+            .unwrap_or(0);
+        let label = if unread > 0 {
+            format!("管家 · {unread} 条未读")
+        } else {
+            "打开管家".to_owned()
+        };
+        items.push(MenuItem::action(label, OpenButlerWindow));
+    }
+    items.push(MenuItem::separator());
     items.push(MenuItem::action("更新数据", RefreshData));
     items.push(MenuItem::action("打开 MNS", ShowMainWindow));
     items.push(MenuItem::action("帮助中心", OpenHelpCenter));
     items.push(MenuItem::action("关于 MNS", ShowAbout));
+    // 守护进程在跑时给它一个明确的出口：关掉 GUI 它仍然常驻，用户想彻底
+    // 停下来不该只能靠命令行 kill。
+    if cx.global::<GuiState>().butler_daemon {
+        items.push(MenuItem::action("停止管家进程", StopButlerDaemon));
+    }
     items.push(MenuItem::action("退出 MNS", QuitApplication));
     items
 }
@@ -2903,10 +3699,18 @@ impl AppShell {
         let code_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("资产代码，例如 007605")
-                .default_value(code)
+                .default_value(code.clone())
         });
         let shares = cx.new(|cx| InputState::new(window, cx).placeholder("例如 1669.62"));
         let price = cx.new(|cx| InputState::new(window, cx).placeholder("例如 1.2018"));
+        if side == TradeSide::Buy {
+            // 只记「打开了买入」，不记填了什么：管家关心的是冲动次数，
+            // 不是用户输入的草稿内容。
+            let _ = crate::butler::events::append(&crate::butler::events::BehaviorEvent::new(
+                crate::butler::events::kind::BUY_DIALOG,
+                serde_json::json!({ "code": code }),
+            ));
+        }
         self.open_dialog(
             Dialog::Trade(TradeForm {
                 side,
@@ -2939,29 +3743,112 @@ impl AppShell {
     }
 
     pub(crate) fn open_add_asset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let code = cx.new(|cx| InputState::new(window, cx).placeholder("例如 007605"));
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("例如 沪深300ETF联接"));
-        let category = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("us_stocks / cn_stocks / counter_cyclical")
-                .default_value("cn_stocks")
+        let query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("输入代码或名称，例如 007605 / 沪深300")
         });
+        let code = cx.new(|cx| InputState::new(window, cx).placeholder("例如 007605"));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("留空则按代码自动带出"));
         self.open_dialog(
             Dialog::AddAsset(AssetForm {
+                query,
+                searched: None,
+                searching: false,
+                results: Vec::new(),
+                selected: None,
                 code,
                 name,
-                category,
+                category: None,
                 error: None,
             }),
             cx,
         );
+    }
+
+    /// F5 搜索：只在 worker 里发网络请求，UI 线程不碰 IO。
+    pub(crate) fn start_fund_search(&mut self, cx: &mut Context<Self>) {
+        let keyword = {
+            let Some(Dialog::AddAsset(form)) = self.dialog.as_mut() else {
+                return;
+            };
+            let keyword = form.query.read(cx).value().trim().to_owned();
+            if keyword.is_empty() {
+                form.error = Some("先输入代码或名称".to_owned());
+                cx.notify();
+                return;
+            }
+            form.searching = true;
+            form.searched = Some(keyword.clone());
+            form.results.clear();
+            form.selected = None;
+            form.error = None;
+            keyword
+        };
+        if let Err(error) = self.jobs.send(Request::SearchFunds { keyword }) {
+            if let Some(Dialog::AddAsset(form)) = self.dialog.as_mut() {
+                form.searching = false;
+                form.error = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 再次点同一行取消选择——用户需要一个不重开弹层的撤销动作。
+    pub(crate) fn select_fund_candidate(
+        &mut self,
+        candidate: FundCandidate,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Dialog::AddAsset(form)) = self.dialog.as_mut() else {
+            return;
+        };
+        let same = form
+            .selected
+            .as_ref()
+            .is_some_and(|current| current.code == candidate.code);
+        form.selected = (!same).then_some(candidate);
+        // 类别跟着标走走：换了候选就作废旧选择，避免「美股」标签留在
+        // 一只 A 股指数基金上——这比多让用户点一次危险得多。
+        if !same {
+            form.category = None;
+        }
+        form.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn clear_fund_candidate(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::AddAsset(form)) = self.dialog.as_mut() else {
+            return;
+        };
+        form.selected = None;
+        form.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn select_asset_category(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        let Some(Dialog::AddAsset(form)) = self.dialog.as_mut() else {
+            return;
+        };
+        form.category = Some(key);
+        form.error = None;
+        cx.notify();
+    }
+
+    /// F7 空账户清单「收起」：只落一个 bool，不存步骤状态——清单本身永远
+    /// 由数据派生（现金 / 持仓 / 报告），所以不存在「清单说我做完了但数据
+    /// 说没做」这种第二事实源。
+    pub(crate) fn dismiss_start_checklist(&mut self, cx: &mut Context<Self>) {
+        self.agent_settings.hide_start_checklist = true;
+        if let Err(error) = save_settings(&self.agent_settings) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
     }
 }
 
 fn dialog_shell(
     title: &'static str,
     subtitle: &'static str,
-    body: Vec<Div>,
+    body: Vec<AnyElement>,
     error: Option<String>,
 ) -> Div {
     let mut heading = div().v_flex().gap(px(3.)).child(
@@ -3010,7 +3897,7 @@ fn trade_dialog(form: &TradeForm, _window: &mut Window, cx: &mut Context<AppShel
         form.side.label(),
         "现金与持仓将同步更新",
         vec![
-            field("代码", Input::new(&form.code)),
+            field("代码", Input::new(&form.code)).into_any_element(),
             div()
                 .h_flex()
                 .gap(px(10.))
@@ -3019,7 +3906,8 @@ fn trade_dialog(form: &TradeForm, _window: &mut Window, cx: &mut Context<AppShel
                         .flex_1()
                         .child(field("份额", Input::new(&form.shares))),
                 )
-                .child(div().flex_1().child(field("价格", Input::new(&form.price)))),
+                .child(div().flex_1().child(field("价格", Input::new(&form.price))))
+                .into_any_element(),
         ],
         form.error.clone(),
     )
@@ -3082,8 +3970,9 @@ fn guardrail_dialog(form: &GuardrailForm, _window: &mut Window, cx: &mut Context
                         .text_size(px(12.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(line)
-                })),
-            field(reason_label, Input::new(&form.reason)),
+                }))
+                .into_any_element(),
+            field(reason_label, Input::new(&form.reason)).into_any_element(),
         ],
         form.error.clone(),
     )
@@ -3118,8 +4007,8 @@ fn cash_dialog(form: &CashForm, _window: &mut Window, cx: &mut Context<AppShell>
         title,
         subtitle,
         vec![
-            field("金额", Input::new(&form.amount)),
-            field("备注", Input::new(&form.note)),
+            field("金额", Input::new(&form.amount)).into_any_element(),
+            field("备注", Input::new(&form.note)).into_any_element(),
         ],
         form.error.clone(),
     )
@@ -3143,15 +4032,290 @@ fn cash_dialog(form: &CashForm, _window: &mut Window, cx: &mut Context<AppShell>
     )
 }
 
+/// 可点 chip：白底 + 描边。
+///
+/// 组件库的 compact 按钮在白色卡片上填充色与卡片几乎同色，用户看不出
+/// 「这里能点」。类别三选一与行内动作改用这套自绘 chip；选中态换主色
+/// 描边 + 主色浅底。
+fn bordered_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    fg: u32,
+    bg: u32,
+    border: u32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .px(px(12.))
+        .py(px(5.))
+        .rounded(px(999.))
+        .border_1()
+        .border_color(rgb(border))
+        .bg(rgb(bg))
+        .text_size(px(12.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .child(label.into())
+}
+
 fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShell>) -> Div {
+    let mut body: Vec<AnyElement> = Vec::new();
+
+    // ── 搜索 ────────────────────────────────────────────────────────
+    body.push(
+        div()
+            .h_flex()
+            .gap(px(8.))
+            .items_end()
+            .child(
+                div()
+                    .flex_1()
+                    .child(field("搜索基金（代码或名称）", Input::new(&form.query))),
+            )
+            .child(
+                Button::new("asset-search")
+                    .compact()
+                    .primary()
+                    .label(if form.searching { "搜索中…" } else { "搜索" })
+                    .disabled(form.searching)
+                    .on_click(cx.listener(|shell, _, _, cx| shell.start_fund_search(cx))),
+            )
+            .into_any_element(),
+    );
+
+    if form.searching {
+        body.push(caption("正在搜索…").into_any_element());
+    } else if form.results.is_empty() {
+        if form.searched.is_some() {
+            body.push(caption("没有找到基金。换个代码或关键词试试。").into_any_element());
+        }
+    } else {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, candidate) in form.results.iter().enumerate() {
+            let active = form
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.code == candidate.code);
+            let candidate = candidate.clone();
+            let picked = candidate.clone();
+            let row = div()
+                .id(("asset-result", index))
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(RADIUS_SM))
+                .bg(rgb(if active { ACCENT_SOFT } else { LAYER }))
+                .border_1()
+                .border_color(rgb(if active { ACCENT } else { BORDER }))
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |shell, _, _, cx| {
+                        shell.select_fund_candidate(picked.clone(), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("{} {}", candidate.code, candidate.name)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .child(format!(
+                                    "{} · {}",
+                                    candidate.fund_type, candidate.company
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .items_end()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_family(mono_family())
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(
+                                    candidate
+                                        .nav
+                                        .map(|nav| format!("{nav:.4}"))
+                                        .unwrap_or_else(|| "—".to_owned()),
+                                ),
+                        )
+                        .child(if candidate.exchange_traded {
+                            pill("场内·不收", WARNING, WARNING_SOFT)
+                        } else {
+                            pill("场外", TEXT_SECONDARY, NEUTRAL_SOFT)
+                        }),
+                );
+            rows.push(row.into_any_element());
+        }
+        body.push(
+            div()
+                .id("asset-results")
+                .v_flex()
+                .gap(px(4.))
+                .max_h(px(168.))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element(),
+        );
+    }
+
+    // ── 已选 / 建议 ─────────────────────────────────────────────────
+    if let Some(candidate) = &form.selected {
+        body.push(
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(RADIUS_SM))
+                .bg(rgb(ACCENT_TINT))
+                .border_1()
+                .border_color(rgb(ACCENT_SOFT))
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("已选：{} {}", candidate.code, candidate.name)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(if candidate.exchange_traded {
+                                    "场外没有对应联接基金的话，这只就不能在 MNS 里跟踪。"
+                                } else {
+                                    candidate.hint
+                                }),
+                        ),
+                )
+                .child(
+                    bordered_chip("asset-clear", "清除", TEXT_SECONDARY, SURFACE, BORDER).on_click(
+                        cx.listener(|shell, _, _, cx| shell.clear_fund_candidate(cx)),
+                    ),
+                )
+                .into_any_element(),
+        );
+    }
+
+    // ── 类别：三选一，默认不选 ──────────────────────────────────────
+    let suggested = form.selected.as_ref().and_then(|candidate| candidate.suggested);
+    let blocked = form
+        .selected
+        .as_ref()
+        .is_some_and(|candidate| candidate.exchange_traded);
+    let mut chips: Vec<AnyElement> = Vec::new();
+    for key in crate::app::CATEGORY_KEYS {
+        let active = form.category == Some(key);
+        let hint = suggested == Some(key);
+        let label = if hint {
+            format!("{} · 建议", category_label(key))
+        } else {
+            category_label(key).to_owned()
+        };
+        let (fg, bg, border) = if active {
+            (ACCENT, ACCENT_SOFT, ACCENT)
+        } else if hint {
+            // 建议只是提示，不等于选中：浅底 + 主色字，但提交仍要用户亲点。
+            (ACCENT, ACCENT_TINT, ACCENT_SOFT)
+        } else {
+            (TEXT, SURFACE, BORDER)
+        };
+        chips.push(
+            bordered_chip(format!("asset-category-{key}"), label, fg, bg, border)
+                .on_click(cx.listener(move |shell, _, _, cx| shell.select_asset_category(key, cx)))
+                .into_any_element(),
+        );
+    }
+    if !blocked {
+        body.push(
+            div()
+                .v_flex()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child("归属类别"),
+                )
+                .child(div().h_flex().gap(px(6.)).children(chips))
+                .into_any_element(),
+        );
+    }
+
+    // 场内不进账本：这里只解释原因，不给「仍要添加」的出口。
+    if blocked {
+        body.push(
+            div()
+                .v_flex()
+                .gap(px(4.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(RADIUS_SM))
+                .bg(rgb(WARNING_SOFT))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(WARNING))
+                        .child("这是场内标的（ETF/LOF），MNS 不收。"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(WARNING))
+                        .child("场内要在证券账户按市价交易，成本与份额都不在 MNS 的口径里。请改选它对应的场外联接基金。"),
+                )
+                .into_any_element(),
+        );
+    }
+
+    // ── 手填：一等入口（选中候选时隐藏，避免两套输入打架） ──────────
+    if form.selected.is_none() {
+        body.push(
+            div()
+                .v_flex()
+                .gap(px(8.))
+                .child(caption("或直接填写。6 位基金代码可留空名称，保存时自动带出。"))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap(px(8.))
+                        .child(div().flex_1().child(field("代码", Input::new(&form.code))))
+                        .child(div().flex_1().child(field("名称", Input::new(&form.name)))),
+                )
+                .into_any_element(),
+        );
+    }
+
     dialog_shell(
         "添加标的",
-        "",
-        vec![
-            field("代码", Input::new(&form.code)),
-            field("名称", Input::new(&form.name)),
-            field("分类", Input::new(&form.category)),
-        ],
+        "只记录成本，不代下单",
+        body,
         form.error.clone(),
     )
     .child(

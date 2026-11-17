@@ -163,7 +163,9 @@ pub fn parse(source: &str) -> Vec<Block> {
 
         // Thematic break.
         if (trimmed.starts_with("---") || trimmed.starts_with("***"))
-            && trimmed.chars().all(|c| c == '-' || c == '*' || c.is_whitespace())
+            && trimmed
+                .chars()
+                .all(|c| c == '-' || c == '*' || c.is_whitespace())
         {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::Hr);
@@ -199,9 +201,7 @@ pub fn parse(source: &str) -> Vec<Block> {
         }
 
         // Table: a header row followed by a GFM separator row.
-        if trimmed.starts_with('|')
-            && i + 1 < lines.len()
-            && is_separator_row(lines[i + 1].trim())
+        if trimmed.starts_with('|') && i + 1 < lines.len() && is_separator_row(lines[i + 1].trim())
         {
             flush_paragraph(&mut paragraph, &mut blocks);
             let aligns = parse_separator_row(lines[i + 1].trim());

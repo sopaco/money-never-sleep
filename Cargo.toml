@@ -1,6 +1,6 @@
 [package]
 name = "money-never-sleep"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "AI-Powered Contrarian Investment Decision Assistant"
 license = "MIT"
@@ -27,11 +27,34 @@ name = "mns-help"
 path = "src/bin/mns-help.rs"
 required-features = ["gui"]
 
+# Butler 确定性内核的终端入口（唤醒/开口判定/记忆/任务）。
+[[bin]]
+name = "mns-butler"
+path = "src/bin/mns-butler.rs"
+
+# Butler daemon: keeps evaluating wake sources (schedule / ledger / tasks) and
+# delivering notifications after the GUI window is closed. Reads `facts.json`
+# written by the GUI; never opens the ledger database.
+#
+# `agent` is required: when the deterministic kernel has nothing to say, the
+# daemon may ask the external ACP agent for one short line (`agent-init`).
+[[bin]]
+name = "mns-butlerd"
+path = "src/bin/mns-butlerd.rs"
+required-features = ["agent"]
+
 # Headless verification of the ACP chain used by the GUI:
 #   cargo run --example agent_smoke --features agent
 [[example]]
 name = "agent_smoke"
 path = "examples/agent_smoke.rs"
+required-features = ["agent"]
+
+# Butler-window dialogue chain (persona + follow-up on one session):
+#   cargo run --example butler_talk_smoke --features agent
+[[example]]
+name = "butler_talk_smoke"
+path = "examples/butler_talk_smoke.rs"
 required-features = ["agent"]
 
 [features]
@@ -56,6 +79,11 @@ gui-test = ["gui", "gpui-pre/test-support"]
 # gpui-pre-macos, so this adds no extra compile unit.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+# 系统通知：UNUserNotificationCenter 是 macOS 10.14+ 的正式入口，允许本地
+# 未公证包弹横幅；`objc2` 只提供运行时，类绑定要单独引入。
+objc2-foundation = "0.3"
+objc2-user-notifications = "0.3"
+block2 = "0.6"
 
 [build-dependencies]
 # 把 assets/app.ico 编成 exe 的 RT_GROUP_ICON #1 资源。GPUI 的 Windows 后端

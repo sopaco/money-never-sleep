@@ -23,8 +23,24 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     match (&shell.data, &shell.load_error) {
         (Some(data), _) => {
             let mood = Mood::resolve(Some(data));
-            if data.positions.is_empty() && data.cash.abs() < 0.005 {
-                root = root.child(start_card(cx));
+            // F7：清单由数据派生，只有「收起」是一个持久化 bool。
+            let done = [
+                data.cash > 0.005,
+                !data.positions.is_empty(),
+                data.latest_report.is_some(),
+            ];
+            let completed = done.iter().filter(|step| **step).count();
+            let show_checklist =
+                !shell.agent_settings.hide_start_checklist && completed < 3;
+            // 720 首屏预算：全空账户只放清单；部分完成时先看账户，再把
+            // 剩下的步骤压成一条细条，不让引导挤掉曲线卡。
+            if show_checklist {
+                if completed == 0 {
+                    root = root.child(start_checklist(done, cx));
+                } else {
+                    root = root.child(hero(data));
+                    root = root.child(start_strip(done, cx));
+                }
             } else {
                 root = root.child(hero(data));
             }
@@ -262,7 +278,7 @@ fn allocation_card(data: &Snapshot) -> Div {
     // 放进纵向页面里会让卡片被拉高。
     let mut card = card_pad().child(card_header_linked(
         "配置位置",
-        "当前权重 / 目标权重",
+        "当前权重 / 目标权重（不含本月新钱）",
         help_links::TARGET_WEIGHT,
     ));
     if data.total_assets <= 0.0 {
@@ -833,64 +849,174 @@ fn report_card(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
     card
 }
 
-fn start_card(cx: &mut Context<AppShell>) -> Div {
-    let step = |index: &'static str, title: &'static str, body: &'static str| {
-        div()
-            .v_flex()
-            .flex_1()
-            .gap(px(4.))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(ACCENT))
-                    .child(index),
-            )
-            .child(
-                div()
-                    .text_size(px(13.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(body),
-            )
+/// F7 空账户清单：每一步都从数据派生（现金 / 持仓 / 报告），只有「收起」
+/// 落库。这样清单不会变成第二事实源，也不会把「还没做」永远挂在首页。
+/// 部分完成时的细条：只说还差什么，不重铺整张清单。
+fn start_strip(done: [bool; 3], cx: &mut Context<AppShell>) -> Div {
+    let labels = ["入金", "添加标的", "生成报告"];
+    let missing: Vec<&str> = labels
+        .iter()
+        .zip(done)
+        .filter(|(_, done)| !done)
+        .map(|(label, _)| *label)
+        .collect();
+
+    let action = if !done[0] {
+        Button::new("strip-start")
+            .compact()
+            .label("去完成")
+            .on_click(cx.listener(|shell, _, window, cx| {
+                shell.open_cash(CashKind::Deposit, window, cx);
+            }))
+            .into_any_element()
+    } else if !done[1] {
+        Button::new("strip-start")
+            .compact()
+            .label("去完成")
+            .on_click(cx.listener(|shell, _, window, cx| {
+                shell.open_add_asset(window, cx);
+            }))
+            .into_any_element()
+    } else {
+        Button::new("strip-start")
+            .compact()
+            .label("更新数据")
+            .on_click(cx.listener(|shell, _, _, cx| shell.refresh(cx)))
+            .into_any_element()
     };
 
     card_pad()
-        .gap(px(14.))
-        .child(div().v_flex().gap(px(3.)).child(section_title("三步开始")))
+        .h_flex()
+        .items_center()
+        .gap(px(10.))
+        .p(px(12.))
+        .py(px(10.))
+        .child(dot(WARNING))
         .child(
             div()
-                .h_flex()
-                .gap(px(20.))
-                .items_start()
-                .child(step("01", "入金", "登记转入账户的资金。"))
-                .child(step("02", "添加标的并买入", "建标的后记录实际成交。"))
-                .child(step("03", "更新数据", "抓取价格与情绪。")),
+                .flex_1()
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(format!("还差 {} 步：{}", missing.len(), missing.join("、"))),
         )
+        .child(action)
+        .child(
+            Button::new("strip-dismiss")
+                .compact()
+                .label("收起")
+                .on_click(cx.listener(|shell, _, _, cx| shell.dismiss_start_checklist(cx))),
+        )
+}
+
+fn start_checklist(done: [bool; 3], cx: &mut Context<AppShell>) -> Div {
+    let completed = done.iter().filter(|step| **step).count();
+
+    let row = |done: bool,
+               title: &'static str,
+               body: &'static str,
+               action: Option<AnyElement>| {
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .child(
+                div()
+                    .h(px(18.))
+                    .w(px(18.))
+                    .rounded(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(if done { SUCCESS_SOFT } else { NEUTRAL_SOFT }))
+                    .text_size(px(11.))
+                    .text_color(rgb(if done { SUCCESS } else { TEXT_TERTIARY }))
+                    .child(if done { "✓" } else { "·" }),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if done { TEXT_SECONDARY } else { TEXT }))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(TEXT_TERTIARY))
+                            .child(body),
+                    ),
+            )
+            .children(action)
+    };
+
+    let deposit = (!done[0]).then(|| {
+        Button::new("checklist-deposit")
+            .compact()
+            .primary()
+            .label("入金")
+            .on_click(cx.listener(|shell, _, window, cx| {
+                shell.open_cash(CashKind::Deposit, window, cx);
+            }))
+            .into_any_element()
+    });
+    let asset = (!done[1]).then(|| {
+        Button::new("checklist-asset")
+            .compact()
+            .label("添加标的")
+            .on_click(cx.listener(|shell, _, window, cx| {
+                shell.open_add_asset(window, cx);
+            }))
+            .into_any_element()
+    });
+    let report = (!done[2]).then(|| {
+        Button::new("checklist-report")
+            .compact()
+            .label("更新数据")
+            .on_click(cx.listener(|shell, _, _, cx| shell.refresh(cx)))
+            .into_any_element()
+    });
+
+    card_pad()
+        .gap(px(10.))
         .child(
             div()
                 .h_flex()
-                .gap(px(8.))
+                .items_center()
+                .justify_between()
                 .child(
-                    Button::new("start-deposit")
-                        .primary()
-                        .label("入金")
-                        .on_click(cx.listener(|shell, _, window, cx| {
-                            shell.open_cash(CashKind::Deposit, window, cx);
-                        })),
+                    div()
+                        .v_flex()
+                        .gap(px(2.))
+                        .child(section_title("先把账户跑起来"))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .child(format!("{completed}/3 已完成，这里只显示还缺什么")),
+                        ),
                 )
                 .child(
-                    Button::new("start-asset")
-                        .label("添加标的")
-                        .on_click(cx.listener(|shell, _, window, cx| {
-                            shell.open_add_asset(window, cx);
-                        })),
+                    Button::new("checklist-dismiss")
+                        .compact()
+                        .label("收起")
+                        .on_click(
+                            cx.listener(|shell, _, _, cx| shell.dismiss_start_checklist(cx)),
+                        ),
                 ),
         )
+        .child(row(done[0], "入金", "登记转入账户的资金。", deposit))
+        .child(row(done[1], "添加标的", "先建标的，再记录实际成交。", asset))
+        .child(row(
+            done[2],
+            "生成第一份报告",
+            "抓取价格与情绪，留下决策记录。",
+            report,
+        ))
 }
 
 fn skeleton() -> Div {

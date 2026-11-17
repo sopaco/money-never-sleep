@@ -63,6 +63,7 @@ pub const CHAPTERS: &[Chapter] = &[
             page!("desktop-portfolio", "持仓与账本"),
             page!("desktop-plan", "计划页"),
             page!("desktop-agent", "AI 助手"),
+            page!("desktop-butler", "管家"),
             page!("desktop-settings", "托盘、自启动与设置"),
         ],
     },
@@ -72,6 +73,7 @@ pub const CHAPTERS: &[Chapter] = &[
         pages: &[
             page!("cli-quickstart", "快速上手"),
             page!("cli-reference", "命令参考"),
+            page!("cli-butler", "管家审计（mns-butler）"),
             page!("cli-backtest", "回测与历史审计"),
         ],
     },

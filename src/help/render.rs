@@ -7,15 +7,15 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
 use gpui_kit::{
-    div, img, px, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
-    IntoElement, ParentElement, Pixels, SharedString, Styled, StyledText, UnderlineStyle,
+    AnyElement, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat, IntoElement,
+    ParentElement, Pixels, SharedString, Styled, StyledText, UnderlineStyle, div, img, px, rgb,
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::gui::components::mono_family;
 use crate::gui::theme::{
-    ACCENT, ACCENT_SOFT, BORDER, DANGER, DANGER_SOFT, DIVIDER, LAYER, SUCCESS, SUCCESS_SOFT,
-    TEXT, TEXT_SECONDARY, TEXT_TERTIARY, WARNING, WARNING_SOFT, RADIUS, RADIUS_SM,
+    ACCENT, ACCENT_SOFT, BORDER, DANGER, DANGER_SOFT, DIVIDER, LAYER, RADIUS, RADIUS_SM, SUCCESS,
+    SUCCESS_SOFT, TEXT, TEXT_SECONDARY, TEXT_TERTIARY, WARNING, WARNING_SOFT,
 };
 
 use super::markdown::{Align, Block, Callout, ListItem, Span};
@@ -100,8 +100,7 @@ impl ImageCache {
 /// the start of the file, so this stays a few dozen lines instead of pulling a
 /// decoder into the help viewer.
 fn image_aspect(bytes: &[u8]) -> Option<f32> {
-    let (width, height) = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-    {
+    let (width, height) = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
         // PNG: IHDR is the first chunk, width/height are big-endian u32 at 16/20.
         let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
         let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
@@ -437,11 +436,11 @@ fn render_table(aligns: &[Align], rows: &[Vec<Vec<Span>>]) -> gpui_kit::Div {
         .overflow_hidden();
     for (row_index, row) in rows.iter().enumerate() {
         let header = row_index == 0;
-        let mut row_el = div().h_flex().w_full().bg(if header {
-            rgb(LAYER)
-        } else {
-            rgb(0xffffff)
-        });
+        let mut row_el =
+            div()
+                .h_flex()
+                .w_full()
+                .bg(if header { rgb(LAYER) } else { rgb(0xffffff) });
         for (col, cell) in row.iter().enumerate() {
             let weight = weights.get(col).copied().unwrap_or(1.0);
             let mut cell_el = div()

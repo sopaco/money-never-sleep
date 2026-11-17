@@ -404,6 +404,28 @@ pub fn ensure_initialized() -> Result<bool> {
     Ok(true)
 }
 
+/// 记账之后刷新管家事实，并在守护进程在跑时叫醒它。
+///
+/// GUI 有自己的热快照，走 `gui::run_butler_wake_from`；这个函数给 CLI 用：
+/// 用户关掉 GUI 后在终端里入金，管家也应该马上知道，而不是等下一次巡检。
+///
+/// 只做两件事：把当前账户折算成 `AccountFacts` 落盘、通过本地通道发一条
+/// 账本事件。守护进程不在时第二件事静默失败，不改任何行为。
+pub fn publish_butler_ledger(kind: &str) {
+    let now = chrono::Local::now();
+    let facts = match load_snapshot() {
+        Ok(snapshot) => crate::butler::AccountFacts::from_snapshot(&snapshot, now),
+        // 读不到账户就别编事实：守护进程会用上一份，或干脆不开口。
+        Err(_) => return,
+    };
+    if let Err(error) = crate::butler::orchestrator::write_facts(now, &facts) {
+        eprintln!("管家事实落盘失败：{error:#}");
+        return;
+    }
+    let id = format!("cli:{kind}:{}", now.timestamp_millis());
+    let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger: Some(id) });
+}
+
 pub fn load_snapshot() -> Result<Snapshot> {
     let config = AppConfig::load()?;
     let db = Database::open()?;
@@ -964,6 +986,39 @@ pub fn set_decision_weekday(weekday: u32) -> Result<()> {
     }
     let mut config = AppConfig::load()?;
     config.rebalance.decision_weekday = weekday;
+    config.save()
+}
+
+/// 保存管家主动开口频控。数值的合法性交给 `AppConfig::validate()`，这里只
+/// 在写入前给出可读的错误，避免把一份坏配置落盘后下次启动才报错。
+pub fn set_butler_policy(
+    daily_cap: usize,
+    weekly_cap: usize,
+    dedupe_days: i64,
+    quiet_start_hour: u32,
+    quiet_end_hour: u32,
+) -> Result<()> {
+    if daily_cap == 0 {
+        anyhow::bail!("每天最多开口次数至少为 1");
+    }
+    if weekly_cap < daily_cap {
+        anyhow::bail!("每周上限不能小于每天上限");
+    }
+    if dedupe_days < 1 {
+        anyhow::bail!("去重天数至少为 1");
+    }
+    if quiet_start_hour > 23 || quiet_end_hour > 24 {
+        anyhow::bail!("静音时段必须在 0-24 点之间");
+    }
+    let mut config = AppConfig::load()?;
+    config.butler = crate::config::ButlerConfig {
+        daily_cap,
+        weekly_cap,
+        dedupe_days,
+        quiet_start_hour,
+        quiet_end_hour,
+    };
+    config.validate()?;
     config.save()
 }
 

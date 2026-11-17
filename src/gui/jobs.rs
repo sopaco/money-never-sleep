@@ -21,6 +21,14 @@ pub enum Request {
     SetProfile(String),
     SetMonthly(f64),
     SetWeekday(u32),
+    /// 管家主动开口频控（设置页）。
+    SetButlerPolicy {
+        daily_cap: usize,
+        weekly_cap: usize,
+        dedupe_days: i64,
+        quiet_start_hour: u32,
+        quiet_end_hour: u32,
+    },
     Deposit {
         amount: f64,
         note: Option<String>,
@@ -33,6 +41,10 @@ pub enum Request {
         code: String,
         name: String,
         category: String,
+    },
+    /// F5 标的搜索。关键词送网络的事放在 worker，UI 线程绝不发请求。
+    SearchFunds {
+        keyword: String,
     },
     Buy {
         code: String,
@@ -76,9 +88,16 @@ pub enum Event {
     Refreshed(Result<RefreshOutcome, String>),
     /// A write succeeded; the string is user-facing confirmation copy.
     Saved(String),
+    /// 一次记账成功并已写入行为日志。带毫秒时间戳，作为该事件的去重 id。
+    LedgerRecorded(String),
     Failed(String),
     /// Report text for the agent prompt, produced by the CLI itself.
     Brief(Result<String, String>),
+    /// F5 搜索结果。`keyword` 原样带回：慢响应不能覆盖后一次搜索的结果。
+    FundSearch {
+        keyword: String,
+        result: Result<Vec<crate::quote::FundCandidate>, String>,
+    },
     /// Refreshed archive index, sent after load / save / delete.
     Conversations(Result<Vec<ConversationSummary>, String>),
     /// Full transcript for a read-only replay.
@@ -167,44 +186,171 @@ impl Jobs {
                             &event_tx,
                             app::set_decision_weekday(weekday).map(|()| "决策日已更新".to_owned()),
                         ),
-                        Request::Deposit { amount, note } => finish(
+                        Request::SetButlerPolicy {
+                            daily_cap,
+                            weekly_cap,
+                            dedupe_days,
+                            quiet_start_hour,
+                            quiet_end_hour,
+                        } => finish(
                             &event_tx,
-                            app::deposit(amount, note.as_deref())
-                                .map(|balance| format!("已入金，现金余额 ¥{balance:.2}")),
+                            app::set_butler_policy(
+                                daily_cap,
+                                weekly_cap,
+                                dedupe_days,
+                                quiet_start_hour,
+                                quiet_end_hour,
+                            )
+                            .map(|()| "管家频控已保存".to_owned()),
                         ),
-                        Request::Withdraw { amount, note } => finish(
-                            &event_tx,
-                            app::withdraw(amount, note.as_deref())
-                                .map(|balance| format!("已出金，现金余额 ¥{balance:.2}")),
-                        ),
+                        Request::Deposit { amount, note } => {
+                            let result = app::deposit(amount, note.as_deref());
+                            let ledger = result
+                                .is_ok()
+                                .then(|| {
+                                    record_ledger(
+                                        "deposit",
+                                        serde_json::json!({ "amount": amount }),
+                                    )
+                                })
+                                .flatten();
+                            finish(
+                                &event_tx,
+                                result.map(|balance| format!("已入金，现金余额 ¥{balance:.2}")),
+                            );
+                            if let Some(at) = ledger {
+                                let _ = event_tx.send(Event::LedgerRecorded(at));
+                            }
+                        }
+                        Request::Withdraw { amount, note } => {
+                            let result = app::withdraw(amount, note.as_deref());
+                            let ledger = result
+                                .is_ok()
+                                .then(|| {
+                                    record_ledger(
+                                        "withdraw",
+                                        serde_json::json!({ "amount": amount }),
+                                    )
+                                })
+                                .flatten();
+                            finish(
+                                &event_tx,
+                                result.map(|balance| format!("已出金，现金余额 ¥{balance:.2}")),
+                            );
+                            if let Some(at) = ledger {
+                                let _ = event_tx.send(Event::LedgerRecorded(at));
+                            }
+                        }
                         Request::AddAsset {
                             code,
                             name,
                             category,
-                        } => finish(
-                            &event_tx,
-                            app::add_asset(&code, &name, &category)
-                                .map(|()| format!("已添加标的 {code}")),
-                        ),
+                        } => {
+                            // 手填代码是一等入口，但口径和搜索入口一致：只收
+                            // 场外基金。6 位基金代码先按代码查一次，既补齐名称
+                            // 又确认它不是场内 ETF/LOF；查询失败时不阻断已写好
+                            // 名称的录入，网络问题不该演变成「不能记账」。
+                            let mut name = name;
+                            if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
+                                match runtime.block_on(crate::quote::search_funds(&code)) {
+                                    Ok(rows) => {
+                                        if let Some(found) =
+                                            rows.iter().find(|row| row.code == code)
+                                        {
+                                            if found.exchange_traded {
+                                                let _ = event_tx.send(Event::Failed(format!(
+                                                    "{} 是场内标的（ETF/LOF），MNS 只记场外基金；请添加它对应的场外联接基金",
+                                                    code
+                                                )));
+                                                continue;
+                                            }
+                                            if name.trim().is_empty() {
+                                                name = found.name.clone();
+                                            }
+                                        } else if name.trim().is_empty() {
+                                            let _ = event_tx.send(Event::Failed(format!(
+                                                "未能获取 {code} 的名称，请手动填写"
+                                            )));
+                                            continue;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if name.trim().is_empty() {
+                                            let _ = event_tx.send(Event::Failed(format!(
+                                                "未能获取 {code} 的名称：{error:#}"
+                                            )));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            finish(
+                                &event_tx,
+                                app::add_asset(&code, &name, &category)
+                                    .map(|()| format!("已添加标的 {code} {name}")),
+                            );
+                        }
+                        Request::SearchFunds { keyword } => {
+                            let result = runtime
+                                .block_on(crate::quote::search_funds(&keyword))
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = event_tx.send(Event::FundSearch { keyword, result });
+                        }
                         Request::Buy {
                             code,
                             shares,
                             price,
                             note,
-                        } => finish(
-                            &event_tx,
-                            app::buy(&code, shares, price, note.as_deref())
-                                .map(|()| format!("已记录买入 {code} {shares:.2} 份")),
-                        ),
+                        } => {
+                            let result = app::buy(&code, shares, price, note.as_deref());
+                            let ledger = result
+                                .is_ok()
+                                .then(|| {
+                                    record_ledger(
+                                        "buy",
+                                        serde_json::json!({
+                                            "code": code,
+                                            "shares": shares,
+                                            "price": price,
+                                        }),
+                                    )
+                                })
+                                .flatten();
+                            finish(
+                                &event_tx,
+                                result.map(|()| format!("已记录买入 {code} {shares:.2} 份")),
+                            );
+                            if let Some(at) = ledger {
+                                let _ = event_tx.send(Event::LedgerRecorded(at));
+                            }
+                        }
                         Request::Sell {
                             code,
                             shares,
                             price,
-                        } => finish(
-                            &event_tx,
-                            app::sell(&code, shares, price)
-                                .map(|()| format!("已记录卖出 {code} {shares:.2} 份")),
-                        ),
+                        } => {
+                            let result = app::sell(&code, shares, price);
+                            let ledger = result
+                                .is_ok()
+                                .then(|| {
+                                    record_ledger(
+                                        "sell",
+                                        serde_json::json!({
+                                            "code": code,
+                                            "shares": shares,
+                                            "price": price,
+                                        }),
+                                    )
+                                })
+                                .flatten();
+                            finish(
+                                &event_tx,
+                                result.map(|()| format!("已记录卖出 {code} {shares:.2} 份")),
+                            );
+                            if let Some(at) = ledger {
+                                let _ = event_tx.send(Event::LedgerRecorded(at));
+                            }
+                        }
                         Request::AgentBrief { refresh } => {
                             let _ = event_tx.send(Event::Brief(agent_brief(refresh)));
                             let _ = event_tx.send(Event::Loaded(load()));
@@ -256,6 +402,31 @@ impl Jobs {
         self.tx
             .send(request)
             .map_err(|_| "后台线程已退出，请重启应用".to_owned())
+    }
+}
+
+/// 账本事件写入行为日志，供管家唤醒。失败忽略：记账已经成功，埋点不该
+/// 反过来让用户看到报错。返回唤醒 id，供去重。
+///
+/// id 一律由 `orchestrator::ledger_wake` 生成，GUI 不自己拼字符串——两处
+/// 各拼一遍，改规则时必然漂移，去重就失效了。
+fn record_ledger(side: &str, detail: serde_json::Value) -> Option<String> {
+    let mut detail = detail;
+    if let Some(map) = detail.as_object_mut() {
+        map.insert(
+            "side".to_owned(),
+            serde_json::Value::String(side.to_owned()),
+        );
+    }
+    let event = crate::butler::events::BehaviorEvent::new(
+        crate::butler::events::kind::TRADE_RECORDED,
+        detail,
+    );
+    let wake = crate::butler::orchestrator::ledger_wake(&event);
+    crate::butler::events::append(&event).ok()?;
+    match wake {
+        Some(crate::butler::WakeSource::Ledger { id }) => Some(id),
+        _ => None,
     }
 }
 

@@ -1,7 +1,7 @@
 //! 设置：风险档位、定投金额、决策日与外部 Agent。
 
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
 
 use crate::gui::AppShell;
@@ -266,6 +266,142 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
             .child(caption("登录后常驻托盘，不打开窗口。")),
     );
 
+    // ── 行为记录（管家） ───────────────────────────────────────
+    let behavior = shell.behavior_enabled;
+    let mut behavior_toggle = Button::new("behavior-log").compact().label(if behavior {
+        "已开启"
+    } else {
+        "已关闭"
+    });
+    if behavior {
+        behavior_toggle = behavior_toggle.primary();
+    }
+    root = root.child(
+        card_pad()
+            .gap(px(8.))
+            .child(card_header("行为记录", "供管家参考"))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .child(dot(if behavior { SUCCESS } else { TEXT_TERTIARY }))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("本地行为记录"),
+                            ),
+                    )
+                    .child(behavior_toggle.on_click(cx.listener(|shell, _, _, cx| {
+                        shell.toggle_behavior_logging(cx);
+                    }))),
+            )
+            .child(caption(
+                "记录打开应用、切换页面、打开买入弹层与护栏命中；只存在本机，不上传，可随时关闭或清除。",
+            ))
+            .child(
+                div().h_flex().justify_end().child(
+                    Button::new("clear-behavior")
+                        .compact()
+                        .label("清除记录")
+                        .on_click(cx.listener(|shell, _, _, cx| shell.clear_behavior_log(cx))),
+                ),
+            ),
+    );
+
+    // ── 管家 ─────────────────────────────────────────────────
+    let proactive = shell.butler_proactive;
+    let mut proactive_toggle = Button::new("butler-proactive").compact().label(if proactive {
+        "已开启"
+    } else {
+        "已停止"
+    });
+    if proactive {
+        proactive_toggle = proactive_toggle.primary();
+    }
+    root = root.child(
+        card_pad()
+            .gap(px(8.))
+            .child(card_header("管家", "本地 · 只读账本"))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .child(dot(if proactive { SUCCESS } else { TEXT_TERTIARY }))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("主动开口"),
+                            ),
+                    )
+                    .child(proactive_toggle.on_click(cx.listener(|shell, _, _, cx| {
+                        shell.toggle_butler_proactive(cx);
+                    }))),
+            )
+            .child(caption(
+                "开口会弹一条系统通知（macOS）并在托盘菜单留一条，点开即进会话；只在本机，不外发。关掉后管家仍可回答问题。",
+            ))
+            .child(divider())
+            .child(caption("主动开口频控（改完立即生效）"))
+            .child(
+                div()
+                    .h_flex()
+                    .items_end()
+                    .gap(px(12.))
+                    .child(number_field("每天最多", &shell.butler_daily, "次"))
+                    .child(number_field("每周最多", &shell.butler_weekly, "次"))
+                    .child(number_field("同一件事去重", &shell.butler_dedupe, "天")),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .items_end()
+                    .gap(px(12.))
+                    .child(number_field("静音从", &shell.butler_quiet_start, "点"))
+                    .child(number_field("到", &shell.butler_quiet_end, "点"))
+                    .child(
+                        Button::new("save-butler-policy")
+                            .primary()
+                            .compact()
+                            .label("保存频控")
+                            .on_click(cx.listener(|shell, _, _, cx| {
+                                shell.save_butler_policy(cx);
+                            })),
+                    ),
+            )
+            .child(caption(
+                "静音时段内不主动开口（起止相同表示不静音）；开关本身仍由上面的「主动开口」控制。频控只限制说多少，不决定能不能说。",
+            ))
+            .child(
+                div().h_flex().justify_end().child(
+                    Button::new("open-butler")
+                        .compact()
+                        .label("打开管家")
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::gui::OpenButlerWindow),
+                                cx,
+                            );
+                        })),
+                ),
+            ),
+    );
+
     // ── 数据与文件 ─────────────────────────────────────────────
     root = root.child(
         card_pad()
@@ -300,6 +436,27 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
     );
 
     root.into_any_element()
+}
+
+/// 设置页里的窄数字输入：标签在上，输入框与单位在同一行。
+fn number_field(
+    label: &'static str,
+    input: &Entity<InputState>,
+    unit: &'static str,
+) -> AnyElement {
+    div()
+        .v_flex()
+        .gap(px(4.))
+        .child(caption(label))
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(6.))
+                .child(div().w(px(68.)).child(Input::new(input)))
+                .child(caption(unit)),
+        )
+        .into_any_element()
 }
 
 fn badge_metric(label: &'static str, value: usize) -> Div {

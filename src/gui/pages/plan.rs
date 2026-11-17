@@ -232,7 +232,7 @@ fn legs_card(data: &Snapshot) -> Div {
         .gap(px(0.))
         .child(div().pb(px(10.)).child(card_header_linked(
             "分腿分配",
-            "只买不卖",
+            "只买不卖；当前与偏离含本月新钱",
             help_links::BAND_PER_LEG,
         )));
 

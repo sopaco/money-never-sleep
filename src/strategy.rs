@@ -997,6 +997,117 @@ mod tests {
     }
 
     #[test]
+    fn 定投与再平衡的目标风险仓位严格相等且偏离按含新钱口径差() {
+        let c = AppConfig::default_config();
+        let positions = vec![
+            pos("QQQ", "纳指ETF", "us_stocks", 1_000.0, 1.0, 1.2, "2020-01-01"),
+            pos("DIV", "红利ETF", "cn_stocks", 2_000.0, 1.0, 0.9, "2020-01-01"),
+            pos("GLD", "黄金ETF", "counter_cyclical", 500.0, 1.0, 1.4, "2020-01-01"),
+        ];
+        let (cash, monthly, score) = (5_000.0, 3_000.0, 37.0);
+
+        let rebalance = calculate_rebalance_plan(&c, score, cash, &positions, today());
+        let monthly_plan = calculate_monthly_plan(&c, score, cash, &positions, monthly);
+
+        // 同一分数、同一份配置：目标风险仓位必须逐位相等，不能「差不多」。
+        assert_eq!(rebalance.target_risk_weight, monthly_plan.target_risk_weight);
+
+        let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+        let total_now = cash + holdings;
+        let total_with_new = total_now + monthly;
+        assert!((rebalance.total_assets - total_now).abs() < 1e-9);
+        assert!((monthly_plan.total_assets - total_with_new).abs() < 1e-9);
+
+        // 定投的偏离必须按「含本月新钱」的分母算，否则页面上的当前/偏离
+        // 与买入金额用的不是同一个总资产。
+        for leg in &monthly_plan.legs {
+            let current: f64 = positions
+                .iter()
+                .filter(|p| p.category == leg.category)
+                .map(|p| p.market_value_or_cost())
+                .sum::<f64>()
+                + 0.0;
+            let expected = current / total_with_new * 100.0 - leg.target_weight;
+            assert!(
+                (leg.drift_pp - expected).abs() < 1e-9,
+                "{} 的定投偏离应按含新钱总资产计，实际 {:.6} 预期 {:.6}",
+                leg.category_cn,
+                leg.drift_pp,
+                expected
+            );
+        }
+
+        // 两套口径的差值只来自分母：同一笔持仓在新钱口径下的偏离
+        // = current × (1/含新钱总资产 − 1/当前总资产) × 100。
+        for leg in &rebalance.legs {
+            let monthly_leg = monthly_plan
+                .legs
+                .iter()
+                .find(|l| l.category == leg.category)
+                .unwrap();
+            let current: f64 = positions
+                .iter()
+                .filter(|p| p.category == leg.category)
+                .map(|p| p.market_value_or_cost())
+                .sum::<f64>()
+                + 0.0;
+            let expected_delta = current * (1.0 / total_with_new - 1.0 / total_now) * 100.0;
+            assert!(
+                (monthly_leg.drift_pp - leg.drift_pp - expected_delta).abs() < 1e-9,
+                "{} 的口径差应只来自分母，实际 {:.6} 预期 {:.6}",
+                leg.category_cn,
+                monthly_leg.drift_pp - leg.drift_pp,
+                expected_delta
+            );
+        }
+    }
+
+    #[test]
+    fn 缺标的腿在两条计划链路中的结论一致() {
+        let c = AppConfig::default_config();
+        let positions = vec![pos(
+            "QQQ", "纳指ETF", "us_stocks", 1_000.0, 1.0, 1.0, "2020-01-01",
+        )];
+        let rebalance = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
+        let monthly_plan = calculate_monthly_plan(&c, 20.0, 100_000.0, &positions, 3_000.0);
+
+        for category in ["cn_stocks", "counter_cyclical"] {
+            let rebalance_leg = rebalance
+                .legs
+                .iter()
+                .find(|l| l.category == category)
+                .unwrap();
+            let monthly_leg = monthly_plan
+                .legs
+                .iter()
+                .find(|l| l.category == category)
+                .unwrap();
+            assert_eq!(rebalance_leg.amount, 0.0, "{} 再平衡不应报金额", category);
+            assert_eq!(monthly_leg.amount, 0.0, "{} 定投不应报金额", category);
+            assert_eq!(
+                rebalance_leg.hold_reason.as_deref(),
+                Some(NO_INSTRUMENT_REASON),
+                "{} 再平衡应挂缺标的指引",
+                category
+            );
+            assert_eq!(
+                monthly_leg.hold_reason.as_deref(),
+                Some(NO_INSTRUMENT_REASON),
+                "{} 定投应挂缺标的指引",
+                category
+            );
+            assert!(rebalance_leg.items.is_empty());
+            assert!(monthly_leg.items.is_empty());
+        }
+
+        // 两条链路的合计都只累计可执行部分，结论才能互相搬。
+        let rebalance_sum: f64 = rebalance.legs.iter().map(|l| l.amount).sum();
+        let monthly_sum: f64 = monthly_plan.legs.iter().map(|l| l.amount).sum();
+        assert!((rebalance.total_buy - rebalance_sum).abs() < 0.01);
+        assert!((monthly_plan.total_buy - monthly_sum).abs() < 0.01);
+    }
+
+    #[test]
     fn 无路径依赖_相同权重下建议与现金规模无关() {
         // 旧框架下"买入=现金的百分比"，刚注资会放大买入金额；
         // 新框架的目标是权重，故同一权重状态下建议方向应一致。

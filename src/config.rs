@@ -73,6 +73,41 @@ pub struct AppConfig {
     /// 买入冷静期：情绪过热时的二次确认提示（不阻断交易、不改动仓位）
     #[serde(default)]
     pub guardrail: GuardrailConfig,
+    /// 管家主动开口频控（设置页可调，立即生效）
+    #[serde(default)]
+    pub butler: ButlerConfig,
+}
+
+/// 管家主动开口频控。
+///
+/// 这些数值只约束「说多少」，不决定「能不能说」——后者是
+/// `ButlerState.policy.enabled`（设置页的开关，落在 `state.json`）。
+/// 数值放在 `config.toml` 是因为它属于用户偏好，且要能被 GUI 与守护进程
+/// 同时读到：守护进程每次判定前重新加载配置，改完不必重启。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ButlerConfig {
+    /// 每天最多主动开口几次
+    pub daily_cap: usize,
+    /// 每周（滚动 7 天）最多主动开口几次
+    pub weekly_cap: usize,
+    /// 同一事件多少天内不重复开口
+    pub dedupe_days: i64,
+    /// 静音时段起点（含），24 小时制
+    pub quiet_start_hour: u32,
+    /// 静音时段终点（不含），24 小时制；可写 24 表示到午夜
+    pub quiet_end_hour: u32,
+}
+
+impl Default for ButlerConfig {
+    fn default() -> Self {
+        Self {
+            daily_cap: 3,
+            weekly_cap: 10,
+            dedupe_days: 3,
+            quiet_start_hour: 22,
+            quiet_end_hour: 8,
+        }
+    }
 }
 
 /// 买入冷静期配置。
@@ -615,6 +650,7 @@ impl AppConfig {
             backtest: BacktestSettings::default(),
             channels: ChannelCosts::default(),
             guardrail: GuardrailConfig::default(),
+            butler: ButlerConfig::default(),
         }
     }
 
@@ -785,6 +821,26 @@ impl AppConfig {
         }
         if chrono::NaiveDate::parse_from_str(&b.entry_date, "%Y-%m-%d").is_err() {
             anyhow::bail!("backtest.entry_date 必须为 YYYY-MM-DD: {}", b.entry_date);
+        }
+        let k = &self.butler;
+        if k.daily_cap == 0 {
+            anyhow::bail!("butler.daily_cap 至少为 1");
+        }
+        if k.weekly_cap < k.daily_cap {
+            anyhow::bail!(
+                "butler.weekly_cap({}) 不能小于 daily_cap({})",
+                k.weekly_cap,
+                k.daily_cap
+            );
+        }
+        if k.dedupe_days < 1 {
+            anyhow::bail!("butler.dedupe_days 至少为 1");
+        }
+        if k.quiet_start_hour > 23 {
+            anyhow::bail!("butler.quiet_start_hour 应在 0-23 之间: {}", k.quiet_start_hour);
+        }
+        if k.quiet_end_hour > 24 {
+            anyhow::bail!("butler.quiet_end_hour 应在 0-24 之间: {}", k.quiet_end_hour);
         }
         Ok(())
     }
@@ -963,6 +1019,11 @@ impl AppConfig {
             "guardrail.hot_threshold" => Some(self.guardrail.hot_threshold.to_string()),
             "guardrail.cooldown_days" => Some(self.guardrail.cooldown_days.to_string()),
             "guardrail.show_stats" => Some(self.guardrail.show_stats.to_string()),
+            "butler.daily_cap" => Some(self.butler.daily_cap.to_string()),
+            "butler.weekly_cap" => Some(self.butler.weekly_cap.to_string()),
+            "butler.dedupe_days" => Some(self.butler.dedupe_days.to_string()),
+            "butler.quiet_start_hour" => Some(self.butler.quiet_start_hour.to_string()),
+            "butler.quiet_end_hour" => Some(self.butler.quiet_end_hour.to_string()),
             "profile" => Some(self.profile_label().to_string()),
             "profile.core_blend" => Some(self.profile.core_blend.to_string()),
             "backtest.data_path" => Some(self.backtest.data_path.clone()),
@@ -1030,6 +1091,11 @@ impl AppConfig {
             "guardrail.hot_threshold" => self.guardrail.hot_threshold = value.parse()?,
             "guardrail.cooldown_days" => self.guardrail.cooldown_days = value.parse()?,
             "guardrail.show_stats" => self.guardrail.show_stats = value.parse()?,
+            "butler.daily_cap" => self.butler.daily_cap = value.parse()?,
+            "butler.weekly_cap" => self.butler.weekly_cap = value.parse()?,
+            "butler.dedupe_days" => self.butler.dedupe_days = value.parse()?,
+            "butler.quiet_start_hour" => self.butler.quiet_start_hour = value.parse()?,
+            "butler.quiet_end_hour" => self.butler.quiet_end_hour = value.parse()?,
             "target_weight.mode" => {
                 self.target_weight.mode = match value.trim().to_ascii_lowercase().as_str() {
                     "step" | "阶梯" => WeightMode::Step,
@@ -1160,6 +1226,34 @@ mod tests {
     #[test]
     fn 默认配置应通过校验() {
         assert!(cfg().validate().is_ok());
+    }
+
+    #[test]
+    fn 管家频控默认值与越界校验() {
+        let c = cfg();
+        assert_eq!(c.butler.daily_cap, 3);
+        assert_eq!(c.butler.weekly_cap, 10);
+        assert_eq!(c.butler.dedupe_days, 3);
+
+        let mut bad = cfg();
+        bad.butler.daily_cap = 0;
+        assert!(bad.validate().is_err(), "每天至少一次");
+
+        let mut bad = cfg();
+        bad.butler.weekly_cap = 2;
+        assert!(bad.validate().is_err(), "每周不能小于每天");
+
+        let mut bad = cfg();
+        bad.butler.dedupe_days = 0;
+        assert!(bad.validate().is_err());
+
+        let mut bad = cfg();
+        bad.butler.quiet_start_hour = 24;
+        assert!(bad.validate().is_err());
+
+        let mut bad = cfg();
+        bad.butler.quiet_end_hour = 25;
+        assert!(bad.validate().is_err());
     }
 
     #[test]

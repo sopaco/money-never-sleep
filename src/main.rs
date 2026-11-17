@@ -2,8 +2,8 @@
 // CLI output. This binary keeps only argument parsing and terminal rendering.
 #[allow(unused_imports)]
 use money_never_sleep::{
-    audit, backtest, cli, config, db, guardrail, live_data, market, metrics, models, quote, report,
-    sentiment, signal, strategy,
+    app, audit, backtest, cli, config, db, guardrail, live_data, market, metrics, models, quote,
+    report, sentiment, signal, strategy,
 };
 
 use anyhow::{Context, Result};
@@ -300,6 +300,7 @@ fn cmd_cash_set(amount: f64) -> Result<()> {
     } else {
         println!("✓ 现金余额已设置为: ¥{:.2}", amount);
     }
+    app::publish_butler_ledger("adjust");
     Ok(())
 }
 
@@ -313,6 +314,7 @@ fn cmd_cash_deposit(amount: f64, note: Option<String>) -> Result<()> {
     let today = chrono::Local::now().date_naive();
     db.add_cash_flow(today, amount, "deposit", note.as_deref())?;
     println!("✓ 入金 ¥{:.2}，当前余额: ¥{:.2}", amount, new_balance);
+    app::publish_butler_ledger("deposit");
     Ok(())
 }
 
@@ -335,6 +337,7 @@ fn cmd_cash_withdraw(amount: f64, note: Option<String>) -> Result<()> {
     let today = chrono::Local::now().date_naive();
     db.add_cash_flow(today, -amount, "withdraw", note.as_deref())?;
     println!("✓ 出金 ¥{:.2}，当前余额: ¥{:.2}", amount, balance - amount);
+    app::publish_butler_ledger("withdraw");
     Ok(())
 }
 
@@ -694,6 +697,7 @@ fn cmd_buy(code: &str, shares: f64, price: f64) -> Result<()> {
         "✓ 买入 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}",
         code, shares, price, amount
     );
+    app::publish_butler_ledger("buy");
     Ok(())
 }
 
@@ -705,6 +709,7 @@ fn cmd_sell(code: &str, shares: f64, price: f64) -> Result<()> {
         "✓ 卖出 {} {:.2} 份 @ ¥{:.2}，合计 ¥{:.2}",
         code, shares, price, amount
     );
+    app::publish_butler_ledger("sell");
     Ok(())
 }
 

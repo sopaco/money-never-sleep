@@ -13,14 +13,17 @@ mod macos;
 pub mod markdown;
 pub mod render;
 
+use std::sync::{Arc, OnceLock};
+
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, div, point, px, rgba, rgb, size, AnyWindowHandle, App, AppContext, ClickEvent,
-    Context, ElementId, Entity, Global, InteractiveElement, IntoElement, KeyBinding,
-    ParentElement, Pixels, QuitMode, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    AnyWindowHandle, App, AppContext, ClickEvent, Context, ElementId, Entity, Global, Image,
+    ImageFormat, InteractiveElement, IntoElement, KeyBinding, ObjectFit, ParentElement, Pixels,
+    QuitMode, Render, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, point, px, rgb, rgba,
+    size,
 };
 // The menu bar is macOS-only in GPUI; the other platforms use the window's own
 // system menu (or none at all).
@@ -28,9 +31,29 @@ use gpui_kit::{
 use gpui_kit::{Menu, MenuItem, SystemMenuType};
 
 use crate::gui::theme::{
-    ACCENT, BG, BORDER, DIVIDER, HOVER, LAYER, SELECTED, SURFACE, TEXT, TEXT_TERTIARY, RADIUS,
-    RADIUS_SM,
+    ACCENT, BG, BORDER, DIVIDER, HOVER, LAYER, RADIUS, RADIUS_SM, SELECTED, SURFACE, TEXT,
+    TEXT_TERTIARY,
 };
+/// 帮助中心的品牌图，编进二进制以免运行时依赖工作目录；`OnceLock` 让每帧
+/// 复用同一个 `Arc<Image>`，不在绘制阶段反复解码 PNG。
+fn help_mark(size: f32) -> impl IntoElement {
+    static MARK: OnceLock<Arc<Image>> = OnceLock::new();
+    let image = MARK
+        .get_or_init(|| {
+            Arc::new(Image::from_bytes(
+                ImageFormat::Png,
+                include_bytes!("../../assets/icon_help.png").to_vec(),
+            ))
+        })
+        .clone();
+    // 图片自带圆角蓝底，`object_fit` 用 contain 保证不被拉伸裁切。
+    img(image)
+        .w(px(size))
+        .h(px(size))
+        .object_fit(ObjectFit::Contain)
+        .flex_none()
+}
+
 use content::{Chapter, Page};
 
 /// 目录树的宽度（逻辑像素）。
@@ -113,108 +136,118 @@ pub fn run() {
         crate::single_instance::Acquired::AlreadyRunning => return,
     };
 
-    gpui_kit::application()
+    let app = gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         // A help window is the whole application: closing it must also end the
         // process, otherwise the single-instance lock outlives the window and
         // the tray's 「帮助中心」 can never open it again.
-        .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            crate::gui::theme::apply(cx);
+        .with_quit_mode(QuitMode::LastWindowClosed);
 
-            // GPUI leaves cmd-w / cmd-q to the application (its own tests assert
-            // those bindings stay empty), so the viewer must bind them or the
-            // window ignores the standard macOS shortcut.
-            let mut bindings = vec![
-                KeyBinding::new("alt-left", NavigateBack, None),
-                KeyBinding::new("alt-right", NavigateForward, None),
-            ];
-            #[cfg(target_os = "macos")]
-            bindings.extend([
-                KeyBinding::new("cmd-w", CloseHelpWindow, None),
-                KeyBinding::new("cmd-q", QuitHelp, None),
-                KeyBinding::new("cmd-left", NavigateBack, None),
-                KeyBinding::new("cmd-right", NavigateForward, None),
-                KeyBinding::new("cmd-shift-h", NavigateHome, None),
-            ]);
-            #[cfg(not(target_os = "macos"))]
-            bindings.extend([
-                KeyBinding::new("ctrl-w", CloseHelpWindow, None),
-                KeyBinding::new("alt-f4", CloseHelpWindow, None),
-                KeyBinding::new("ctrl-q", QuitHelp, None),
-            ]);
-            cx.bind_keys(bindings);
+    // On macOS the viewer shares MNS.app's bundle, so it cannot have a Dock
+    // tile of its own. Run it as an accessory instead: the window still shows
+    // and takes focus, but no Dock icon appears. This has to be set on the
+    // builder *before* the run loop starts — setting it via `cx` afterwards
+    // would flash a Dock icon first (see gpui-pre-macos's `MacPlatform::run`).
+    // It also means no menu bar, which is fine: cmd-w / cmd-q stay bound below.
+    #[cfg(target_os = "macos")]
+    let app = app.with_windowing(gpui_kit::WindowingRequest::Headless);
 
-            // Also required on macOS: without a menu an item click has nothing
-            // to dispatch to, which reads as "the menu button does nothing".
-            #[cfg(target_os = "macos")]
-            cx.set_menus(help_menus());
+    app.run(move |cx| {
+        gpui_kit::init(cx);
+        crate::gui::theme::apply(cx);
 
-            // Keep the default comfortable, but scale with the display instead
-            // of pinning a small window on a high-resolution screen.
-            let bounds = cx
-                .primary_display()
-                .map(|display| display.bounds().size)
-                .unwrap_or_else(|| size(px(1280.), px(820.)));
-            let window_size = size(
-                px((bounds.width.as_f32() * 0.78).clamp(1000., 1440.)).min(bounds.width - px(48.)),
-                px((bounds.height.as_f32() * 0.80).clamp(640., 980.)).min(bounds.height - px(88.)),
-            );
+        // GPUI leaves cmd-w / cmd-q to the application (its own tests assert
+        // those bindings stay empty), so the viewer must bind them or the
+        // window ignores the standard macOS shortcut.
+        let mut bindings = vec![
+            KeyBinding::new("alt-left", NavigateBack, None),
+            KeyBinding::new("alt-right", NavigateForward, None),
+        ];
+        #[cfg(target_os = "macos")]
+        bindings.extend([
+            KeyBinding::new("cmd-w", CloseHelpWindow, None),
+            KeyBinding::new("cmd-q", QuitHelp, None),
+            KeyBinding::new("cmd-left", NavigateBack, None),
+            KeyBinding::new("cmd-right", NavigateForward, None),
+            KeyBinding::new("cmd-shift-h", NavigateHome, None),
+        ]);
+        #[cfg(not(target_os = "macos"))]
+        bindings.extend([
+            KeyBinding::new("ctrl-w", CloseHelpWindow, None),
+            KeyBinding::new("alt-f4", CloseHelpWindow, None),
+            KeyBinding::new("ctrl-q", QuitHelp, None),
+        ]);
+        cx.bind_keys(bindings);
 
-            let options = WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some("MNS 帮助中心".into()),
-                    ..Default::default()
-                }),
-                window_bounds: Some(WindowBounds::centered(window_size, cx)),
-                window_min_size: Some(size(px(860.), px(560.))),
+        // Also required on macOS: without a menu an item click has nothing
+        // to dispatch to, which reads as "the menu button does nothing".
+        #[cfg(target_os = "macos")]
+        cx.set_menus(help_menus());
+
+        // Keep the default comfortable, but scale with the display instead
+        // of pinning a small window on a high-resolution screen.
+        let bounds = cx
+            .primary_display()
+            .map(|display| display.bounds().size)
+            .unwrap_or_else(|| size(px(1280.), px(820.)));
+        let window_size = size(
+            px((bounds.width.as_f32() * 0.78).clamp(1000., 1440.)).min(bounds.width - px(48.)),
+            px((bounds.height.as_f32() * 0.80).clamp(640., 980.)).min(bounds.height - px(88.)),
+        );
+
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("MNS 帮助中心".into()),
                 ..Default::default()
-            };
-            let (window, view) =
-                gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| HelpShell::new(start)))
-                    .expect("open help window");
-            // The viewer is a standalone process: nothing else will bring it to
-            // the front (the tray spawns it as a child), and the menu bar only
-            // belongs to the frontmost app.
-            cx.activate(true);
-            cx.set_global(HelpGlobals {
-                view: Some(view),
-                window: Some(window),
-            });
-
-            cx.on_action(|_: &NavigateBack, cx| {
-                if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
-                    view.update(cx, |shell, cx| {
-                        shell.back();
-                        cx.notify();
-                    });
-                }
-            });
-            cx.on_action(|_: &NavigateForward, cx| {
-                if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
-                    view.update(cx, |shell, cx| {
-                        shell.forward();
-                        cx.notify();
-                    });
-                }
-            });
-            cx.on_action(|_: &NavigateHome, cx| {
-                if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
-                    view.update(cx, |shell, cx| {
-                        shell.home();
-                        cx.notify();
-                    });
-                }
-            });
-            cx.on_action(|_: &CloseHelpWindow, cx| close_help_window(cx));
-            cx.on_action(|_: &QuitHelp, cx| cx.quit());
-
-            #[cfg(target_os = "macos")]
-            sync_app_menu_name(cx);
-
-            spawn_link_watcher(cx, instance, started);
+            }),
+            window_bounds: Some(WindowBounds::centered(window_size, cx)),
+            window_min_size: Some(size(px(860.), px(560.))),
+            ..Default::default()
+        };
+        let (window, view) =
+            gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| HelpShell::new(start)))
+                .expect("open help window");
+        // The viewer is a standalone process: nothing else will bring it to
+        // the front (the tray spawns it as a child), and the menu bar only
+        // belongs to the frontmost app.
+        cx.activate(true);
+        cx.set_global(HelpGlobals {
+            view: Some(view),
+            window: Some(window),
         });
+
+        cx.on_action(|_: &NavigateBack, cx| {
+            if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
+                view.update(cx, |shell, cx| {
+                    shell.back();
+                    cx.notify();
+                });
+            }
+        });
+        cx.on_action(|_: &NavigateForward, cx| {
+            if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
+                view.update(cx, |shell, cx| {
+                    shell.forward();
+                    cx.notify();
+                });
+            }
+        });
+        cx.on_action(|_: &NavigateHome, cx| {
+            if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
+                view.update(cx, |shell, cx| {
+                    shell.home();
+                    cx.notify();
+                });
+            }
+        });
+        cx.on_action(|_: &CloseHelpWindow, cx| close_help_window(cx));
+        cx.on_action(|_: &QuitHelp, cx| cx.quit());
+
+        #[cfg(target_os = "macos")]
+        sync_app_menu_name(cx);
+
+        spawn_link_watcher(cx, instance, started);
+    });
 }
 
 /// `cmd-w` / 菜单「关闭窗口」: remove the window, which (with
@@ -446,9 +479,7 @@ impl HelpShell {
                     .items_center()
                     .gap(px(7.))
                     .mr(px(12.))
-                    .text_size(px(16.))
-                    .text_color(rgb(ACCENT))
-                    .child(IconName::BookText),
+                    .child(help_mark(20.)),
             )
             .child(
                 div()
@@ -576,11 +607,7 @@ impl HelpShell {
                             .flex_none()
                             .rounded(px(RADIUS_SM))
                             .text_size(px(12.5))
-                            .text_color(if selected {
-                                rgb(ACCENT)
-                            } else {
-                                rgb(TEXT)
-                            })
+                            .text_color(if selected { rgb(ACCENT) } else { rgb(TEXT) })
                             .font_weight(if selected {
                                 gpui_kit::FontWeight::MEDIUM
                             } else {
@@ -629,11 +656,7 @@ impl HelpShell {
                     .px(metrics.padding)
                     .pt(px(40.))
                     .pb(px(72.))
-                    .child(render::render_document(
-                        blocks,
-                        &self.images,
-                        metrics.text,
-                    ))
+                    .child(render::render_document(blocks, &self.images, metrics.text))
                     .child(self.render_pager(cx)),
             )
     }

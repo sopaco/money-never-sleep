@@ -41,6 +41,8 @@
 #define AppExeName "mns-gui.exe"
 #define CliExeName "mns.exe"
 #define HelpExeName "mns-help.exe"
+#define ButlerExeName "mns-butler.exe"
+#define ButlerdExeName "mns-butlerd.exe"
 #define AppUrl "https://github.com/sopaco/money-never-sleep"
 
 [Setup]
@@ -89,6 +91,11 @@ Source: "{#SourceDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\{#CliExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; 帮助中心与 GUI 同目录：托盘菜单「帮助中心」从自身所在目录启动 mns-help.exe。
 Source: "{#SourceDir}\{#HelpExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; 管家审计 CLI（mns-butler status / wake / memory …）。
+Source: "{#SourceDir}\{#ButlerExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; 管家守护进程：GUI 从自身所在目录拉起它，关掉主窗口后继续判定。它是控制台
+; 程序，由带 CREATE_NO_WINDOW 的 GUI 启动，不会闪黑框。
+Source: "{#SourceDir}\{#ButlerdExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#IconFile}"; DestDir: "{app}"; DestName: "app.ico"; Flags: ignoreversion
 ; 帮助截图（可选目录，没有图片时占位存在但为空，Inno 不会报错）。
@@ -101,3 +108,24 @@ Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFi
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppDisplayName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; 守护进程是常驻的：不先停掉它，卸载时它占着自己的 exe，文件删不掉。
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM {#ButlerdExeName} /F"; Flags: runhidden; RunOnceId: "StopButlerDaemon"
+
+[Code]
+// 升级时守护进程可能正跑着 mns-butlerd.exe，Windows 会锁住文件导致覆盖失败。
+// 安装前先请它退出；GUI 下次启动会按需重新拉起（这段空档里判定回到 GUI 进程内）。
+procedure StopButlerDaemon();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM {#ButlerdExeName} /F', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopButlerDaemon();
+  Result := '';
+end;

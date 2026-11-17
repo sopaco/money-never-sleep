@@ -7,8 +7,8 @@
 //! - 先创建的进程持有 `Local\MNS-<app>-instance` 互斥体，成为 Primary；
 //! - 后启动的进程发现互斥体已存在，`SetEvent` 通知 Primary 唤起窗口，然后
 //!   自己立刻退出；
-//! - Primary 用一个轻量轮询（见各 GUI 的 400ms 定时任务）检查事件，命中时
-//!   走与托盘菜单「打开 MNS」完全相同的窗口路径。
+//! - Primary 用专用线程阻塞在这个命名事件上（不做轮询），命中时走与托盘
+//!   菜单「打开 MNS」完全相同的窗口路径。
 //!
 //! `Local\` 前缀让实例按登录会话隔离：同一台机器上多个用户各有一份，互不干扰。
 //! 非 Windows 平台暂不安装全局锁，`acquire` 恒返回 Primary。
@@ -44,13 +44,29 @@ pub fn acquire(app: &str) -> Acquired {
 }
 
 impl Guard {
-    /// 是否有第二个实例请求唤起本进程的窗口。
+    /// 是否有第二个实例请求唤起本进程的窗口（非阻塞探测）。
     ///
     /// 命中后立即复位事件，避免每次轮询都重复置前。
     pub fn wakeup_requested(&self) -> bool {
         #[cfg(windows)]
         {
             self.inner.wakeup_requested()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// 阻塞到「又有人启动了本程序」。命中后复位事件再返回，调用方可以接着等
+    /// 下一次。没有可用事件（建锁失败的降级路径）时永不返回。
+    ///
+    /// 这是阻塞等待，不是轮询：没有第二个实例时这个线程一直睡在内核里，
+    /// 不占 CPU，也不受定时器分辨率或系统节流影响。
+    pub fn wait_wakeup(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.inner.wait_wakeup()
         }
         #[cfg(not(windows))]
         {
@@ -68,6 +84,7 @@ mod windows_impl {
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
     const WAIT_OBJECT_0: u32 = 0;
+    const INFINITE: u32 = u32::MAX;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -105,7 +122,27 @@ mod windows_impl {
                 true
             }
         }
+
+        pub fn wait_wakeup(&self) -> bool {
+            if self.event.is_null() {
+                // 建锁失败时没有事件可用：永远等下去，别让调用方反复空转。
+                loop {
+                    std::thread::park();
+                }
+            }
+            // SAFETY: `event` 是本进程创建的有效事件句柄，存活于 Guard 生命周期内。
+            unsafe {
+                if WaitForSingleObject(self.event, INFINITE) != WAIT_OBJECT_0 {
+                    return false;
+                }
+                ResetEvent(self.event);
+                true
+            }
+        }
     }
+
+    // 句柄可以跨线程等待：`wait_wakeup` 在专用线程上跑，`Drop` 仍在原线程。
+    unsafe impl Send for Guard {}
 
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -144,7 +181,7 @@ mod windows_impl {
                 }
                 return None;
             }
-            // 手动重置事件：即使 Primary 还没开始轮询，信号也不会丢。
+            // 手动重置事件：即使 Primary 还没开始等待，信号也不会丢。
             let event = CreateEventW(std::ptr::null(), 1, 0, event_name.as_ptr());
             Some(Guard { mutex, event })
         }

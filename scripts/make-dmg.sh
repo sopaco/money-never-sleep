@@ -8,10 +8,12 @@
 # on the same team (they clear the quarantine flag once). Distributing outside
 # the team requires a Developer ID plus notarisation — see docs/gui-release.md.
 #
-# The bundle ships all three executables, at the same version:
-#   Contents/MacOS/mns-gui   desktop shell
-#   Contents/MacOS/mns       CLI, the one an agent must call
-#   Contents/MacOS/mns-help  standalone help viewer (tray menu opens it)
+# The bundle ships all five executables, at the same version:
+#   Contents/MacOS/mns-gui     desktop shell
+#   Contents/MacOS/mns         CLI, the one an agent must call
+#   Contents/MacOS/mns-help    standalone help viewer (tray menu opens it)
+#   Contents/MacOS/mns-butler  butler CLI (audit: why did it speak today?)
+#   Contents/MacOS/mns-butlerd butler daemon (keeps deciding after the window closes)
 # Agents resolve the CLI from the installed app, never from a guessable path
 # such as ~/mns or a stale copy on PATH. $HOME/QuickBins/mns has already drifted
 # to 0.7.0 while the app was 0.8.0, so a PATH lookup is not a trustworthy
@@ -30,6 +32,8 @@ APP_NAME="MNS"
 EXECUTABLE="mns-gui"
 CLI="mns"
 HELP="mns-help"
+BUTLER="mns-butler"
+BUTLERD="mns-butlerd"
 BUNDLE_ID="${BUNDLE_ID:-com.sopaco.mns}"
 VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)"
 DIST="$ROOT/target/dist"
@@ -68,6 +72,12 @@ if [[ -n "${TARGET:-}" ]]; then
     echo "==> building $HELP $VERSION ($ARCH, release, $TARGET)"
     cargo build --release --features gui --bin "$HELP" --target "$TARGET"
     HELP_BIN="$ROOT/target/$TARGET/release/$HELP"
+    echo "==> building $BUTLER $VERSION ($ARCH, release, $TARGET)"
+    cargo build --release --bin "$BUTLER" --target "$TARGET"
+    BUTLER_BIN="$ROOT/target/$TARGET/release/$BUTLER"
+    echo "==> building $BUTLERD $VERSION ($ARCH, release, $TARGET)"
+    cargo build --release --features agent --bin "$BUTLERD" --target "$TARGET"
+    BUTLERD_BIN="$ROOT/target/$TARGET/release/$BUTLERD"
 else
     echo "==> building $EXECUTABLE $VERSION ($ARCH, release)"
     cargo build --release --features gui --bin "$EXECUTABLE"
@@ -78,9 +88,15 @@ else
     echo "==> building $HELP $VERSION ($ARCH, release)"
     cargo build --release --features gui --bin "$HELP"
     HELP_BIN="$ROOT/target/release/$HELP"
+    echo "==> building $BUTLER $VERSION ($ARCH, release)"
+    cargo build --release --bin "$BUTLER"
+    BUTLER_BIN="$ROOT/target/release/$BUTLER"
+    echo "==> building $BUTLERD $VERSION ($ARCH, release)"
+    cargo build --release --features agent --bin "$BUTLERD"
+    BUTLERD_BIN="$ROOT/target/release/$BUTLERD"
 fi
 
-for artifact in "$BIN" "$CLI_BIN" "$HELP_BIN"; do
+for artifact in "$BIN" "$CLI_BIN" "$HELP_BIN" "$BUTLER_BIN" "$BUTLERD_BIN"; do
     if [[ ! -x "$artifact" ]]; then
         echo "missing build artifact: $artifact" >&2
         exit 1
@@ -124,6 +140,9 @@ cp "$CLI_BIN" "$APP/Contents/MacOS/$CLI"
 # Contents/MacOS must contain only Mach-O executables, otherwise codesign sees
 # each PNG as an unsigned nested code object and `--verify --strict` fails.
 cp "$HELP_BIN" "$APP/Contents/MacOS/$HELP"
+# 管家：CLI 用于终端复算「今天为什么说话」，守护进程由 GUI 启动并常驻。
+cp "$BUTLER_BIN" "$APP/Contents/MacOS/$BUTLER"
+cp "$BUTLERD_BIN" "$APP/Contents/MacOS/$BUTLERD"
 if [[ -d "$ROOT/help/images" ]]; then
     mkdir -p "$APP/Contents/Resources/help"
     cp -R "$ROOT/help/images" "$APP/Contents/Resources/help/images"
@@ -179,13 +198,17 @@ PLIST
 # helper with a stale or absent signature fails Gatekeeper on a copied DMG.
 if [[ -n "${CODESIGN_ID:-}" ]]; then
     echo "==> signing with $CODESIGN_ID"
-    codesign --force --options runtime --timestamp \
-        --sign "$CODESIGN_ID" "$APP/Contents/MacOS/$CLI"
+    for helper in "$CLI" "$BUTLER" "$BUTLERD"; do
+        codesign --force --options runtime --timestamp \
+            --sign "$CODESIGN_ID" "$APP/Contents/MacOS/$helper"
+    done
     codesign --force --options runtime --timestamp \
         --sign "$CODESIGN_ID" "$APP"
 else
     echo "==> signing ad-hoc (local use)"
-    codesign --force --sign - "$APP/Contents/MacOS/$CLI"
+    for helper in "$CLI" "$BUTLER" "$BUTLERD"; do
+        codesign --force --sign - "$APP/Contents/MacOS/$helper"
+    done
     codesign --force --sign - "$APP"
 fi
 codesign --verify --strict --verbose=2 "$APP"
@@ -214,5 +237,6 @@ echo "   $SIZE · $(shasum -a 256 "$DMG" | cut -d' ' -f1 | cut -c1-16)…"
 echo
 echo "   GUI  $APP/Contents/MacOS/$EXECUTABLE"
 echo "   CLI  $APP/Contents/MacOS/$CLI  (${CLI_VERSION:-not executable on this host})"
+echo "   管家 $APP/Contents/MacOS/$BUTLER / $BUTLERD"
 echo "   装到 /Applications 后，agent 应调用："
 echo "   /Applications/$APP_NAME.app/Contents/MacOS/$CLI"

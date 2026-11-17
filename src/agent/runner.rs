@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::{
-    AgentCommand, AgentEvent, AgentHandle, AgentSettings, DecisionReport, EntryKind,
+    AgentCommand, AgentEvent, AgentHandle, AgentSettings, DecisionReport, EntryKind, GoalSource,
     PermissionChoice, PermissionPolicy, PermissionPrompt, RunState, TimelineEntry,
     detect_agent_cli,
 };
@@ -94,7 +94,11 @@ pub(crate) fn start_runtime_impl() -> (AgentHandle, UnboundedReceiver<AgentEvent
 
                 while let Some(command) = command_rx.recv().await {
                     match command {
-                        AgentCommand::Start { goal, settings, .. } => {
+                        AgentCommand::Start {
+                            goal,
+                            settings,
+                            source,
+                        } => {
                             if session.as_ref().is_some_and(|s| !s.task.is_finished()) {
                                 emit_entry(
                                     &event_tx,
@@ -110,7 +114,7 @@ pub(crate) fn start_runtime_impl() -> (AgentHandle, UnboundedReceiver<AgentEvent
                             let task_shared = shared.clone();
                             let task = tokio::spawn(async move {
                                 run_session(
-                                    goal, settings, events, task_shared, stop_rx, ask_rx,
+                                    goal, source, settings, events, task_shared, stop_rx, ask_rx,
                                 )
                                 .await;
                             });
@@ -398,15 +402,25 @@ fn resolve_cwd(settings: &AgentSettings) -> PathBuf {
     cwd
 }
 
-/// Inject the autonomy contract into the single prompt. This is what keeps the
-/// interaction goal-driven rather than chat-driven.
+/// Build the first prompt for a session.
 ///
 /// The CLI path is part of the contract, not an afterthought. Without it the
 /// agent burns its first turns on `find`, `ls /private/tmp` and reading
 /// `Info.plist`; worse, it may decide the database file is the data source and
 /// query `~/.mns/mns.db` with sqlite3. Naming the binary and forbidding the
 /// storage layer keeps the agent on the one supported interface.
-fn compose_goal(goal: &str, cwd: &Path, cli: Option<&Path>) -> String {
+///
+/// Two different contracts live here, and the split is the point:
+///
+/// - `Manual` / `DailyReview` are tasks. They keep the original autonomy
+///   contract (plan, call tools until done, report what was completed, return
+///   a `mns-decision` block). The assistant page and the scheduled review
+///   depend on it, so its text must not drift.
+/// - `Conversation` is the butler window. It is an ACP session too, but the
+///   user is chatting: the autonomy contract made the model narrate in-progress
+///   work and append `action:` fields, which is exactly what a butler must not
+///   do. It gets a short dialogue contract instead.
+fn compose_goal(goal: &str, source: GoalSource, cwd: &Path, cli: Option<&Path>) -> String {
     let cli_rule = match cli {
         Some(cli) => {
             let cli = cli.display();
@@ -425,19 +439,37 @@ fn compose_goal(goal: &str, cwd: &Path, cli: Option<&Path>) -> String {
             .to_owned(),
     };
 
-    format!(
-        "{goal}\n\n---\n【MNS 桌面端执行约定】\n\
-         - 这是一个自主执行任务：请自行拆解步骤、连续调用所需工具，直到目标达成或确认无法继续；\
-         不要逐步向用户提问，也不要等待用户补充信息。\n\
-         - 工作目录：{cwd}\n\
-         {cli_rule}\n\
-         - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
-         - 工作目录可写，但不要另建记录或存档文件：最终结论只通过回答里的 mns-decision 块回传，由 MNS 统一保存与展示。\n\
-         - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
-         MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
-         - 完成后用中文输出：已完成事项、涉及的文件或命令、以及未完成或有风险的事项。",
-        cwd = cwd.display()
-    )
+    let contract = match source {
+        GoalSource::Manual | GoalSource::DailyReview => format!(
+            "【MNS 桌面端执行约定】\n\
+             - 这是一个自主执行任务：请自行拆解步骤、连续调用所需工具，直到目标达成或确认无法继续；\
+             不要逐步向用户提问，也不要等待用户补充信息。\n\
+             - 工作目录：{cwd}\n\
+             {cli_rule}\n\
+             - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
+             - 工作目录可写，但不要另建记录或存档文件：最终结论只通过回答里的 mns-decision 块回传，由 MNS 统一保存与展示。\n\
+             - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
+             MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
+             - 完成后用中文输出：已完成事项、涉及的文件或命令、以及未完成或有风险的事项。",
+            cwd = cwd.display()
+        ),
+        GoalSource::Conversation => format!(
+            "【MNS 桌面端对话约定】\n\
+             - 这是一次对话，不是任务：不要拆解步骤，不要写「我先查一下」「接下来我会…」这类过程旁白。\
+             需要数据可以看下面的清单或调用 mns CLI，查完直接给结论，不要播报你正在查什么。\n\
+             - 用中文回答，像真人聊天：先给结论，再给一两句理由；不要逐条汇报「已完成事项 / 涉及命令」。\n\
+             - 不要输出 mns-decision 块，也不要在正文里写 action、effective、monthly_amount 之类的字段。\n\
+             - 工作目录：{cwd}\n\
+             {cli_rule}\n\
+             - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
+             - 不要另建记录或存档文件。\n\
+             - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
+             MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。",
+            cwd = cwd.display()
+        ),
+    };
+
+    format!("{goal}\n\n---\n{contract}")
 }
 
 /// Pull the last ```mns-decision block out of an assistant message.
@@ -469,6 +501,7 @@ fn extract_decision(text: &str) -> Option<DecisionReport> {
 
 async fn run_session(
     goal: String,
+    source: GoalSource,
     settings: AgentSettings,
     events: EventTx,
     shared: Shared,
@@ -522,7 +555,7 @@ async fn run_session(
     );
 
     let agent = AcpAgent::new(config);
-    let prompt_text = compose_goal(&goal, &cwd, cli.as_deref());
+    let prompt_text = compose_goal(&goal, source, &cwd, cli.as_deref());
 
     let events_for_updates = events.clone();
     let events_for_permissions = events.clone();
@@ -1303,25 +1336,76 @@ mod tests {
 
     #[test]
     fn goal_prompt_carries_the_autonomy_contract() {
-        let prompt = compose_goal(
-            "检查数据",
+        for source in [GoalSource::Manual, GoalSource::DailyReview] {
+            let prompt = compose_goal(
+                "检查数据",
+                source,
+                Path::new("/work"),
+                Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+            );
+            assert!(prompt.starts_with("检查数据"));
+            assert!(prompt.contains("这是一个自主执行任务"));
+            assert!(prompt.contains("不要逐步向用户提问"));
+            assert!(prompt.contains("连续调用所需工具"));
+            assert!(prompt.contains("MNS 不提供 URL 或 API Key"));
+            assert!(prompt.contains("/work"));
+            assert!(prompt.contains("不要执行下单、交易"));
+            assert!(prompt.contains("工作目录可写"));
+            assert!(prompt.contains("mns-decision"));
+            assert!(prompt.contains("已完成事项"));
+        }
+    }
+
+    #[test]
+    fn conversation_prompt_drops_the_task_contract() {
+        let prompt = compile_conversation_goal();
+        assert!(
+            prompt.contains("这是一次对话，不是任务"),
+            "the butler window must not read like an execution order"
+        );
+        assert!(prompt.contains("先给结论"), "answer first, then reasons");
+        assert!(
+            !prompt.contains("这是一个自主执行任务"),
+            "the autonomy contract is exactly what made butler replies report-like"
+        );
+        assert!(!prompt.contains("不要逐步向用户提问"));
+        assert!(!prompt.contains("连续调用所需工具"));
+        assert!(
+            !prompt.contains("完成后用中文输出"),
+            "no completion report in a conversation"
+        );
+        assert!(
+            prompt.contains("不要输出 mns-decision"),
+            "the machine channel is only for task runs"
+        );
+        assert!(prompt.contains("不要执行下单、交易"), "safety rules still apply");
+        assert!(prompt.contains("不要用 find"), "the CLI rule still applies");
+    }
+
+    #[test]
+    fn conversation_prompt_has_no_action_fields() {
+        let prompt = compile_conversation_goal();
+        assert!(prompt.contains("action、effective、monthly_amount"));
+        assert!(
+            !prompt.contains("action: "),
+            "the contract may name the fields but must not teach the syntax"
+        );
+    }
+
+    fn compile_conversation_goal() -> String {
+        compose_goal(
+            "明天 A 股怎么看",
+            GoalSource::Conversation,
             Path::new("/work"),
             Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
-        );
-        assert!(prompt.starts_with("检查数据"));
-        assert!(prompt.contains("不要逐步向用户提问"));
-        assert!(prompt.contains("连续调用所需工具"));
-        assert!(prompt.contains("MNS 不提供 URL 或 API Key"));
-        assert!(prompt.contains("/work"));
-        assert!(prompt.contains("不要执行下单、交易"));
-        assert!(prompt.contains("工作目录可写"));
-        assert!(prompt.contains("mns-decision"));
+        )
     }
 
     #[test]
     fn goal_prompt_names_the_cli_and_forbids_the_storage_layer() {
         let prompt = compose_goal(
             "生成今日报告",
+            GoalSource::Manual,
             Path::new("/work"),
             Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
         );
@@ -1339,7 +1423,7 @@ mod tests {
 
     #[test]
     fn goal_prompt_without_a_cli_forbids_guessing() {
-        let prompt = compose_goal("生成今日报告", Path::new("/work"), None);
+        let prompt = compose_goal("生成今日报告", GoalSource::Manual, Path::new("/work"), None);
         assert!(prompt.contains("未检测到随应用安装的 mns CLI"));
         assert!(prompt.contains("不要自行搜索文件系统"));
         assert!(

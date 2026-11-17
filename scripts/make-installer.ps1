@@ -118,6 +118,21 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build --features gui --bin mns-help 失败（exit $LASTEXITCODE）"
     }
+
+    # 管家审计 CLI（mns-butler status / wake / memory …）。
+    Write-Step '编译 mns-butler.exe（管家审计 CLI，release）'
+    & cargo build --release @targetArgs --bin mns-butler
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build --bin mns-butler 失败（exit $LASTEXITCODE）"
+    }
+
+    # 管家守护进程：与 GUI 同目录，由 GUI 拉起。它走 Windows 命名管道
+    # （\\.\pipe\mns-<app>-<用户名>）与 GUI 握手，关掉主窗口后继续判定。
+    Write-Step '编译 mns-butlerd.exe（管家守护进程，release）'
+    & cargo build --release @targetArgs --features agent --bin mns-butlerd
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build --bin mns-butlerd 失败（exit $LASTEXITCODE）"
+    }
 }
 else {
     Write-Step '跳过编译，使用已有构建产物'
@@ -126,9 +141,11 @@ else {
 $guiExe = Join-Path $binDir 'mns-gui.exe'
 $cliExe = Join-Path $binDir 'mns.exe'
 $helpExe = Join-Path $binDir 'mns-help.exe'
-foreach ($exe in @($guiExe, $cliExe, $helpExe)) {
+$butlerExe = Join-Path $binDir 'mns-butler.exe'
+$butlerdExe = Join-Path $binDir 'mns-butlerd.exe'
+foreach ($exe in @($guiExe, $cliExe, $helpExe, $butlerExe, $butlerdExe)) {
     if (-not (Test-Path -LiteralPath $exe)) {
-        throw "缺少构建产物：$exe（先执行 cargo build --release --features gui --bin mns-gui 与 --bin mns 与 --bin mns-help）"
+        throw "缺少构建产物：$exe（先执行 cargo build --release --features gui --bin mns-gui 与 --bin mns 与 --bin mns-help 与 --bin mns-butler 与 --features agent --bin mns-butlerd）"
     }
 }
 
@@ -151,6 +168,8 @@ New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 Copy-Item -LiteralPath $guiExe -Destination $stageDir
 Copy-Item -LiteralPath $cliExe -Destination $stageDir
 Copy-Item -LiteralPath $helpExe -Destination $stageDir
+Copy-Item -LiteralPath $butlerExe -Destination $stageDir
+Copy-Item -LiteralPath $butlerdExe -Destination $stageDir
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stageDir
 
 # 帮助中心运行时从自身旁边的 help\images 读取截图；没有截图时显示占位框。

@@ -8,7 +8,23 @@
 
 - **Type**: Personal CLI investment tool (Rust)
 - **Binary**: `target/release/mns.exe` (Windows) / `target/release/mns` (Linux/macOS)
-- **Installed CLI**: `/Applications/MNS.app/Contents/MacOS/mns` — the DMG ships the CLI inside the app bundle at the same version as the GUI. When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
+- **Installed CLI**: `/Applications/MNS.app/Contents/MacOS/mns` — the DMG ships the CLI inside the app bundle at the same version as the GUI.
+- **Butler daemon**: `MNS.app/Contents/MacOS/mns-butlerd` is spawned by the GUI and keeps
+  evaluating butler wake sources after the window closes. It never opens the ledger DB
+  (it reads `agent/butler/facts.json` written by the GUI) and it never posts system
+  notifications (macOS rejects them from a helper executable — the GUI delivers).
+  Stop it with the tray item 「停止管家进程」 or `pkill -f mns-butlerd` before testing
+  butler state by hand, or your `mns-butler wake` will race with it. It is
+  event-driven, not a poller: it sleeps until the next computed deadline
+  (scheduled sweep, due task, due commitment) and is woken by pokes from the
+  GUI/CLI over the local channel (Unix socket, or `\\.\pipe\mns-<app>-<user>`
+  on Windows) — no launchd/cron/Task Scheduler entry is involved.
+  It is built with `--features agent`: when the deterministic kernel has nothing
+  to say, it may start an ACP runtime for one short `agent-init` line (120 s
+  timeout, silent on failure, same ledger caps as deterministic notices). The
+  runtime shuts down after every turn, so it never leaves an orphan agent process
+  behind.
+  When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
 - **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/` and `agent/runs/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd.
 - **Stack**: Rust edition 2024, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
@@ -18,6 +34,8 @@
 ### Build
 ```bash
 cargo build --release
+# 管家守护进程需要 agent 特性（agent-init 主动开口）：
+cargo build --release --features agent --bin mns-butlerd
 ```
 
 ### Run
@@ -43,6 +61,9 @@ mns backtest legacy   # 已降级，结论不可迁移到实盘
 
 使用 mns 辅助实盘决策前，先读 mns-advisor 的 `references/buy-sell-playbook.md` 与
 `references/evidence-boundary.md`：情绪信号已被证伪为择时依据，不得据新闻或 FGI 给出买卖点。
+该约束适用于 mns 助手、报告与买卖决策编排；管家（butler）是自主人格，按
+`docs/butler-persona-upgrade-2026-11-17.md` 的双人格边界执行——会话可给倾向性
+观点（自我标注、数字同源、不谎称下单），通知 banner 仍走最严话术口径。
 
 ### Package (Windows)
 ```powershell

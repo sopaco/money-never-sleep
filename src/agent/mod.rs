@@ -27,6 +27,8 @@
 mod runner;
 pub mod routine;
 
+/// 只给桌面端用：没有 `gui` 时没人消费，单独编 `--features agent` 会报警告。
+#[cfg(feature = "gui")]
 pub(crate) use runner::cli_path;
 
 use std::path::{Path, PathBuf};
@@ -96,6 +98,9 @@ pub struct AgentSettings {
     /// 登录系统时静默启动（只常驻托盘）。默认关闭，由用户在设置里开启；
     /// 系统侧登录项由 `gui::autostart` 写入/删除。
     pub launch_at_login: bool,
+    /// F7 空账户清单被用户收起。只存这个 bool：清单的每一步都由数据派生，
+    /// 不存步骤勾选状态，避免出现「清单说做完了、数据说没做」的第二事实源。
+    pub hide_start_checklist: bool,
 }
 
 impl Default for AgentSettings {
@@ -109,6 +114,7 @@ impl Default for AgentSettings {
             daily_review: false,
             daily_review_time: "08:30".to_owned(),
             launch_at_login: false,
+            hide_start_checklist: false,
         }
     }
 }
@@ -120,6 +126,11 @@ pub enum GoalSource {
     #[default]
     Manual,
     DailyReview,
+    /// A chat turn from the butler window. It is still an ACP session, but it
+    /// is not a task: the prompt must not carry the autonomy contract (plan,
+    /// call tools until done, report what was completed, return mns-decision).
+    /// That contract turned butler replies into execution reports.
+    Conversation,
 }
 
 /// A structured conclusion returned by the agent inside a ```mns-decision
