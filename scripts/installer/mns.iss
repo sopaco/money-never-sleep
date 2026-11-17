@@ -103,7 +103,9 @@ Source: "{#SourceDir}\help\*"; DestDir: "{app}\help"; Flags: ignoreversion recur
 
 [Icons]
 Name: "{autoprograms}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"
-Name: "{autoprograms}\{#AppDisplayName} 帮助中心"; Filename: "{app}\{#HelpExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"
+; 帮助中心的图标来自 mns-help.exe 自身嵌入的 ID-1 资源（build.rs 按 bin 编入
+; icon_help.ico），所以快捷方式直接引用 exe，不再复用主程序的 app.ico。
+Name: "{autoprograms}\{#AppDisplayName} 帮助中心"; Filename: "{app}\{#HelpExeName}"; IconFilename: "{app}\{#HelpExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]

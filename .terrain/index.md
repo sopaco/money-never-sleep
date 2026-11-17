@@ -21,6 +21,7 @@ source: .
 
   - Cargo.toml
   - LICENSE
+  - tests/
   - distribution/
     - skill/
     - bin-win-x64/
@@ -32,10 +33,12 @@ source: .
   - build.rs
   - README.md
   - examples/
+    - butler_talk_smoke.rs
     - agent_smoke.rs
   - README_zh.md
   - scripts/
     - make-installer.ps1
+    - make-texture.py
     - make-dmg.sh
     - make-help-diagrams.sh
     - make-icons.swift
@@ -45,7 +48,10 @@ source: .
     - tray-32.rgba
     - app_icon.png
     - tray-22.rgba
+    - icon_help.png
     - AppIcon.icns
+    - icon_butler.png
+    - butler-texture.png
     - app.ico
     - icon-128.png
     - icon-512.png
@@ -75,28 +81,22 @@ source: .
     - finance-guide.md
     - start.md
     - finance-insurance.md
+    - desktop-butler.md
     - finance-mistakes.md
     - finance-qdii.md
     - finance-alternatives.md
+    - cli-butler.md
   - src/
+    - notify.rs
     - strategy.rs
     - quote.rs
     - market.rs
     - app/
+    - ipc.rs
     - bin/
     - live_data.rs
     - audit.rs
     - signal.rs
     - config.rs
     - lib.rs
-    - sentiment.rs
-    - discipline.rs
-    - models.rs
-    - agent/
-    - db.rs
-    - metrics.rs
-    - report.rs
-    - guardrail.rs
-    - gui/
-    - backtest.rs
   - …
