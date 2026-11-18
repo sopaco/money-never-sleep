@@ -53,7 +53,9 @@ source: .
     - icon_butler.png
     - butler-texture.png
     - app.ico
+    - icon_help.ico
     - icon-128.png
+    - icon_butler.ico
     - icon-512.png
   - CLAUDE.md
   - help/
@@ -97,6 +99,4 @@ source: .
     - live_data.rs
     - audit.rs
     - signal.rs
-    - config.rs
-    - lib.rs
   - …
