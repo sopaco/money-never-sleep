@@ -362,16 +362,12 @@ async fn fetch_from_yahoo(symbol: &str) -> Result<Option<f64>> {
 /// - 字母开头: 美股/ETF，使用 Yahoo Finance
 /// - 其他: 尝试 Yahoo Finance
 pub async fn fetch_price(code: &str, category: &str) -> Result<Option<f64>> {
-    // 根据代码特征判断数据源
     let is_chinese_fund = code.len() == 6 && code.chars().all(|c| c.is_ascii_digit());
 
     if is_chinese_fund || category == "cn_stocks" {
-        // 国内基金: 优先天天基金
         if let Some(price) = fetch_from_tiantian(code).await? {
             return Ok(Some(price));
         }
-        // 如果天天基金没有数据，可能是 QDII 等特殊基金，尝试 Yahoo
-        // QDII 在 Yahoo 可能有对应代码，但通常不完整
         Ok(None)
     } else {
         // 美股/ETF: 使用 Yahoo Finance
@@ -401,14 +397,12 @@ pub async fn update_all_prices(positions: &[Position]) -> Result<Vec<PriceUpdate
                 });
             }
             Ok(None) => {
-                // 接口无数据，跳过该资产
                 eprintln!(
                     "⚠ 无法获取 {} ({}) 的价格数据，已跳过",
                     pos.asset_code, pos.asset_name
                 );
             }
             Err(e) => {
-                // 请求失败，跳过该资产，继续处理其他
                 eprintln!(
                     "⚠ 获取 {} ({}) 价格失败: {}，已跳过",
                     pos.asset_code, pos.asset_name, e
@@ -421,15 +415,7 @@ pub async fn update_all_prices(positions: &[Position]) -> Result<Vec<PriceUpdate
 }
 
 /// 获取单个股票的完整报价信息（用于市场分析）
-///
-/// # Arguments
-/// * `symbol` - 股票代码（如 AAPL, ^GSPC）
-///
-/// # Returns
-/// * `Ok(StockQuote)` - 完整报价信息
-/// * `Err` - 获取失败
 pub async fn fetch_full_quote(symbol: &str) -> Result<StockQuote> {
-    // 使用 Yahoo Finance v8 API 获取完整报价
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=2d",
         symbol
@@ -456,7 +442,6 @@ pub async fn fetch_full_quote(symbol: &str) -> Result<StockQuote> {
 
     let json: serde_json::Value = resp.json().await.context("解析 Yahoo Finance 响应失败")?;
 
-    // 解析响应
     let chart = json.get("chart").context("响应缺少 chart 字段")?;
     let result = chart
         .get("result")

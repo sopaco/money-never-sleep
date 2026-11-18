@@ -50,18 +50,15 @@ pub async fn fetch_market_indices() -> Result<Vec<MarketQuote>> {
         match quote::fetch_full_quote(symbol).await {
             Ok(q) => {
                 let mut quote: MarketQuote = q.into();
-                // 使用预定义的中文名称
                 quote.name = default_name.to_string();
                 quotes.push(quote);
             }
             Err(e) => {
-                // 收集错误信息，稍后统一显示
                 errors.push((*symbol, e.to_string()));
             }
         }
     }
 
-    // 使用表格显示获取失败的指数
     if !errors.is_empty() {
         let mut error_table = Table::new();
         error_table

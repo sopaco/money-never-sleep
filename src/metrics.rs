@@ -45,7 +45,6 @@ pub fn xirr(flows: &[CashFlow]) -> Option<f64> {
         if f.abs() < 1e-9 {
             return Some(rate);
         }
-        // 数值导数
         let h = 1e-6;
         let d = (npv(rate + h) - f) / h;
         if d.abs() < 1e-12 {
@@ -433,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn 台账流水转XIRR符号约定正确() {
         // 台账：期初 +10000（D0）、入金 +5000（D+30）；终值 16000（D+90）。
         // XIRR 视角：投出 -10000、-5000，期末拿回 +16000 → 盈利为正。

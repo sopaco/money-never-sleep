@@ -109,7 +109,6 @@ fn cmd_init(force: bool) -> Result<()> {
         }
     }
 
-    // 用户确认后，删除旧的数据库文件
     if db_exists {
         std::fs::remove_file(&db_path)
             .with_context(|| format!("删除数据库失败: {}", db_path.display()))?;
@@ -122,7 +121,6 @@ fn cmd_init(force: bool) -> Result<()> {
     let db = db::Database::open()?;
     drop(db);
 
-    // 创建报告输出目录
     let report_dir = config.report_dir();
     std::fs::create_dir_all(&report_dir)?;
 
@@ -146,12 +144,10 @@ fn cmd_config(key: Option<String>, value: Option<String>) -> Result<()> {
 
     match (key, value) {
         (None, None) => {
-            // 显示全部配置
             let content = toml::to_string_pretty(&config)?;
             println!("{}", content);
         }
         (Some(k), None) => {
-            // 显示某个配置项
             match config.get_value(&k) {
                 Some(v) => println!("{} = {}", k, v),
                 None => anyhow::bail!("未知的配置项: {}", k),
@@ -747,7 +743,6 @@ async fn cmd_sentiment() -> Result<()> {
     let config = AppConfig::load()?;
     println!("正在获取恐贪指数...");
 
-    // 使用配置的 API URL
     let url = &config.api.fear_greed_url;
     let data = sentiment::fetch_fear_greed_data(url).await?;
     let score_f64 = data.score as f64;
@@ -755,7 +750,6 @@ async fn cmd_sentiment() -> Result<()> {
 
     println!("恐贪指数: {} ({})", data.score, zone);
 
-    // 保存快照（含历史数据）
     let db = db::Database::open()?;
     db.save_fear_greed_snapshot(
         score_f64,
@@ -2100,7 +2094,6 @@ async fn cmd_update_prices() -> Result<()> {
         return Ok(());
     }
 
-    // 更新数据库并显示结果
     println!(
         "{:<10} {:<20} {:>12} {:>12} {:>8}",
         "代码", "名称", "原价格", "新价格", "来源"
@@ -2108,7 +2101,6 @@ async fn cmd_update_prices() -> Result<()> {
     println!("{}", "-".repeat(66));
 
     for update in &updates {
-        // 更新数据库
         db.update_price(&update.asset_code, update.new_price)?;
 
         let old = update
@@ -2140,11 +2132,9 @@ async fn cmd_update_prices() -> Result<()> {
 async fn cmd_market() -> Result<()> {
     println!("📊 市场综合概况\n");
 
-    // 获取指数数据
     println!("正在获取全球主要指数...");
     let indices = market::fetch_market_indices().await?;
 
-    // 显示指数表格
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -2168,7 +2158,6 @@ async fn cmd_market() -> Result<()> {
 
     println!("{}", table);
 
-    // 获取恐贪指数
     println!("\n正在获取 CNN Fear & Greed Index...");
     let config = AppConfig::load()?;
     let url = &config.api.fear_greed_url;
@@ -2189,10 +2178,8 @@ async fn cmd_market() -> Result<()> {
 async fn cmd_analyze(symbol: &str) -> Result<()> {
     println!("📊 分析: {}\n", symbol);
 
-    // 获取报价数据
     let quote = market::fetch_stock_quote(symbol).await?;
 
-    // 显示基础报价信息
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)

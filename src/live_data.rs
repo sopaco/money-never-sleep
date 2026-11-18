@@ -558,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn 解析应跳过注释表头与缺失FGI() {
         let days = LiveDataset::parse(sample()).unwrap();
         assert_eq!(days.len(), 3);
@@ -567,6 +568,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn FGI缺失日不进入策略验证段() {
         let ds = LiveDataset {
             days: LiveDataset::parse(sample()).unwrap(),

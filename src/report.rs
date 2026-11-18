@@ -340,7 +340,6 @@ pub fn generate_report(
     }
     report.push_str("\n\n");
 
-    // 账户概览
     // `.sum()` 在空迭代器（无持仓）上返回 -0.0（IEEE 754 加法恒等元的符号），
     // 数值上等于 0.0 不影响后续计算，但 "{:.2}" 会原样打印成 "¥-0.00" 误导用户，
     // 因此用 "+ 0.0" 归一化符号（-0.0 + 0.0 == 0.0，对非零值无影响）。
@@ -364,7 +363,6 @@ pub fn generate_report(
     }
     report.push('\n');
 
-    // 持仓明细
     if !positions.is_empty() {
         report.push_str("  持仓明细:\n");
 
@@ -398,7 +396,6 @@ pub fn generate_report(
                 None => "-".to_string(),
             };
 
-            // 年化收益单元格着色
             let mut ann_cell = Cell::new(&ann_str);
             if let Some(r) =
                 pos.annualized_return_with_min_days(&today_date, config.settings.min_holding_days)
@@ -421,7 +418,6 @@ pub fn generate_report(
             ]);
         }
 
-        // 将表格每行缩进两个空格
         for line in table.to_string().lines() {
             report.push_str(&format!("  {}\n", line));
         }
@@ -516,7 +512,6 @@ pub fn generate_report(
     }
     report.push('\n');
 
-    // 净操作指引
     report.push_str("【净操作指引】\n");
     if plan.has_action() {
         report.push_str(&format!(
@@ -576,7 +571,6 @@ pub fn generate_report(
     }
     report.push('\n');
 
-    // 风险警告
     if !risk_warnings.is_empty() {
         report.push_str("【风险警告】\n");
         for w in risk_warnings {
@@ -818,7 +812,6 @@ pub fn generate_observation_report(
     }
     report.push('\n');
 
-    // 下一决策日
     let dw = config.rebalance.decision_weekday;
     if dw >= 1 && dw <= 7 {
         let names = ["一", "二", "三", "四", "五", "六", "日"];
@@ -1012,6 +1005,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn TLDR动作行使用精确金额与明细同口径() {
         // P3：动作行曾是"买入 ¥1300"（百位取整）而明细是 ¥1352.31，
         // 两数并存会让人怀疑哪个才是要执行的金额——动作行必须精确。

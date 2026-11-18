@@ -41,6 +41,7 @@ pub enum Intent {
     OpenButler,
 }
 
+#[cfg(windows)]
 impl Intent {
     /// 命名事件的后缀。`Open` 沿用旧名字，升级过程中老 Primary 也认得。
     fn event_suffix(self) -> &'static str {

@@ -401,13 +401,11 @@ impl Database {
         let today = Local::now().format("%Y-%m-%d").to_string();
         let amount = shares * price;
 
-        // 先检查现金余额
         let balance = self.get_cash_balance()?;
         if balance < amount {
             anyhow::bail!("现金余额不足: 当前 ¥{:.2}, 需要 ¥{:.2}", balance, amount);
         }
 
-        // 更新持仓：加权平均成本
         let old_total = pos.shares * pos.cost_price;
         let new_shares = pos.shares + shares;
         let new_cost_price = if new_shares > 0.0 {
@@ -422,7 +420,6 @@ impl Database {
             pos.first_buy_date.clone()
         };
 
-        // 使用事务保证原子性
         let tx = self
             .conn
             .unchecked_transaction()
@@ -478,7 +475,6 @@ impl Database {
 
         let balance = self.get_cash_balance()?;
 
-        // 使用事务保证原子性
         let tx = self
             .conn
             .unchecked_transaction()

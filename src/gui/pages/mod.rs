@@ -98,7 +98,6 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui_kit::base::StyledExt;
     use gpui_kit::{
         AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled,
         TestAppContext, Window, div, px, size,

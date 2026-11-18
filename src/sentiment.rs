@@ -47,24 +47,15 @@ pub struct FearGreedData {
 }
 
 /// 获取完整恐贪指数数据（含历史）
-///
-/// # Arguments
-/// * `url` - CNN API 端点 URL
-///
-/// # Returns
-/// * `Ok(FearGreedData)` - 完整数据结构
-/// * `Err` - 网络错误或解析错误
 pub async fn fetch_fear_greed_data(url: &str) -> Result<FearGreedData> {
     let client = build_client()?;
 
     let mut last_error = None;
 
-    // 重试机制
     for attempt in 1..=MAX_RETRIES {
         match try_fetch(&client, url).await {
             Ok(data) => return Ok(data),
             Err(e) => {
-                // 最后一次尝试不等待
                 if attempt < MAX_RETRIES {
                     tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
                 }
@@ -73,7 +64,6 @@ pub async fn fetch_fear_greed_data(url: &str) -> Result<FearGreedData> {
         }
     }
 
-    // 所有重试都失败
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
 }
 
@@ -95,7 +85,6 @@ async fn try_fetch(client: &Client, url: &str) -> Result<FearGreedData> {
 
     let text = response.text().await.context("读取响应内容失败")?;
 
-    // 解析 JSON，提取历史数据
     parse_cnn_response(&text)
 }
 
