@@ -41,12 +41,15 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use money_never_sleep::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource};
 use money_never_sleep::butler::agenda;
-use money_never_sleep::butler::orchestrator::{self, AccountFacts};
+use money_never_sleep::butler::orchestrator::{
+    self, AccountFacts, AgentInitOutcome, AgentInitRecord, AGENT_INIT_MIN_IDLE_HOURS,
+    agent_init_backoff, append_init_record,
+};
 use money_never_sleep::butler::schedule;
 use money_never_sleep::butler::talk;
 use money_never_sleep::butler::{
-    butler_dir, Butler, Memory, Role, Session, SilentBecause, SpeakCandidate, SpeakDecision,
-    SpeakReason, WakeSource, WakeVerdict,
+    butler_dir, writer_lock, Butler, Memory, Role, Session, SilentBecause, SpeakCandidate,
+    SpeakDecision, SpeakReason, WakeSource, WakeVerdict,
 };
 use money_never_sleep::ipc::{self, Client, Signal};
 use tokio::sync::mpsc::UnboundedSender;
@@ -65,10 +68,6 @@ const FACTS_PRICE_AGE_HOURS: i64 = 24;
 /// 睡眠的绝对时刻更稳。它不代表「每半小时巡检一次」：巡检间隔仍由
 /// `WakeScheduler` 判定。
 const MAX_SLEEP: Duration = Duration::from_secs(30 * 60);
-
-/// 主动开口（agent-init）与上一次会话往来之间至少隔这么久。太近就不开口：
-/// 用户刚聊完，管家再自己起话头会像催促。
-const AGENT_INIT_MIN_IDLE_HOURS: i64 = 12;
 
 /// 一次 agent-init 的硬超时。超时即本轮沉默——主动开口没有模板兜底，
 /// 不说比说一半好，更不能卡住主循环。
@@ -119,7 +118,15 @@ async fn run() -> Result<()> {
         tokio::select! {
             biased;
             // 状态变更优先：GUI 记完账、CLI 加完任务，都不该等下一次排程。
-            Some(event) = events.recv() => {
+            event = events.recv() => {
+                // 事件源全没了：accept 线程与所有读连接线程都已退出，本地
+                // 通道从此无人能连上。继续待着只会变成「活着但聋」的进程
+                // ——GUI 下次启动探活失败会再拉一个新的，进程就攒起来。主动
+                // 退出：连接断开后 GUI 会收回巡检与通知。
+                let Some(event) = event else {
+                    link.send(&Signal::Bye);
+                    return Ok(());
+                };
                 if handle_event(event, &mut link, &init_busy, &init_tx) {
                     return Ok(());
                 }
@@ -196,6 +203,9 @@ fn wake(
     link.ensure();
     let now = Local::now();
 
+    // 读-改-写全程持锁：GUI 巡检与 CLI 可能同时各跑一份判定，后保存的
+    // 会把先保存的去重键覆盖回旧值。
+    let _guard = writer_lock();
     let mut butler = match Butler::load() {
         Ok(butler) => butler,
         Err(error) => {
@@ -228,11 +238,14 @@ fn wake(
             // GUI 没在跑也没关系：它下次连上来时会在 `Hello` 之后补齐积压。
             link.send(&Signal::Pending);
         }
-        // 确定性内核没有由头时，才让 agent 自己找话头。只认定时巡检：
-        // 「刚记完一笔账」是账本事件，不该变成一次闲聊。
+        // 确定性内核没有由头时，才让 agent 自己找话头。只认定时巡检与
+        // 失败重试：「刚记完一笔账」是账本事件，不该变成一次闲聊。
         Some(SpeakDecision::Silent(silent))
             if silent == SilentBecause::NothingToSay
-                && matches!(source, WakeSource::Scheduled)
+                && matches!(
+                    source,
+                    WakeSource::Scheduled | WakeSource::AgentInitRetry { .. }
+                )
                 && schedule::gate(&butler.state.policy, &butler.state.ledger, now).is_ok() =>
         {
             spawn_agent_init(init_busy, init_tx);
@@ -269,20 +282,31 @@ fn spawn_agent_init(busy: &Arc<AtomicBool>, done: &UnboundedSender<()>) {
 /// 成本与风险都写在这里：起一个独立 ACP runtime，120 秒内拿不到回答就放弃；
 /// 拿到回答后必须过 `validate_talk` 与通知口径（≤60 字、无买卖话术），
 /// 任何一步不过都沉默——主动开口没有模板兜底，不说比说错好。
+///
+/// 失败不再沉默 12 小时：结果（含失败原因）写进 `initlog.jsonl`，
+/// 下一次尝试按 `agent_init_backoff` 退避。模型说「无」是合法回答，
+/// 不算失败、不缩短节奏。
+///
+/// 锁只包「读-改-写」，绝不跨 await：等 agent 回答的 120 秒里不挡
+/// 别的写者。
 async fn run_agent_init() -> Result<bool> {
     let now = Local::now();
-    let mut butler = Butler::load()?;
-    if schedule::gate(&butler.state.policy, &butler.state.ledger, now).is_err() {
-        return Ok(false);
-    }
-    // 尝试本身也有 12 小时节奏：模型可能每次都说「无」，不能每轮巡检都
-    // 拉起一次外部会话。成功开口另由 ledger 频控约束。
-    let session = Session::load().unwrap_or_default();
-    if !agent_init_due(&butler, &session, now) {
-        return Ok(false);
-    }
-    butler.state.last_agent_init = Some(now);
-    butler.save_state()?;
+    let (butler, session) = {
+        let _guard = writer_lock();
+        let mut butler = Butler::load()?;
+        if schedule::gate(&butler.state.policy, &butler.state.ledger, now).is_err() {
+            return Ok(false);
+        }
+        // 尝试本身也有节奏：模型可能每次都说「无」，不能每轮巡检都拉起一次
+        // 外部会话。成功开口另由 ledger 频控约束。
+        let session = Session::load().unwrap_or_default();
+        if !agent_init_due(&butler, &session, now) {
+            return Ok(false);
+        }
+        butler.state.last_agent_init = Some(now);
+        butler.save_state()?;
+        (butler, session)
+    };
 
     let facts = account_facts(&butler, now);
     let memory = memory_lines(&butler.memory);
@@ -301,6 +325,7 @@ async fn run_agent_init() -> Result<bool> {
         .is_err()
     {
         let _ = handle.send(AgentCommand::Shutdown);
+        record_init(AgentInitOutcome::Failed, Some("agent 会话没能启动"));
         return Ok(false);
     }
     let raw = collect_reply(&handle, &mut events).await;
@@ -309,40 +334,92 @@ async fn run_agent_init() -> Result<bool> {
     let _ = handle.send(AgentCommand::Shutdown);
 
     let Some(raw) = raw else {
+        record_init(
+            AgentInitOutcome::Failed,
+            Some(&format!(
+                "agent {} 秒内没答完或会话中断",
+                AGENT_INIT_TIMEOUT.as_secs()
+            )),
+        );
         return Ok(false);
     };
-    let Ok(cleaned) = talk::validate_talk(&raw) else {
-        return Ok(false);
+    let cleaned = match talk::validate_talk(&raw) {
+        Ok(cleaned) => cleaned,
+        Err(error) => {
+            record_init(
+                AgentInitOutcome::Failed,
+                Some(&format!("回答没过校验：{error}")),
+            );
+            return Ok(false);
+        }
     };
     // 这一条会进系统通知横幅：banner 是纯文本通道，星号会原样显示。会话
     // 气泡也复用同一条文本，单行提醒不需要 markdown。
     let text = talk::notification_text(&cleaned);
     if text.is_empty() || text == "无" || text == "无。" {
+        record_init(AgentInitOutcome::Silent, Some("模型说无"));
         return Ok(false);
     }
     // banner 是被动打扰通道：长度与话术口径与会话不同，这里不降级、只沉默。
-    if schedule::validate_notification(&text).is_err() {
+    if let Err(violation) = schedule::validate_notification(&text) {
+        record_init(
+            AgentInitOutcome::Failed,
+            Some(&format!("回答没过通知口径：{violation}")),
+        );
         return Ok(false);
     }
 
     // 等待回答期间别的路径可能已经开过口：重新加载后再查一次额度，并把
     // 这一条记进同一本 ledger——频控与审计不分 agent 还是确定性内核。
-    let mut butler = Butler::load()?;
-    let now = Local::now();
-    if schedule::gate(&butler.state.policy, &butler.state.ledger, now).is_err() {
-        return Ok(false);
+    {
+        let _guard = writer_lock();
+        let mut butler = Butler::load()?;
+        let now = Local::now();
+        if schedule::gate(&butler.state.policy, &butler.state.ledger, now).is_err() {
+            record_init(AgentInitOutcome::Silent, Some("回答到达时额度已满"));
+            return Ok(false);
+        }
+        let candidate = SpeakCandidate {
+            reason: SpeakReason::AgentInit,
+            trigger: agent_init_trigger(&butler.state.ledger, now),
+            draft: text,
+        };
+        butler.state.ledger.record(now, &candidate);
+        butler.state.ledger.trim(now, 30);
+        butler.state.agent_init_failures = 0;
+        butler.save_state()?;
+        orchestrator::enqueue_notice(now, &candidate)?;
+        orchestrator::enqueue_pending(now, &candidate)?;
     }
-    let candidate = SpeakCandidate {
-        reason: SpeakReason::AgentInit,
-        trigger: agent_init_trigger(&butler.state.ledger, now),
-        draft: text,
-    };
-    butler.state.ledger.record(now, &candidate);
-    butler.state.ledger.trim(now, 30);
-    butler.save_state()?;
-    orchestrator::enqueue_notice(now, &candidate)?;
-    orchestrator::enqueue_pending(now, &candidate)?;
+    record_init(AgentInitOutcome::Spoke, None);
     Ok(true)
+}
+
+/// 落一笔 agent-init 尝试记录，并按结果更新退避计数。
+///
+/// 决策日志先行（append-only，`mns-butler status` 直接读）；状态更新
+/// 拿写锁、失败不重试——计数丢了最多是退避不准，不能反过来阻断主流程。
+/// Spoke 路径在 `run_agent_init` 里已把计数清零并保存，这里只补日志。
+fn record_init(outcome: AgentInitOutcome, detail: Option<&str>) {
+    let record = AgentInitRecord {
+        at: Local::now(),
+        outcome,
+        detail: detail.map(str::to_owned),
+    };
+    if let Err(error) = append_init_record(&record) {
+        eprintln!("mns-butlerd: agent-init 决策日志写入失败：{error:#}");
+    }
+    if outcome != AgentInitOutcome::Failed {
+        return; // 开口与正常沉默：不动退避计数。
+    }
+    let _guard = writer_lock();
+    let Ok(mut butler) = Butler::load() else {
+        return;
+    };
+    butler.state.agent_init_failures = butler.state.agent_init_failures.saturating_add(1);
+    if let Err(error) = butler.save_state() {
+        eprintln!("mns-butlerd: agent-init 退避计数保存失败：{error:#}");
+    }
 }
 
 /// 等到这一轮正文结束。超时、进程报错、会话提前关闭都返回 `None`。
@@ -398,15 +475,16 @@ fn recent_activity(
             .any(|record| record.at >= cutoff)
 }
 
-/// 此刻该不该尝试 agent-init：距上次尝试 ≥12 小时，且 12 小时内没有别的
-/// 往来。两个条件都用同一个窗口——管家不该在用户刚说完话时自己起话头，
-/// 也不该在模型连续说「无」时反复花一次会话成本。
+/// 此刻该不该尝试 agent-init：距上次尝试 ≥ 退避时长（无失败 = 常规 12
+/// 小时；失败 1/2/≥3 次 = 15 分钟 / 1 小时 / 6 小时），且 12 小时内没有
+/// 别的往来。两个条件分开看：管家不该在用户刚说完话时自己起话头，
+/// 也不该在模型连续失败时反复花一次会话成本，更不该一次失败就沉默半天。
 fn agent_init_due(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
-    let cutoff = now - chrono::Duration::hours(AGENT_INIT_MIN_IDLE_HOURS);
+    let cooldown = agent_init_backoff(butler.state.agent_init_failures);
     let attempted_recently = butler
         .state
         .last_agent_init
-        .is_some_and(|last| last >= cutoff);
+        .is_some_and(|last| now - last < cooldown);
     !attempted_recently && !recent_activity(butler, session, now)
 }
 
@@ -514,12 +592,15 @@ fn account_facts(butler: &Butler, now: DateTime<Local>) -> AccountFacts {
 }
 
 fn set_proactive(enabled: bool) -> Result<()> {
+    let _guard = writer_lock();
     let mut butler = Butler::load()?;
     if butler.state.policy.enabled == enabled {
         return Ok(());
     }
     butler.state.policy.enabled = enabled;
-    butler.save()
+    // 只写状态文件：这里只动了开关，顺手重写记忆与任务会把另一个进程
+    // 刚写进去的条目覆盖回旧值。
+    butler.save_state()
 }
 
 /// Ctrl-C / SIGTERM。托盘「停止管家进程」走的是 socket 上的 `Shutdown`，
@@ -660,6 +741,37 @@ mod tests {
         // 13 小时后可以再试。
         butler.state.last_agent_init = Some(at(15, 20));
         assert!(agent_init_due(&butler, &Session::default(), now));
+    }
+
+    #[test]
+    fn 失败后退避而不是沉默十二小时() {
+        let now = at(16, 10);
+        let mut butler = butler_with(vec![]);
+        // 1 小时前失败 1 次：15 分钟退避已过，应当再试。
+        butler.state.last_agent_init = Some(now - chrono::Duration::hours(1));
+        butler.state.agent_init_failures = 1;
+        assert!(agent_init_due(&butler, &Session::default(), now));
+        // 10 分钟前刚失败：还在 15 分钟退避里，不试。
+        butler.state.last_agent_init = Some(now - chrono::Duration::minutes(10));
+        butler.state.agent_init_failures = 1;
+        assert!(!agent_init_due(&butler, &Session::default(), now));
+        // 失败 2 次、20 分钟前：1 小时退避未到。
+        butler.state.last_agent_init = Some(now - chrono::Duration::minutes(20));
+        butler.state.agent_init_failures = 2;
+        assert!(!agent_init_due(&butler, &Session::default(), now));
+        // 失败 2 次、70 分钟前：可以再试。
+        butler.state.last_agent_init = Some(now - chrono::Duration::minutes(70));
+        butler.state.agent_init_failures = 2;
+        assert!(agent_init_due(&butler, &Session::default(), now));
+        // 退避再短，用户 12 小时内聊过天就不主动开口。
+        butler.state.last_agent_init = Some(now - chrono::Duration::hours(3));
+        butler.state.agent_init_failures = 3;
+        let mut session = Session::default();
+        session.messages.push(money_never_sleep::butler::Message::user(
+            now - chrono::Duration::minutes(1),
+            "刚聊完",
+        ));
+        assert!(!agent_init_due(&butler, &session, now));
     }
 
     #[test]

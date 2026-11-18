@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime};
 use clap::{Parser, Subcommand};
 use money_never_sleep::butler::events;
+use money_never_sleep::butler::orchestrator::{self, agent_init_backoff};
 use money_never_sleep::butler::tasks::ButlerTask;
 use money_never_sleep::butler::{AccountFacts, Butler, memory, schedule};
 
@@ -179,6 +180,48 @@ fn status() -> Result<()> {
     );
     println!("近 7 日开口：{recent_speaks} 次");
 
+    // agent 自主开口的尝试记录：回答「昨天 8 点为什么没说话」。
+    // 失败原因只在守护进程 stderr 里的话，GUI 拉起的守护进程谁也看不见。
+    match state.last_agent_init {
+        None => println!("agent 自主开口：从未尝试"),
+        Some(last) => {
+            let failures = state.agent_init_failures;
+            let next = last + agent_init_backoff(failures);
+            match failures {
+                0 => println!(
+                    "agent 自主开口：上次尝试 {}（常规节奏，最早 {}）",
+                    last.format("%Y-%m-%d %H:%M"),
+                    next.format("%m-%d %H:%M")
+                ),
+                count => println!(
+                    "agent 自主开口：上次尝试 {} · 连续失败 {count} · 按退避最早 {}",
+                    last.format("%Y-%m-%d %H:%M"),
+                    next.format("%m-%d %H:%M")
+                ),
+            }
+            for record in orchestrator::read_init_records(3).iter().rev() {
+                let detail = record
+                    .detail
+                    .as_deref()
+                    .unwrap_or(if record.outcome == orchestrator::AgentInitOutcome::Spoke {
+                        "已开口"
+                    } else {
+                        ""
+                    });
+                if detail.is_empty() {
+                    println!("  {} {}", record.at.format("%m-%d %H:%M"), record.outcome.label());
+                } else {
+                    println!(
+                        "  {} {}：{}",
+                        record.at.format("%m-%d %H:%M"),
+                        record.outcome.label(),
+                        detail
+                    );
+                }
+            }
+        }
+    }
+
     println!(
         "记忆：事实 {} 条 / 摘要 {} 条；归档事实 {} 条、摘要 {} 条",
         butler.memory.facts.len(),
@@ -253,6 +296,8 @@ fn wake(ledger: Option<String>) -> Result<()> {
         facts.heavy_page = Some((page_label(page).to_owned(), *views));
     }
 
+    // 读-改-写全程持锁（守护进程没在跑才会走到这里）。
+    let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
     let report = butler.wake(&source, now, &facts);
     butler.save()?;
@@ -287,6 +332,8 @@ fn wake(ledger: Option<String>) -> Result<()> {
 fn tick() -> Result<()> {
     let now = Local::now();
     let today = now.date_naive();
+    // 读-改-写全程持锁：自整理会同时动三份文件。
+    let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
 
     let memory = butler.memory.compact(today);
@@ -336,10 +383,10 @@ fn remember(text: &str, due: Option<&str>) -> Result<()> {
     if let Some(day) = due {
         fact = fact.expires_on(day);
     }
-    let mut butler = Butler::load()?;
-    let verdict = butler.memory.remember(fact);
-    // 只写记忆文件：顺手重写 state/tasks 会覆盖掉守护进程刚写的去重键。
-    butler.save_memory()?;
+    // 只改记忆文件：`Memory::update` 在写锁内重读再落盘——顺手重写
+    // state/tasks 会覆盖掉守护进程刚写的去重键，拿旧快照覆盖记忆则会
+    // 吞掉 GUI 窗口刚记下的条目。
+    let (_, verdict) = memory::Memory::update(|memory| memory.remember(fact))?;
 
     match verdict {
         memory::Remembered::Merged => println!("已有同义条目，引用计数 +1：{body}"),
@@ -397,13 +444,12 @@ fn forget(text: &str) -> Result<()> {
         Some(memory::Intent::Forget { needle }) => needle,
         _ => text.trim().to_owned(),
     };
-    let mut butler = Butler::load()?;
-    let hits = butler.memory.forget(&needle);
+    // 锁内重读再落盘：GUI 窗口可能正开着，别拿启动快照覆盖它的条目。
+    let (_, hits) = memory::Memory::update(|memory| memory.forget(&needle))?;
     if hits.is_empty() {
         println!("没有匹配「{needle}」的记忆");
         return Ok(());
     }
-    butler.save_memory()?;
     for fact in &hits {
         println!("已忘掉（{}）：{}", fact.kind.label(), fact.text);
     }
@@ -455,6 +501,8 @@ fn list_tasks() -> Result<()> {
 
 fn task(action: TaskAction) -> Result<()> {
     let now = Local::now();
+    // 读-改-写全程持锁：GUI 巡检与守护进程可能同时在写 tasks.json。
+    let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
     match action {
         TaskAction::Add { intent, at, key } => {
@@ -514,6 +562,7 @@ fn set_proactive(enabled: bool) -> Result<()> {
         println!("主动开口：{label}（已交由守护进程落盘）");
         return Ok(());
     }
+    let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
     butler.state.policy.enabled = enabled;
     butler.save_state()?;

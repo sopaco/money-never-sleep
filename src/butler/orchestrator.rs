@@ -310,6 +310,104 @@ pub struct ButlerState {
     /// 时每 4 小时起一次外部会话——尝试本身也要有节奏。
     #[serde(default)]
     pub last_agent_init: Option<DateTime<Local>>,
+    /// agent 主动开口的连续失败次数。
+    ///
+    /// 失败（起不来、超时、回答过不了校验）按 [`agent_init_backoff`]
+    /// 退避重试，而不是静默 12 小时；成功开口或模型正常说「无」不改变
+    /// 这个计数——「无」是合法回答，不是故障。
+    #[serde(default)]
+    pub agent_init_failures: u32,
+}
+
+/// agent-init 与上一次会话往来之间至少隔这么久（常规节奏，无失败时）。
+///
+/// 用户刚聊完，管家不该自己起话头；模型连续说「无」时也不该每轮巡检
+/// 都花一次外部会话。
+pub const AGENT_INIT_MIN_IDLE_HOURS: i64 = 12;
+
+/// agent-init 失败后的重试节奏：15 分钟 → 1 小时 → 6 小时封顶。
+///
+/// 失败一次就沉默 12 小时，用户看到的是「管家好几天不说话」；CLI 路径
+/// 配错这类问题修好后也该快点恢复。成功开口（`failures == 0`）回到常规
+/// 的 [`AGENT_INIT_MIN_IDLE_HOURS`]。
+pub fn agent_init_backoff(failures: u32) -> chrono::Duration {
+    match failures {
+        0 => chrono::Duration::hours(AGENT_INIT_MIN_IDLE_HOURS),
+        1 => chrono::Duration::minutes(15),
+        2 => chrono::Duration::hours(1),
+        _ => chrono::Duration::hours(6),
+    }
+}
+
+/// agent-init 的决策日志：`agent/butler/initlog.jsonl`，每次尝试一行。
+///
+/// 守护进程是唯一写者（只追加）。`mns-butler status` 读它回答「昨天
+/// 8 点为什么没说话」——失败原因只打 stderr 的话，GUI 拉起的守护进程
+/// 谁也看不见。
+pub fn initlog_path() -> std::path::PathBuf {
+    butler_dir().join("initlog.jsonl")
+}
+
+/// 一轮 agent-init 尝试的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInitOutcome {
+    /// 开口了：已过校验并记入 ledger。
+    Spoke,
+    /// 模型说「无」或额度已满：正常沉默，不算失败。
+    Silent,
+    /// 起不来 / 超时 / 回答没过校验：计入退避。
+    Failed,
+}
+
+impl AgentInitOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spoke => "开口",
+            Self::Silent => "沉默",
+            Self::Failed => "失败",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInitRecord {
+    pub at: DateTime<Local>,
+    pub outcome: AgentInitOutcome,
+    /// 失败原因或沉默原因（「模型说无」「额度已满」）。开口时为空。
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// 追加一条 agent-init 尝试记录。失败只影响审计，不影响本轮判定。
+pub fn append_init_record(record: &AgentInitRecord) -> Result<()> {
+    append_init_record_at(&initlog_path(), record)
+}
+
+/// 路径可注入版本：测试用 scratch 目录，不碰真实账户数据。
+pub fn append_init_record_at(path: &std::path::Path, record: &AgentInitRecord) -> Result<()> {
+    let line = serde_json::to_string(record)?;
+    super::store::append_line(path, &line)
+}
+
+/// 读最近 `limit` 条尝试记录（旧的先被丢）。文件不存在或损坏行跳过。
+pub fn read_init_records(limit: usize) -> Vec<AgentInitRecord> {
+    read_init_records_at(&initlog_path(), limit)
+}
+
+pub fn read_init_records_at(path: &std::path::Path, limit: usize) -> Vec<AgentInitRecord> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let mut records: Vec<AgentInitRecord> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let keep = records.len().saturating_sub(limit);
+    records.drain(..keep);
+    records
 }
 
 /// 自整理周期（天）。到期后在下一次成功唤醒时顺带执行，不另起定时器。
@@ -750,5 +848,62 @@ mod tests {
         let report = butler.wake(&WakeSource::Scheduled, at(20, 10), &facts());
         assert!(matches!(report.wake, WakeVerdict::TooSoon { .. }));
         assert!(report.speak.is_none(), "没唤醒就不该判开不开口");
+    }
+
+    #[test]
+    fn 失败退避从十五分钟起步六小时封顶() {
+        use chrono::Duration;
+        // 没有失败：常规节奏 12 小时。
+        assert_eq!(agent_init_backoff(0), Duration::hours(12));
+        // 失败 1 次 15 分钟、2 次 1 小时、之后一直 6 小时。
+        assert_eq!(agent_init_backoff(1), Duration::minutes(15));
+        assert_eq!(agent_init_backoff(2), Duration::hours(1));
+        assert_eq!(agent_init_backoff(3), Duration::hours(6));
+        assert_eq!(agent_init_backoff(99), Duration::hours(6));
+    }
+
+    #[test]
+    fn 决策日志追加后能按条数读回() {
+        use super::{
+            AgentInitOutcome, AgentInitRecord, append_init_record_at, read_init_records_at,
+        };
+
+        let dir = std::env::temp_dir().join(format!("mns-butler-initlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("initlog.jsonl");
+
+        for index in 0..5 {
+            append_init_record_at(
+                &path,
+                &AgentInitRecord {
+                    at: at(20, 9),
+                    outcome: if index % 2 == 0 {
+                        AgentInitOutcome::Failed
+                    } else {
+                        AgentInitOutcome::Silent
+                    },
+                    detail: Some(format!("第 {index} 次")),
+                },
+            )
+            .unwrap();
+        }
+        append_init_record_at(
+            &path,
+            &AgentInitRecord {
+                at: at(21, 9),
+                outcome: AgentInitOutcome::Spoke,
+                detail: None,
+            },
+        )
+        .unwrap();
+
+        let last = read_init_records_at(&path, 3);
+        assert_eq!(last.len(), 3, "只应保留最近几条");
+        assert_eq!(last[0].outcome, AgentInitOutcome::Silent, "第 4 次是沉默");
+        assert_eq!(last[2].outcome, AgentInitOutcome::Spoke, "最后一条是开口");
+        assert_eq!(last[2].detail, None);
+        assert_eq!(read_init_records_at(&path, 99).len(), 6, "limit 大于总数时全读");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,6 +22,9 @@ pub enum WakeSource {
     Task { id: String },
     /// 承诺到期（记忆里的 `Commitment`）。`id` 是 `promise:<日期>`。
     Commitment { id: String },
+    /// agent-init 失败后的重试到点。`id` 唯一定位一次重试（上次尝试时间
+    /// + 退避），避免同一条重试被重复叫醒。
+    AgentInitRetry { id: String },
 }
 
 /// 唤醒判定结果。不唤醒也要说明原因——否则「今天怎么没动静」无从回答。
@@ -47,6 +50,9 @@ pub struct WakeScheduler {
     pub seen_tasks: BTreeSet<String>,
     /// 已消费的承诺 id。
     pub seen_commitments: BTreeSet<String>,
+    /// 已消费的 agent-init 重试 id。重试没跑成新一轮尝试（比如用户刚聊
+    /// 过天）时，防止同一个到点时刻把主循环打成空转。
+    pub seen_agent_retries: BTreeSet<String>,
 }
 
 impl Default for WakeScheduler {
@@ -57,6 +63,7 @@ impl Default for WakeScheduler {
             seen_ledger: BTreeSet::new(),
             seen_tasks: BTreeSet::new(),
             seen_commitments: BTreeSet::new(),
+            seen_agent_retries: BTreeSet::new(),
         }
     }
 }
@@ -103,6 +110,15 @@ impl WakeScheduler {
                 }
                 WakeVerdict::Wake
             }
+            // 重试不推进 `last_scheduled`：它不占用 4 小时巡检的节奏，
+            // 也不参与承诺/任务的去重语义——真正的节奏由 run_agent_init
+            // 自己的退避把关，这里只防同一个到点重复叫醒。
+            WakeSource::AgentInitRetry { id } => {
+                if !self.seen_agent_retries.insert(id.clone()) {
+                    return WakeVerdict::Duplicate;
+                }
+                WakeVerdict::Wake
+            }
         }
     }
 
@@ -117,6 +133,7 @@ impl WakeScheduler {
         trim_set(&mut self.seen_ledger, keep);
         trim_set(&mut self.seen_tasks, keep);
         trim_set(&mut self.seen_commitments, keep);
+        trim_set(&mut self.seen_agent_retries, keep);
     }
 }
 

@@ -35,6 +35,21 @@ pub fn butler_dir() -> PathBuf {
     crate::config::app_data_dir().join("agent").join("butler")
 }
 
+/// state / memory / tasks 的跨进程写锁。
+///
+/// 三个写者（GUI、`mns-butlerd`、`mns-butler` CLI）的「读-改-写」全程
+/// 持锁：后写的先看到先写的修改，而不是拿自己启动时的旧快照整体覆盖。
+/// 锁依附在文件描述符上，进程崩溃即释放，不需要清理。
+///
+/// 拿不到时返回 `None`，调用方降级为无锁写入（与加锁前行为一致）——
+/// 「记住周五补美股」不能因为锁故障而丢失。
+pub fn writer_lock() -> Option<store::WriterLock> {
+    store::lock_writers(
+        &butler_dir().join("writers.lock"),
+        std::time::Duration::from_secs(2),
+    )
+}
+
 /// 行为事件日志：`~/.mns/agent/events.jsonl`。
 ///
 /// GUI 追加、管家只读。放在 `agent/` 而不是 `butler/`，是因为它是**账户侧**

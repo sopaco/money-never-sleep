@@ -263,7 +263,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         shell.toggle_launch_at_login(cx);
                     }))),
             )
-            .child(caption("登录后常驻托盘，不打开窗口。")),
+            .child(caption("登录后常驻托盘，不打开窗口；管家横幅也能及时送达。")),
     );
 
     // ── 行为记录（管家） ───────────────────────────────────────

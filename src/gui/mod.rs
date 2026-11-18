@@ -1325,6 +1325,7 @@ impl AppShell {
             state.butler_daemon_conn = None;
         }
 
+        let _guard = crate::butler::writer_lock();
         let mut butler = match crate::butler::Butler::load() {
             Ok(butler) => butler,
             Err(error) => {
@@ -1337,7 +1338,9 @@ impl AppShell {
             }
         };
         butler.state.policy.enabled = next;
-        if let Err(error) = butler.save() {
+        // 只写状态文件：这里只动了开关，顺手重写记忆与任务会把另一个进程
+        // 刚写进去的条目覆盖回旧值。
+        if let Err(error) = butler.save_state() {
             self.show_toast(format!("管家设置保存失败：{error:#}"), ToastTone::Error, cx);
             return;
         }
@@ -2443,19 +2446,28 @@ fn run_butler_wake_with(cx: &mut App, source: crate::butler::WakeSource) {
         return;
     }
 
-    let mut butler = match crate::butler::Butler::load() {
-        Ok(butler) => butler,
-        Err(error) => {
-            eprintln!("[mns-gui] butler state unreadable: {error:#}");
-            return;
+    // 读-改-写全程持锁：守护进程与 CLI 可能同时各跑一份判定，后保存的
+    // 会把先保存的去重键覆盖回旧值。送达（通知、会话）在锁外——那些
+    // 文件只有 GUI 一个写者。
+    let report = {
+        let _guard = crate::butler::writer_lock();
+        let mut butler = match crate::butler::Butler::load() {
+            Ok(butler) => butler,
+            Err(error) => {
+                eprintln!("[mns-gui] butler state unreadable: {error:#}");
+                return;
+            }
+        };
+        let report = butler.wake(&source, now, &facts);
+        if report.wake == crate::butler::WakeVerdict::Wake
+            && let Err(error) = butler.save()
+        {
+            eprintln!("[mns-gui] butler state save failed: {error:#}");
         }
+        report
     };
-    let report = butler.wake(&source, now, &facts);
     if report.wake != crate::butler::WakeVerdict::Wake {
         return;
-    }
-    if let Err(error) = butler.save() {
-        eprintln!("[mns-gui] butler state save failed: {error:#}");
     }
 
     let Some(crate::butler::SpeakDecision::Speak(candidate)) = report.speak else {

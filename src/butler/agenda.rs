@@ -1,11 +1,12 @@
 //! 下一次唤醒的时刻表。
 //!
 //! 守护进程不轮询：它把「下一次该在什么时候想事情」算出来，然后一直睡到
-//! 那个时刻。三个来源取最早的一个：
+//! 那个时刻。四个来源取最早的一个：
 //!
 //! - 定时巡检：`last_scheduled + 最小间隔`（从未巡检过就是现在）；
 //! - 自设任务：最早一条还没被唤醒过的待办；
-//! - 承诺到期：到期日当天早上（静音时段之后）。
+//! - 承诺到期：到期日当天早上（静音时段之后）；
+//! - agent-init 失败重试：上次尝试 + 退避时长。
 //!
 //! 任何输入变化（账本事件、GUI 或 CLI 改了状态）都会让调用方重算，所以这里
 //! 是纯函数：不缓存、不持有状态、不写盘。
@@ -17,6 +18,7 @@
 
 use chrono::{DateTime, Local};
 
+use super::orchestrator::agent_init_backoff;
 use super::{Butler, WakeSource};
 
 /// 承诺到期在几点提。静音时段（默认 22:00–08:00）之后，早于这个点提会
@@ -61,6 +63,24 @@ pub fn next(now: DateTime<Local>, butler: &Butler) -> Option<Agenda> {
             rows.push(Agenda {
                 at,
                 source: WakeSource::Commitment { id },
+            });
+        }
+    }
+
+    // agent-init 失败重试：`last_agent_init + 退避`。只在有失败时排——
+    // 常规节奏（12 小时）由 4 小时一次的定时巡检顺带覆盖，不值得为它
+    // 单独醒；失败后的 15 分钟/1 小时比巡检间隔短，不排就永远等不到。
+    // id 绑定「上次尝试 + 退避」：重试没产生新尝试（用户刚聊过天）时，
+    // seen 集合挡住同一个时刻反复叫醒。
+    if butler.state.agent_init_failures > 0
+        && let Some(last) = butler.state.last_agent_init
+    {
+        let at = last + agent_init_backoff(butler.state.agent_init_failures);
+        let id = format!("init-retry:{}", last.timestamp_millis());
+        if !scheduler.seen_agent_retries.contains(&id) {
+            rows.push(Agenda {
+                at,
+                source: WakeSource::AgentInitRetry { id },
             });
         }
     }
@@ -196,6 +216,55 @@ mod tests {
             .insert("promise:2026-11-19".into());
         let agenda = next(date_at(19, 8, 30), &butler).unwrap();
         assert_eq!(agenda.source, WakeSource::Scheduled);
+    }
+
+    #[test]
+    fn agent_init失败后按退避排重试() {
+        // 巡检刚过（下次 13:00），上次 agent-init 尝试 09:00 且失败 1 次：
+        // 15 分钟退避应当排在巡检前面。
+        let mut case = butler();
+        case.state.scheduler.last_scheduled = Some(at(9, 0));
+        case.state.last_agent_init = Some(at(9, 0));
+        case.state.agent_init_failures = 1;
+
+        let agenda = next(at(9, 5), &case).unwrap();
+        assert!(
+            matches!(agenda.source, WakeSource::AgentInitRetry { .. }),
+            "失败重试应早于 4 小时后的巡检，实际 {agenda:?}"
+        );
+        assert_eq!(agenda.at, at(9, 15), "第 1 次失败退避 15 分钟");
+
+        // 连续失败到 6 小时档：不再比巡检早（下次巡检 13:00，重试 15:00）。
+        let mut case = butler();
+        case.state.scheduler.last_scheduled = Some(at(9, 0));
+        case.state.last_agent_init = Some(at(9, 0));
+        case.state.agent_init_failures = 3;
+        let agenda = next(at(9, 5), &case).unwrap();
+        assert_eq!(agenda.source, WakeSource::Scheduled, "6 小时退避晚于 4 小时后的巡检");
+
+        // 同一个重试时刻已消费过：不再重排（防止空转）。
+        let mut case = butler();
+        case.state.scheduler.last_scheduled = Some(at(9, 0));
+        case.state.last_agent_init = Some(at(9, 0));
+        case.state.agent_init_failures = 1;
+        let id = format!("init-retry:{}", at(9, 0).timestamp_millis());
+        case.state.scheduler.seen_agent_retries.insert(id);
+        let agenda = next(at(9, 5), &case).unwrap();
+        assert_eq!(agenda.source, WakeSource::Scheduled, "已消费的重试不再排");
+    }
+
+    #[test]
+    fn 没有失败就不为agent_init单独醒() {
+        let mut butler = butler();
+        butler.state.scheduler.last_scheduled = Some(at(9, 0));
+        butler.state.last_agent_init = Some(at(9, 0));
+        butler.state.agent_init_failures = 0;
+        let agenda = next(at(9, 5), &butler).unwrap();
+        assert_eq!(
+            agenda.source,
+            WakeSource::Scheduled,
+            "常规 12 小时节奏由巡检顺带覆盖，不需要单独的重试唤醒"
+        );
     }
 
     #[test]

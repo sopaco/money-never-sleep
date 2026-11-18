@@ -16,14 +16,19 @@
   Stop it with the tray item 「停止管家进程」 or `pkill -f mns-butlerd` before testing
   butler state by hand, or your `mns-butler wake` will race with it. It is
   event-driven, not a poller: it sleeps until the next computed deadline
-  (scheduled sweep, due task, due commitment) and is woken by pokes from the
-  GUI/CLI over the local channel (Unix socket, or `\\.\pipe\mns-<app>-<user>`
-  on Windows) — no launchd/cron/Task Scheduler entry is involved.
+  (scheduled sweep, due task, due commitment, agent-init failure retry) and is
+  woken by pokes from the GUI/CLI over the local channel (Unix socket, or
+  `\\.\pipe\mns-<app>-<user>` on Windows) — no launchd/cron/Task Scheduler
+  entry is involved.
   It is built with `--features agent`: when the deterministic kernel has nothing
   to say, it may start an ACP runtime for one short `agent-init` line (120 s
-  timeout, silent on failure, same ledger caps as deterministic notices). The
-  runtime shuts down after every turn, so it never leaves an orphan agent process
-  behind.
+  timeout, silent on failure, same ledger caps as deterministic notices).
+  agent-init failures back off 15 min → 1 h → 6 h (a clean「无」is not a
+  failure), the daemon adds an agent-init retry wake source to the agenda while
+  failures are pending, and every attempt is appended to
+  `agent/butler/initlog.jsonl` (`mns-butler status` shows the last attempts and
+  why they failed). The runtime shuts down after every turn, so it never leaves
+  an orphan agent process behind.
   When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
 - **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/` and `agent/runs/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd.

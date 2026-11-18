@@ -234,6 +234,34 @@ impl Memory {
         write_json(&Self::path(), self)
     }
 
+    /// 「重读-修改-落盘」，全程持写锁。
+    ///
+    /// `memory.json` 有三个写者（GUI 管家窗口、`mns-butlerd` 自整理、CLI
+    /// `remember` / `forget`）。管家窗口一开几个小时，拿打开时的快照在
+    /// 每轮对话后整体覆盖，会把期间 CLI 写进去的事实吞掉——所以每次变更
+    /// 都从磁盘重读，只把这一笔变更叠上去。
+    pub fn update<R>(apply: impl FnOnce(&mut Self) -> R) -> Result<(Self, R)> {
+        // 拿不到锁就无锁继续（调用方语义不能因锁故障而丢「记住」）；
+        // 临时值存活到语句结束，load→apply→save 全程持锁。
+        let guard = super::writer_lock();
+        Self::update_at(&Self::path(), guard.as_ref(), apply)
+    }
+
+    /// 路径可注入的版本：测试用 scratch 目录验证「重读再改」的合并语义，
+    /// 不碰真实账户目录。`guard` 由调用方持有——跨多文件的读-改-写共享
+    /// 同一把锁时，锁的边界归最外层。
+    pub fn update_at<R>(
+        path: &std::path::Path,
+        guard: Option<&super::store::WriterLock>,
+        apply: impl FnOnce(&mut Self) -> R,
+    ) -> Result<(Self, R)> {
+        let _ = guard;
+        let mut memory: Self = read_json(path)?.unwrap_or_default();
+        let result = apply(&mut memory);
+        write_json(path, &memory)?;
+        Ok((memory, result))
+    }
+
     /// 最近一条还没到期的承诺的到期日（含今天）。
     ///
     /// 守护进程拿它算「哪一天该醒来提这件事」——承诺到期是独立唤醒源，
@@ -514,6 +542,36 @@ mod tests {
         assert!(!memory.promote_patterns("常在决策日临时加仓", now()));
         assert_eq!(memory.facts.len(), 1);
         assert_eq!(memory.facts[0].kind, FactKind::Pattern);
+    }
+
+    #[test]
+    fn 更新前重读磁盘不会吞掉别的写者() {
+        // 复现真实丢数据场景：GUI 窗口打开（内存里是旧快照）期间，CLI
+        // 写进一条事实；GUI 再记一笔，旧实现整体覆盖会把 CLI 那条吞掉。
+        let dir = std::env::temp_dir().join(format!("mns-butler-memory-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("memory.json");
+
+        // 第一笔：窗口打开时已经在的记忆。
+        Memory::update_at(&path, None, |memory| {
+            memory.remember(Fact::new(FactKind::Commitment, "周五补美股", now()))
+        })
+        .unwrap();
+
+        // 第二笔：另一个写者直接落盘（模拟 CLI `mns-butler remember`）。
+        Memory::update_at(&path, None, |memory| {
+            memory.remember(Fact::new(FactKind::Timeline, "发薪日 15 号", now()))
+        })
+        .unwrap();
+
+        // 第三笔：窗口里又说了一句。重读后叠加，前两笔都必须还在。
+        let (memory, _) = Memory::update_at(&path, None, |memory| {
+            memory.remember(Fact::new(FactKind::Preference, "称呼我老王", now()))
+        })
+        .unwrap();
+        assert_eq!(memory.facts.len(), 3, "三条事实都应当在：{memory:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

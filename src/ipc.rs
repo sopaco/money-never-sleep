@@ -234,7 +234,12 @@ mod unix_impl {
     use tokio::sync::mpsc::UnboundedSender;
 
     pub(super) fn socket_path(app: &str) -> PathBuf {
-        crate::config::resolve_data_path("run").join(format!("{app}.sock"))
+        // 单测落在临时目录：`~/.mns/run` 是真实账户目录，不该被测试碰。
+        #[cfg(test)]
+        let base = super::tests::test_run_dir();
+        #[cfg(not(test))]
+        let base = crate::config::resolve_data_path("run");
+        base.join(format!("{app}.sock"))
     }
 
     pub(super) struct Listener {
@@ -392,6 +397,17 @@ mod windows_impl {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_PIPE_BUSY: i32 = 231;
     const ERROR_PIPE_CONNECTED: i32 = 535;
+    /// 客户端在服务端调用 ConnectNamedPipe 之前连了又断。GUI 的探活与
+    /// poke 都是「连上就走」的短连接，这是常态路径而非故障：accept 循环
+    /// 据此换一条新实例继续等，而不是退出——退出会让进程变聋，被 GUI
+    /// 重复拉起后进程就攒起来。
+    ///
+    /// 生产代码不按错误码分支（所有 `wait_for_client` 错误一律换实例
+    /// 重来），这个常量唯一的存在意义是给回归测试
+    /// `error_no_data_之后必须换实例继续监听` 钉住「客户端先断必报
+    /// 232」的契约，所以非测试编译允许它无引用。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) const ERROR_NO_DATA: i32 = 232;
 
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
@@ -440,7 +456,7 @@ mod windows_impl {
 
     pub(super) struct Listener;
 
-    fn create_instance(name: &str, first: bool) -> std::io::Result<File> {
+    pub(super) fn create_instance(name: &str, first: bool) -> std::io::Result<File> {
         let name = wide(name);
         let mut open_mode = PIPE_ACCESS_DUPLEX;
         if first {
@@ -476,7 +492,8 @@ mod windows_impl {
 
     /// 等一个客户端连上来。非重叠模式下阻塞到连接建立；客户端抢先连上时
     /// 返回 `ERROR_PIPE_CONNECTED`——那是成功，不是失败。
-    fn wait_for_client(pipe: &File) -> std::io::Result<()> {
+    /// `pub(super)` 是给回归测试直接驱动用的。
+    pub(super) fn wait_for_client(pipe: &File) -> std::io::Result<()> {
         let ok = unsafe { ConnectNamedPipe(pipe.as_raw_handle() as Handle, std::ptr::null_mut()) };
         if ok != 0 {
             return Ok(());
@@ -498,13 +515,27 @@ mod windows_impl {
                 let mut next_id: u64 = 0;
                 loop {
                     if wait_for_client(&pending).is_err() {
-                        return;
+                        // 客户端在「实例建好」与「本线程调 ConnectNamedPipe」之间
+                        // 连了又断——GUI 启动时的探活（连上就走）与紧随其后的
+                        // poke 都是这样的短连接，ConnectNamedPipe 会报
+                        // ERROR_NO_DATA。这是常态路径，不是故障：换一条新实例
+                        // 接着等，绝不能就此退出。accept 线程一死，本进程就
+                        // 成了「活着但谁也连不上」的聋子——GUI 下次启动探活
+                        // 失败会再拉一个新的，进程就攒起来了。管道名仍被手里的
+                        // 实例占着，重建不会撞出第二个监听者。
+                        pending = match next_instance(&name) {
+                            Some(next) => next,
+                            None => return,
+                        };
+                        continue;
                     }
                     // 先把下一条实例建出来，再处理刚连上的这条：否则读取期间
                     // 名字上没有任何空闲实例，第二次连接会撞 `ERROR_PIPE_BUSY`。
-                    let next = match create_instance(&name, false) {
-                        Ok(file) => file,
-                        Err(_) => return,
+                    let next = match next_instance(&name) {
+                        Some(file) => file,
+                        // 连接已到手但换不出下一条实例：进程已没有能力继续
+                        // 监听，退场交给上层收摊（事件通道关闭后调用方退出）。
+                        None => return,
                     };
                     let connected = std::mem::replace(&mut pending, next);
                     next_id += 1;
@@ -521,6 +552,24 @@ mod windows_impl {
             })?;
 
         Ok(Listener)
+    }
+
+    /// 建下一条管道实例：成功路径用它「先建好下一条再收当前连接」，
+    /// `ERROR_NO_DATA` 后用它顶替已不可用的那条。
+    ///
+    /// 失败按 200ms 退避重试，累计 5 秒仍失败就放弃（返回 `None`）：此时进程
+    /// 已经没有能力继续监听，让 accept 线程退出、事件通道随之关闭，比留一个
+    /// 谁也连不上的聋子进程好。守护进程在 Windows 上由 GUI 拉起且没有控制台，
+    /// stderr 会被丢弃：只在放弃时留一行，不在每次重试时刷屏。
+    pub(super) fn next_instance(name: &str) -> Option<File> {
+        for _ in 0..25 {
+            match create_instance(name, false) {
+                Ok(file) => return Some(file),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+        eprintln!("mns-ipc: {name} 连续 5 秒建不出下一条实例，放弃监听");
+        None
     }
 
     fn read_connection(id: u64, pipe: File, tx: UnboundedSender<Event>) {
@@ -606,6 +655,28 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 单测专用的 socket 目录：进程内一次性建好，与真实账户目录
+    /// （`~/.mns/run`）隔离——测试不该往用户的 `.mns` 里落 socket 文件。
+    ///
+    /// 只用**一个**固定名字的目录（不带 pid），跨测试轮次复用：不然每次
+    /// `cargo test` 都会往系统临时目录里丢一个 `mns-ipc-tests-<pid>`，
+    /// 永远攒下去。目录里的 socket 文件名带 pid，并发跑两份测试互不干扰；
+    /// 残留的 socket 也不碍事——`listen` 对连不上的残留文件本来就是删了重建。
+    /// 建目录失败直接 panic：静默退回真实的 `~/.mns/run` 恰恰是这条隔离
+    /// 要挡住的污染。仅 Unix 需要：Windows 的命名管道不落文件系统。
+    #[cfg(unix)]
+    pub(super) fn test_run_dir() -> std::path::PathBuf {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join("mns-ipc-tests");
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                panic!("单测建不出隔离 socket 目录 {dir:?}：{error}");
+            }
+            dir
+        })
+        .clone()
+    }
 
     #[test]
     fn 协议是单行_ndjson() {
@@ -709,9 +780,9 @@ mod tests {
     }
 
     /// 同一个名字不允许起第二个监听者（守护进程靠这个判断「已经有人在跑」）。
-    #[cfg(windows)]
+    /// Unix 上同样成立：探活 connect 成功即拒绝，不删文件抢绑。
     #[test]
-    fn 同一管道名不能有两个监听者() {
+    fn 同一通道名不能有两个监听者() {
         let app = format!("mns-ipc-dup-{}", std::process::id());
         let (_first, _events) = listen(&app).expect("第一个监听者");
         let err = match listen(&app) {
@@ -719,5 +790,88 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// 短连接风暴不能弄死监听者。
+    ///
+    /// 探活与 poke 都是「连上就走」的短连接：GUI 启动时先 connect 探活、
+    /// 紧接着 poke Wake，第二条连接可能落在服务端「实例已建、还没调
+    /// ConnectNamedPipe」的窗口里（Windows 报 `ERROR_NO_DATA`）。修复前
+    /// accept 线程在这种连接上直接退出，进程变成「活着但谁也连不上」的
+    /// 聋子——GUI 下次启动探活失败，再拉一个新的，butlerd 进程就攒起来。
+    /// Unix 没有这个窗口（连接进内核积压队列），这条测试在两个平台都
+    /// 守住「短连接形态不弄死监听者」的不变量。
+    #[test]
+    fn 短连接风暴不能弄死监听者() {
+        let app = format!("mns-ipc-storm-{}", std::process::id());
+        let (_listener, mut events) = listen(&app).expect("监听本地通道");
+        // 连上立刻断开，循环多次：把「连了又断」的窗口尽量撞出来。
+        let mut connected = 0;
+        for _ in 0..200 {
+            if connect(&app).is_ok() {
+                connected += 1;
+            }
+        }
+        assert!(connected >= 32, "风暴里应有足够连接成功，实际 {connected}");
+        // 监听者必须仍然可用：一次正常收发。
+        let mut client = connect(&app).expect("风暴后重新连接");
+        client
+            .send(&Signal::Hello {
+                role: "test".to_owned(),
+            })
+            .expect("写一帧");
+        loop {
+            match events.blocking_recv().expect("事件通道关闭") {
+                Event::Signal(_, Signal::Hello { role }) => {
+                    assert_eq!(role, "test");
+                    break;
+                }
+                Event::Connected(_) | Event::Disconnected(_) => {}
+                Event::Signal(_, other) => panic!("收到意外的信号：{other:?}"),
+            }
+        }
+    }
+
+    /// `ERROR_NO_DATA` 之后必须换实例继续监听（确定性复现，Windows 专属）。
+    ///
+    /// 风暴测试撞的是概率窗口（连了又断恰好落在服务端 `ConnectNamedPipe`
+    /// 之前），在 CI 里可能永远执行不到出错分支。这条测试把每一步钉死：
+    /// 实例建好 → 客户端连上立刻断开 → 服务端此刻才调 `ConnectNamedPipe`。
+    /// 客户端先断在 Windows 上**必然**报 `ERROR_NO_DATA`（MSDN 文档行为，
+    /// 非竞态），这正是 GUI「连上就走的探活」撞上 accept 窗口时的出错点。
+    ///
+    /// 修复前的代码在这种错误上直接退出 accept 线程，进程变聋、被 GUI
+    /// 重复拉起后攒起来；修复后的契约是：换一条新实例接着等。这里用
+    /// `pending = next_instance(...)` 的赋值顺序复刻 accept 循环的时序
+    /// ——新实例到手之后旧实例才被 drop，管道名始终有人占着。
+    #[cfg(windows)]
+    #[test]
+    fn error_no_data_之后必须换实例继续监听() {
+        use super::windows_impl::{
+            create_instance, next_instance, pipe_name, wait_for_client, ERROR_NO_DATA,
+        };
+
+        let app = format!("mns-ipc-nodata-{}", std::process::id());
+        let name = pipe_name(&app);
+
+        // 场景回放：实例建好，客户端连上立刻断开。
+        let mut pending = create_instance(&name, true).expect("建第一条实例");
+        drop(connect(&app).expect("客户端连上"));
+        // 服务端此刻才等连接：客户端先断，必然报 `ERROR_NO_DATA`。
+        let error = wait_for_client(&pending).expect_err("客户端先断必报错");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_NO_DATA),
+            "期望 ERROR_NO_DATA，实际 {error}"
+        );
+
+        // 修复契约：不许退出，换一条新实例（旧实例还占着名字时也必须建得出来，
+        // 管道名自始至终没有被释放，第二个进程永远绑不上）。
+        pending = next_instance(&name).expect("ERROR_NO_DATA 后换出下一条实例");
+        // 换出来的新实例必须能正常接客：客户端先连、服务端后收，
+        // `ConnectNamedPipe` 报 `ERROR_PIPE_CONNECTED`，按成功处理。
+        let client = connect(&app).expect("连上换出来的新实例");
+        wait_for_client(&pending).expect("新实例能正常接客");
+        drop(client);
     }
 }

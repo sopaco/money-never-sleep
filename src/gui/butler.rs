@@ -378,66 +378,79 @@ impl ButlerView {
                 if let Some(day) = due {
                     fact = fact.expires_on(day);
                 }
-                let verdict = self.memory.remember(fact);
-                if let Err(error) = self.save_memory() {
-                    self.error = Some(error);
-                    return Some("记忆没写进磁盘，这次只在内存里生效。".to_owned());
-                }
-                self.facts = self
-                    .facts
-                    .clone()
-                    .with_promises(&self.memory, now.date_naive());
-                let reply = match verdict {
-                    Remembered::Merged => {
-                        format!("这条我记过了，又确认了一次：{}。", clip(&text, 40))
+                match self.update_memory(|memory| memory.remember(fact)) {
+                    Ok(verdict) => {
+                        self.facts = self
+                            .facts
+                            .clone()
+                            .with_promises(&self.memory, now.date_naive());
+                        let reply = match verdict {
+                            Remembered::Merged => {
+                                format!("这条我记过了，又确认了一次：{}。", clip(&text, 40))
+                            }
+                            _ => format!("记下了：{}。要改口径就说「忘掉…」。", clip(&text, 40)),
+                        };
+                        Some(valid_or(reply, "记下了。"))
                     }
-                    _ => format!("记下了：{}。要改口径就说「忘掉…」。", clip(&text, 40)),
-                };
-                Some(valid_or(reply, "记下了。"))
+                    Err(error) => {
+                        self.error = Some(error);
+                        Some("记忆没写进磁盘，这次只在内存里生效。".to_owned())
+                    }
+                }
             }
             memory::Intent::Forget { needle } => {
-                let hits = self.memory.forget(&needle);
-                if hits.is_empty() {
-                    let reply = format!("没找到和「{}」对得上的记忆。", clip(&needle, 20));
-                    return Some(valid_or(reply, "没找到对得上的记忆，我没动其他记录。"));
+                match self.update_memory(|memory| memory.forget(&needle)) {
+                    Ok(hits) if hits.is_empty() => {
+                        let reply = format!("没找到和「{}」对得上的记忆。", clip(&needle, 20));
+                        Some(valid_or(reply, "没找到对得上的记忆，我没动其他记录。"))
+                    }
+                    Ok(hits) => {
+                        self.facts = self
+                            .facts
+                            .clone()
+                            .with_promises(&self.memory, now.date_naive());
+                        let names: Vec<String> = hits
+                            .iter()
+                            .take(3)
+                            .map(|fact| clip(&fact.text, 24))
+                            .collect();
+                        let reply = format!(
+                            "从常驻记忆里拿掉了：{}。归档里还留一份，随时能查。",
+                            names.join("；")
+                        );
+                        Some(valid_or(
+                            reply,
+                            "从常驻记忆里拿掉了。归档里还留一份，随时能查。",
+                        ))
+                    }
+                    Err(error) => {
+                        self.error = Some(error);
+                        Some("记忆没写进磁盘，这次只在内存里生效。".to_owned())
+                    }
                 }
-                if let Err(error) = self.save_memory() {
-                    self.error = Some(error);
-                    return Some("记忆没写进磁盘，这次只在内存里生效。".to_owned());
-                }
-                self.facts = self
-                    .facts
-                    .clone()
-                    .with_promises(&self.memory, now.date_naive());
-                let names: Vec<String> = hits
-                    .iter()
-                    .take(3)
-                    .map(|fact| clip(&fact.text, 24))
-                    .collect();
-                let reply = format!(
-                    "从常驻记忆里拿掉了：{}。归档里还留一份，随时能查。",
-                    names.join("；")
-                );
-                Some(valid_or(
-                    reply,
-                    "从常驻记忆里拿掉了。归档里还留一份，随时能查。",
-                ))
             }
         }
     }
 
-    /// 写盘失败不吞掉原因：用户下一句就会以为「我明明记住了」。
-    fn save_memory(&mut self) -> Result<(), String> {
-        // 记忆文件读不出来时，内存里是空默认值；此时写盘等于覆盖用户原文件。
-        if !self.persist || !self.memory_readable {
-            return Ok(());
+    /// 在写锁内「重读记忆 → 应用这一笔变更 → 落盘」，返回应用的返回值。
+    ///
+    /// 窗口一开几个小时，期间 CLI（`mns-butler remember`）和守护进程都可能
+    /// 写过 `memory.json`：拿窗口打开时的快照整体覆盖会吞掉它们的条目，
+    /// 所以每次变更都从磁盘重读。测试注入的窗口（`persist = false`）只在
+    /// 内存里生效，不碰真实账户目录。
+    ///
+    /// 失败时这笔变更哪儿都没落（磁盘没动、内存副本保持旧值）：错误会摆到
+    /// 界面上，用户至少知道「这条没记上」，而不是以为记住了。
+    fn update_memory<R>(&mut self, apply: impl FnOnce(&mut Memory) -> R) -> Result<R, String> {
+        if !self.persist {
+            return Ok(apply(&mut self.memory));
         }
-        self.memory
-            .save()
-            .map_err(|error| format!("记忆保存失败，重启后可能丢：{error:#}"))?;
+        let (memory, result) =
+            Memory::update(apply).map_err(|error| format!("记忆更新失败：{error:#}"))?;
+        self.memory = memory;
         // 承诺变了：到期的「那一天」可能提前或推后，守护进程要重新排程。
         crate::ipc::poke_daemon();
-        Ok(())
+        Ok(result)
     }
 
     /// 「你记得什么」：把常驻记忆念出来。这是对话的一部分，不该落到兜底句。
@@ -581,9 +594,9 @@ impl ButlerView {
         }
 
         // 普通对话记一句「聊过什么」，供下周自整理。只记用户的问题，
-        // 不记管家自己的措辞——复述自己的话会让记忆越走越偏。
-        self.memory.summarize(now, vec![clip(&text, 60)]);
-        let _ = self.save_memory();
+        // 不记管家自己的措辞——复述自己的话会让记忆越走越偏。写之前重读
+        // 磁盘：窗口开着的时候 CLI / 守护进程可能也写过记忆。
+        let _ = self.update_memory(|memory| memory.summarize(now, vec![clip(&text, 60)]));
         self.session.push(Message::user(now, text.clone()));
 
         let previous = self.previous_user_text();
