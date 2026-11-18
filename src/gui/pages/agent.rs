@@ -1150,6 +1150,15 @@ fn settings_body(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {
                     .map(|policy| policy_chip(policy, shell, cx)),
             ),
         )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT_TERTIARY))
+                .child(
+                    "仅作用于非 opencode 的 ACP agent。使用默认 opencode 时，任务与管家都按 \
+                     Agent 默认开放工具，MNS 只额外拦会改账本的 mns 子命令和 init。",
+                ),
+        )
         .child(divider())
         .child(card_header("外部 Agent", ""))
         .child(

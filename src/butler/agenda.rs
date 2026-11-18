@@ -144,6 +144,7 @@ mod tests {
             due_at: at(11, 30),
             created_at: at(9, 10),
             key: "k1".into(),
+            kind: crate::butler::tasks::TaskKind::Check,
             state: crate::butler::tasks::TaskState::Pending,
             finished_at: None,
         });
@@ -169,6 +170,7 @@ mod tests {
             due_at: at(10, 30),
             created_at: at(9, 10),
             key: "k1".into(),
+            kind: crate::butler::tasks::TaskKind::Check,
             state: crate::butler::tasks::TaskState::Pending,
             finished_at: None,
         });
@@ -278,6 +280,7 @@ mod tests {
             due_at: at(9, 30),
             created_at: at(9, 10),
             key: "k1".into(),
+            kind: crate::butler::tasks::TaskKind::Check,
             state: crate::butler::tasks::TaskState::Pending,
             finished_at: None,
         });

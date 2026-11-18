@@ -48,8 +48,8 @@ use money_never_sleep::butler::orchestrator::{
 use money_never_sleep::butler::schedule;
 use money_never_sleep::butler::talk;
 use money_never_sleep::butler::{
-    butler_dir, writer_lock, Butler, Memory, Role, Session, SilentBecause, SpeakCandidate,
-    SpeakDecision, SpeakReason, WakeSource, WakeVerdict,
+    butler_dir, writer_lock, Butler, Session, SilentBecause, SpeakCandidate, SpeakDecision,
+    SpeakReason, WakeSource, WakeVerdict,
 };
 use money_never_sleep::ipc::{self, Client, Signal};
 use tokio::sync::mpsc::UnboundedSender;
@@ -309,11 +309,10 @@ async fn run_agent_init() -> Result<bool> {
     };
 
     let facts = account_facts(&butler, now);
-    let memory = memory_lines(&butler.memory);
-    let recent = recent_lines(&session);
+    let memory = talk::memory_lines(&butler.memory, now.date_naive());
+    let recent = talk::recent_lines(&session);
     let settings = chat_settings();
-    let cli = std::path::PathBuf::from(&settings.agent_cli);
-    let goal = talk::agent_init_goal(&facts, Some(&cli), &memory, &recent);
+    let goal = init_goal(&settings, &facts, &memory, &recent);
 
     let (handle, mut events) = money_never_sleep::agent::start_runtime();
     if handle
@@ -488,46 +487,6 @@ fn agent_init_due(butler: &Butler, session: &Session, now: DateTime<Local>) -> b
     !attempted_recently && !recent_activity(butler, session, now)
 }
 
-/// 记忆压成几行：未过期的事实优先，随后是最近一次自整理的要点。
-fn memory_lines(memory: &Memory) -> Vec<String> {
-    let today = Local::now().date_naive();
-    let mut lines: Vec<String> = memory
-        .facts
-        .iter()
-        .filter(|fact| !fact.is_expired(today))
-        .map(|fact| fact.text.clone())
-        .take(8)
-        .collect();
-    if let Some(summary) = memory.summaries.last() {
-        lines.extend(summary.points.iter().take(3).cloned());
-    }
-    lines
-}
-
-/// 最近几轮对话压成「谁：说了什么」，给主动开口提供语气与上下文。
-fn recent_lines(session: &Session) -> Vec<String> {
-    let start = session.messages.len().saturating_sub(6);
-    session.messages[start..]
-        .iter()
-        .map(|message| {
-            let who = match message.role {
-                Role::User => "用户",
-                Role::Butler => "管家",
-            };
-            format!("{who}：{}", clip_chars(&message.text, 80))
-        })
-        .collect()
-}
-
-fn clip_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 /// agent-init 的触发键：`agent-init:<日期>:<当天序号>`。
 ///
 /// 序号让同一天多条记录彼此不同，去重窗口不会误伤；额度由 ledger 的
@@ -551,6 +510,23 @@ fn chat_settings() -> money_never_sleep::agent::AgentSettings {
     let _ = std::fs::create_dir_all(&dir);
     settings.working_dir = dir.to_string_lossy().into_owned();
     settings
+}
+
+/// 主动开口的首轮 goal。
+///
+/// `settings.agent_cli` 是运行这次会话的 ACP 程序（opencode），不是数据入口。
+/// 曾经把它直接传给 `agent_init_goal`，导致 prompt 里的命令变成
+/// `<opencode 路径> portfolio`——数据入口整段失效。管家的命令入口来自
+/// `mns` / `mns-butler` 的安装路径（写在 AGENTS.md 与技能里），不是这里。
+/// `settings` 保留在签名里，是为了让回归测试证明它被忽略。
+fn init_goal(
+    settings: &money_never_sleep::agent::AgentSettings,
+    facts: &AccountFacts,
+    memory: &[String],
+    recent: &[String],
+) -> String {
+    let _ = settings;
+    talk::agent_init_goal(facts, memory, recent)
 }
 
 /// 账户事实，按年龄决定能信多少。
@@ -680,6 +656,7 @@ impl GuiLink {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use money_never_sleep::butler::Memory;
 
     fn at(day: u32, hour: u32) -> DateTime<Local> {
         Local
@@ -772,6 +749,24 @@ mod tests {
             "刚聊完",
         ));
         assert!(!agent_init_due(&butler, &session, now));
+    }
+
+    #[test]
+    fn 主动开口不泄露_acp_agent_路径但保留真实工具入口() {
+        let settings = money_never_sleep::agent::AgentSettings {
+            agent_cli: "/opt/agent/opencode".to_owned(),
+            ..Default::default()
+        };
+        let goal = init_goal(&settings, &AccountFacts::default(), &[], &[]);
+        assert!(
+            !goal.contains("/opt/agent/opencode"),
+            "agent_cli 是 ACP 程序，不能当成数据入口写进 prompt"
+        );
+        assert!(
+            goal.contains("mns-butler task add"),
+            "提醒必须走真实的到点任务"
+        );
+        assert!(!goal.contains("不要执行命令"), "能力优先，不再全禁工具");
     }
 
     #[test]

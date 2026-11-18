@@ -466,7 +466,7 @@ fn save_decision(body: &str) -> Result<std::path::PathBuf, String> {
 /// The shell deliberately does not re-implement report generation: the text the
 /// agent judges must be byte-identical to what the user sees in a terminal.
 fn agent_brief(refresh: bool) -> Result<String, String> {
-    let cli = crate::agent::cli_path().ok_or_else(|| {
+    let cli = crate::agent::mns_bin().ok_or_else(|| {
         "未找到 mns CLI：请安装 MNS.app，或设置 MNS_BIN 指向可执行文件".to_owned()
     })?;
 

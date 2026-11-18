@@ -14,32 +14,47 @@
 //! 白名单在 `expression::adopt_*`）、不谎称已下单、不空答。这一点必须
 //! 写进帮助文档。
 
-use std::path::Path;
-
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 
 use super::expression::money;
+use super::memory::Memory;
 use super::orchestrator::AccountFacts;
 use super::schedule;
+use super::session::{Role, Session};
 
 /// ACP 回答的长度上限。会话是管家的主场，可以聊开一点，但超过这个数
 /// 就不是「聊」而是贴报告了。
 pub const MAX_TALK_CHARS: usize = 2000;
 
-/// 首轮 goal：人设 + 账本事实 + 可查命令 + 说话方式 + 两个短示例。
+/// 首轮 goal：人设 + 账本事实 + **记忆与最近对话** + 可查命令 + 说话方式
+/// + 两个短示例。
 ///
 /// ACP 的 `session/new` 没有 system prompt 注入位（`NewSessionRequest` 里
 /// 那个字段是 UNSTABLE，且要求 agent 声明 `sessionCapabilities.systemPrompt`；
 /// opencode 2.2.5 没有声明），所以人设只能写进第一条消息。后续提问复用
 /// 同一个 session，不必重复。
 ///
+/// 记忆与最近对话必须在**用户提问的首轮**就注入，不能只留给主动开口：
+/// 用户问「我上次说的那件事呢」时，答案在记忆里——否则管家自己找话题时
+/// 看得见记忆，用户当面问反而失忆，只剩关键词触发的本地念条目。
+///
 /// 人设要点：像个真人管家在聊天，先结论后理由、默认短；观点是我的、可以
 /// 直说（自主人格），账本数字是事实、只照抄（数据诚信），下单能力不存在、
 /// 不谎称（能力诚实）。few-shot 比形容词管用：两个短例子直接示范长度与
 /// 语气，避免模型把「自由发挥」理解成长篇报告。
-pub fn opening_goal(question: &str, facts: &AccountFacts, cli: Option<&Path>) -> String {
+pub fn opening_goal(
+    question: &str,
+    facts: &AccountFacts,
+    memory: &[String],
+    recent: &[String],
+) -> String {
     let anchored = format!("{question}\n\n{}", length_note(question));
-    compose_goal("【用户的问题】", &anchored, facts, cli, "")
+    compose_goal(
+        "【用户的问题】",
+        &anchored,
+        facts,
+        &context_block(memory, recent),
+    )
 }
 
 /// 主动开口的首轮 goal。用户没有提问，所以问题位换成一条「你想对他说什么」
@@ -47,12 +62,17 @@ pub fn opening_goal(question: &str, facts: &AccountFacts, cli: Option<&Path>) ->
 ///
 /// 输出要过通知 banner 的口径（≤60 字、不带买卖点话术），所以这里的指令
 /// 必须写死「一句话、只报事实或提醒」，而不是让 agent 自己发挥成长段落。
-pub fn agent_init_goal(
-    facts: &AccountFacts,
-    cli: Option<&Path>,
-    memory: &[String],
-    recent: &[String],
-) -> String {
+pub fn agent_init_goal(facts: &AccountFacts, memory: &[String], recent: &[String]) -> String {
+    compose_goal(
+        "【这次的任务】",
+        AGENT_INIT_QUESTION,
+        facts,
+        &context_block(memory, recent),
+    )
+}
+
+/// 记忆与最近对话的注入块。用户对话与主动开口共用同一份格式。
+fn context_block(memory: &[String], recent: &[String]) -> String {
     let mut context = String::new();
     if !memory.is_empty() {
         context.push_str("【你记得的事】\n");
@@ -68,7 +88,49 @@ pub fn agent_init_goal(
         }
         context.push('\n');
     }
-    compose_goal("【这次的任务】", AGENT_INIT_QUESTION, facts, cli, &context)
+    context
+}
+
+/// 记忆压成几行：未过期的事实优先，随后是最近一次会话摘要的要点。
+///
+/// 有界（≤8 条事实 + ≤3 条要点）：首轮 goal 已经带着账本事实与示例，
+/// 记忆只是补「用户强调过什么」，不是把记忆文件整个搬进去。
+pub fn memory_lines(memory: &Memory, today: NaiveDate) -> Vec<String> {
+    let mut lines: Vec<String> = memory
+        .facts
+        .iter()
+        .filter(|fact| !fact.is_expired(today))
+        .map(|fact| fact.text.clone())
+        .take(8)
+        .collect();
+    if let Some(summary) = memory.summaries.last() {
+        lines.extend(summary.points.iter().take(3).cloned());
+    }
+    lines
+}
+
+/// 最近几轮对话压成「谁：说了什么」，给跨会话的语气与上下文。
+pub fn recent_lines(session: &Session) -> Vec<String> {
+    let start = session.messages.len().saturating_sub(6);
+    session.messages[start..]
+        .iter()
+        .map(|message| {
+            let who = match message.role {
+                Role::User => "用户",
+                Role::Butler => "管家",
+            };
+            format!("{who}：{}", clip_chars(&message.text, 80))
+        })
+        .collect()
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// 主动开口的任务说明。它替代「用户的问题」那一节。
@@ -79,22 +141,15 @@ const AGENT_INIT_QUESTION: &str = "\
 只报事实或一句提醒，不给买卖建议、不预测涨跌、不承诺收益。\
 如果确实没有值得说的事，只回「无」。";
 
-fn compose_goal(
-    label: &str,
-    question: &str,
-    facts: &AccountFacts,
-    cli: Option<&Path>,
-    context: &str,
-) -> String {
+fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str) -> String {
     let facts_text = facts_block(facts);
-    let tools = tools_block(cli);
     format!(
         "你是用户的私人投资管家，一个像真人一样说话的自主智能体。这本账是你的地盘：\
          市场、计划、持仓、和钱有关的闲聊都可以谈，也可以有自己的观点和倾向。观点是你的，\
-         直说并标明「我的看法」；账本数字是事实，只照抄下面的清单或命令输出。\n\n\
+         直说并标明「我的看法」；账本数字是事实，只照抄下面的清单。\n\n\
          【账本事实】\n\
          {facts_text}\n\n\
-         {tools}\n\n\
+         {TOOLS_BLOCK}\n\n\
          {context}\
          【怎么说】\n\
          - 先给结论，再给一两句理由；像面对面聊天，不像写报告。\n\
@@ -107,9 +162,13 @@ fn compose_goal(
          也不要输出 mns-decision、action、effective 之类的内部标记。\n\
          - 给观点就自我标注；预测说不准就直说不准——可以给倾向和理由，不装确定。\n\
          - 不谎称已经下单或改了账：下单你做不了，动账的只有用户本人。\n\
-         - 数字照抄上面的清单或命令输出，不要心算、不要四舍五入、不要凭记忆补。\n\
+         - 「记住 / 忘掉」由管家界面在消息进入你之前解析并落盘；不要调用 remember / forget，\
+         也不要声称自己写了记忆。\n\
+         - 提醒必须真的建了任务才能说「记下了」；没看到「已接受」就如实说失败，不要假装。\
+         到点任务只送一句话：`--talk` 是一句问候，不是长聊；别承诺「到点陪你聊两句」。\n\
+         - 数字照抄上面的清单，不要心算、不要四舍五入、不要凭记忆补。\n\
          - 数据不是今天的时候，先用一句话提醒先更新，再回答。\n\
-         - 上面的事实够答就直接答，不要为了确认再跑一遍命令；只有确实缺数据时才查。\n\n\
+         - 上面的事实够答就直接答；缺数据用 mns 查，查不到就直说没有，不要猜。\n\n\
          【示例】\n\
          用户：明天 A 股怎么看？\n\
          管家：我的看法是继续震荡，方向说不准。**这不影响你的计划**——按带宽走就行，\
@@ -267,8 +326,10 @@ fn is_machine_field(line: &str) -> bool {
 /// 流式输出里未闭合的半截连同后续文本一起丢掉：宁可少显示，也不能把机器
 /// 字段留进气泡。
 fn strip_decision_blocks(text: &str) -> String {
-    const MARKERS: [(&str, &str); 2] =
-        [("```mns-decision", "```"), ("<mns-decision>", "</mns-decision>")];
+    const MARKERS: [(&str, &str); 2] = [
+        ("```mns-decision", "```"),
+        ("<mns-decision>", "</mns-decision>"),
+    ];
 
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -381,30 +442,37 @@ fn facts_block(facts: &AccountFacts) -> String {
     lines.join("\n")
 }
 
-fn tools_block(cli: Option<&Path>) -> String {
-    match cli {
-        Some(cli) => {
-            let cli = cli.display();
-            format!(
-                "【可以查的只读命令】\n\
-                 - `{cli} portfolio` 持仓、成本与市值\n\
-                 - `{cli} cash` 现金与流水\n\
-                 - `{cli} performance` 实际收益与回撤\n\
-                 - `{cli} plan --monthly <金额>` 定投分配\n\
-                 - `{cli} guard` 买入冷静期\n\
-                 只跑这几个命令；不要读 ~/.mns 下的数据库或配置，也不要写任何文件。"
-            )
-        }
-        None => {
-            "【没有可用的命令行】只依据上面的账本事实回答；不够就直说不够，不要推测。".to_owned()
-        }
-    }
-}
+/// 管家的工具说明：能查、能提醒，但提醒必须落成真实任务。
+///
+/// 旧的写法是「不要执行命令」，结果用户说「5 分钟后提醒我」时，它只会
+/// 用 `sleep 300 && osascript …` 编一句假承诺——ACP 子进程结束后后台进程
+/// 会被回收，通知根本不会响。现在给它真实的命令通道，同时把提醒的唯一
+/// 正确路径写死：`mns-butler task add`，看到「已接受」才算数。
+const TOOLS_BLOCK: &str = "【能用的工具】\n\
+     - 账户数据用 mns 的只读子命令查（portfolio / cash / performance / plan --monthly <金额> / guard / history / market）；\
+     路径与清单见工作目录 AGENTS.md 和 mns-account 技能。\n\
+     - 管家状态与任务用 mns-butler 的 status / memory / tasks / outbox。\n\
+     - 用户要提醒时，必须用 `mns-butler task add \"<提醒什么>\" --in <时长> [--user]` 真的建一条到点任务：\
+     相对时间用 `--in 90s` / `--in 5m` / `--in 2h` / `--in 1d`，不要自己算绝对时刻；\
+     只有用户给的是绝对时刻才用 `--at \"YYYY-MM-DD HH:MM[:SS]\"`。\
+     用户亲口要的提醒加 `--user`：跳过「必须是检查」的措辞校验，也不占管家的每日额度；\
+     你自己提议的检查任务不加。用户原话里有「打个招呼 / 主动开口 / 陪我聊两句」就加 `--talk`（隐含 --user），\
+     不要建成普通检查任务。活跃最多 10 条。看到「已接受任务」才能说记下了。\n\
+     - 到点任务只会送达一句话：`--talk` 也只是一句问候，不会自动展开对话。\
+     不要承诺「到点陪你聊」；用户要长聊，让他那个时间直接发消息。\n\
+     - 可以联网查公开信息，也可以加载技能。不要写任意文件、不要动账本；\
+     管家状态与到点任务只用 mns-butler 改。\n\
+     - 回执要说清到点时刻与前提：提醒需要 MNS 开着（托盘也算），没开就只会在下次打开时补上（24 小时内）；\
+     你设的到点任务不受主动开口开关、频控和静音影响，但应用完全退出时只能等下次打开。\
+     不要用 sleep / osascript / display notification 假装提醒。";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::butler::memory::{Fact, FactKind};
     use crate::butler::orchestrator::{DriftRow, PlanLine};
+    use crate::butler::session::Message;
+    use chrono::TimeZone;
 
     fn row(name: &str, current: f64, target: f64) -> DriftRow {
         DriftRow {
@@ -442,7 +510,7 @@ mod tests {
 
     #[test]
     fn 首轮把人设事实与风格一起交出去() {
-        let goal = opening_goal("现在偏离多少", &rich(), None);
+        let goal = opening_goal("现在偏离多少", &rich(), &[], &[]);
         assert!(goal.contains("私人投资管家"), "人设要立自主人格");
         assert!(goal.contains("像真人一样说话"), "要的是聊天，不是报告");
         assert!(goal.contains("我的看法"), "观点要自我标注");
@@ -456,22 +524,37 @@ mod tests {
         assert!(goal.contains("不谎称已经下单"), "能力诚实是硬底线");
         assert!(goal.contains("照抄"), "数字同源是硬底线");
         assert!(goal.contains("现在偏离多少"));
-        assert!(goal.contains("只依据上面的账本事实回答"));
+        assert!(
+            goal.contains("mns-butler task add"),
+            "管家要能真的建提醒，而不是说自己做不到"
+        );
+        assert!(goal.contains("查不到就直说没有"));
     }
 
     #[test]
     fn 空账本不念零也不假装有持仓() {
-        let goal = opening_goal("我有什么", &AccountFacts::default(), None);
+        let goal = opening_goal("我有什么", &AccountFacts::default(), &[], &[]);
         assert!(goal.contains("还没有持仓"));
         assert!(!goal.contains("总资产 ¥0"), "零不该被念成一个数字");
     }
 
     #[test]
-    fn 有命令行时给出绝对路径() {
-        let cli = std::path::Path::new("/usr/local/bin/mns");
-        let goal = opening_goal("现金多少", &rich(), Some(cli));
-        assert!(goal.contains("/usr/local/bin/mns portfolio"));
-        assert!(goal.contains("不要写任何文件"));
+    fn 管家能查账户也能建到点任务() {
+        let goal = opening_goal("现金多少", &rich(), &[], &[]);
+        assert!(
+            goal.contains("mns-butler task add"),
+            "提醒必须走真实任务，不能再退回「我做不到」"
+        );
+        assert!(
+            goal.contains("portfolio"),
+            "缺数据时可以自己查，而不是只靠注入"
+        );
+        assert!(
+            !goal.contains("不要执行命令"),
+            "能力优先：不要再把命令入口关掉"
+        );
+        assert!(goal.contains("MNS 开着"), "回执要说明应用前提");
+        assert!(goal.contains("查不到就直说没有"));
     }
 
     #[test]
@@ -484,12 +567,12 @@ mod tests {
 
     #[test]
     fn 默认短而说展开才允许写长() {
-        let short = opening_goal("现在偏离多少", &rich(), None);
+        let short = opening_goal("现在偏离多少", &rich(), &[], &[]);
         assert!(short.contains("默认简短"), "默认要贴一条短提醒");
         assert!(!short.contains("用户要求展开"));
 
         for cue in ["展开说说", "细说一下美股", "详细讲讲"] {
-            let long = opening_goal(cue, &rich(), None);
+            let long = opening_goal(cue, &rich(), &[], &[]);
             assert!(
                 long.contains("用户要求展开"),
                 "「{cue}」是明确的展开要求，提示词不该还在压长度"
@@ -501,15 +584,84 @@ mod tests {
     #[test]
     fn 展开提醒不误伤普通名词() {
         // 细节 / 详细仓位 不是「要求写长」的指令，否则默认长度就被绕过。
-        let goal = opening_goal("详细仓位比例是多少", &rich(), None);
+        let goal = opening_goal("详细仓位比例是多少", &rich(), &[], &[]);
         assert!(goal.contains("默认简短"));
+    }
+
+    #[test]
+    fn 首轮把记忆与最近对话带进用户会话() {
+        // 跨会话连续性的验收点：用户当面问「上次说的事」，记忆必须在场。
+        // 只靠关键词触发本地念条目，agent 一无所知——那是记事本，不是记忆。
+        let goal = opening_goal(
+            "我上次说的补美股那件事呢",
+            &rich(),
+            &["周五补美股".to_owned()],
+            &["用户：记住周五补美股".to_owned()],
+        );
+        assert!(goal.contains("【用户的问题】"));
+        assert!(goal.contains("我上次说的补美股那件事呢"));
+        assert!(goal.contains("【你记得的事】"), "记忆要进用户对话的首轮");
+        assert!(goal.contains("周五补美股"));
+        assert!(goal.contains("【最近的对话】"));
+        assert!(goal.contains("用户：记住周五补美股"));
+    }
+
+    #[test]
+    fn 空记忆时首轮不画空区块() {
+        let goal = opening_goal("现金多少", &rich(), &[], &[]);
+        assert!(!goal.contains("【你记得的事】"), "没记忆别占版面");
+        assert!(!goal.contains("【最近的对话】"));
+    }
+
+    #[test]
+    fn 记忆行取未过期事实与最近摘要() {
+        let at = Local
+            .with_ymd_and_hms(2026, 11, 16, 9, 0, 0)
+            .single()
+            .unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let mut memory = Memory::default();
+        memory
+            .facts
+            .push(Fact::new(FactKind::Commitment, "周五补美股", at));
+        memory.facts.push(
+            Fact::new(FactKind::Timeline, "已过期的事", at)
+                .expires_on(NaiveDate::from_ymd_opt(2026, 11, 19).unwrap()),
+        );
+        memory.summarize(at, vec!["聊过加仓".to_owned()]);
+
+        let lines = memory_lines(&memory, today);
+        assert_eq!(lines, vec!["周五补美股".to_owned(), "聊过加仓".to_owned()]);
+    }
+
+    #[test]
+    fn 最近对话压成谁说了什么并截长() {
+        let at = Local
+            .with_ymd_and_hms(2026, 11, 16, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut session = Session::default();
+        session.push(Message::user(at, "今天加仓吗"));
+        session.push(Message::butler(at, "先看带宽"));
+
+        let lines = recent_lines(&session);
+        assert_eq!(
+            lines,
+            vec!["用户：今天加仓吗".to_owned(), "管家：先看带宽".to_owned()]
+        );
+
+        let long = "字".repeat(120);
+        session.push(Message::user(at, long));
+        let last = recent_lines(&session).pop().unwrap();
+        let body = last.strip_prefix("用户：").expect("保留谁说的");
+        assert_eq!(body.chars().count(), 81, "截到 80 字 + 省略号");
+        assert!(body.ends_with('…'));
     }
 
     #[test]
     fn 主动开口把记忆与最近对话带进上下文() {
         let goal = agent_init_goal(
             &rich(),
-            None,
             &["周五补美股".to_owned()],
             &["用户：最近怎么样".to_owned()],
         );
@@ -545,8 +697,12 @@ mod tests {
 
     #[test]
     fn 正常回答保留markdown并规整空白() {
-        let text = validate_talk("## 偏离\n\n**美股** 41.2%，超出 6.2pp。\n\n\n- 第一条\n- 第二条").unwrap();
-        assert!(text.contains("**美股**"), "窗口用 markdown 渲染，不该剥掉强调");
+        let text = validate_talk("## 偏离\n\n**美股** 41.2%，超出 6.2pp。\n\n\n- 第一条\n- 第二条")
+            .unwrap();
+        assert!(
+            text.contains("**美股**"),
+            "窗口用 markdown 渲染，不该剥掉强调"
+        );
         assert!(text.contains("## 偏离"), "小标题保留，渲染层负责排版");
         assert!(text.contains("- 第一条"));
         assert!(!text.contains("\n\n\n"), "连续空行要折叠");

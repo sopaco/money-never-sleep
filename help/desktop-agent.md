@@ -13,6 +13,7 @@
 
 - Agent 的结论以 JSON 存档到 `~/.mns/agent/`，可以只读回放；
 - Agent **不会写你的账本**，也不会执行交易；
+- 使用 MNS 默认的 opencode 时，任务页按 Agent 默认开放 shell、联网、编辑与子代理；MNS 只加一条 best-effort 护栏，拒绝会改账本的 `mns` 子命令和 `init`（`buy`、`sell`、`cash set`、`today` 等），避免误操作。这不是沙箱：换用其他 ACP agent 时这条护栏不生效，请检查它那边的权限设置；
 - 历史对话可以在助手页的「历史记录」里回放或删除。
 
 ## 日常巡检

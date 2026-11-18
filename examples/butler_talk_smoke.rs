@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use chrono::Local;
 use money_never_sleep::agent::{
     AgentCommand, AgentEvent, EntryKind, GoalSource, load_settings, start_runtime,
 };
@@ -96,16 +97,21 @@ async fn run_turn(
 #[tokio::main]
 async fn main() {
     let facts = facts();
-    // 与 GUI 走同一条路径：随应用安装的 CLI 绝对路径。example 在 crate 外，
-    // `agent::cli_path` 是 pub(crate)，这里按同一规则找一个可用的副本。
-    let cli = ["/Applications/MNS.app/Contents/MacOS/mns"]
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .find(|path| path.is_file());
+    // 管家现在有真实工具：账户用 mns 查，提醒用 mns-butler task add 落成到点任务。
     let question = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "现在偏离多少".to_owned());
-    let goal = talk::opening_goal(&question, &facts, cli.as_deref());
+    // 与 GUI 同一条注入路径：记忆与最近对话也进首轮（这里从账户目录读
+    // 真实记忆，空记忆则注入为空）。
+    let today = Local::now().date_naive();
+    let memory = money_never_sleep::butler::Memory::load().unwrap_or_default();
+    let session = money_never_sleep::butler::Session::load().unwrap_or_default();
+    let goal = talk::opening_goal(
+        &question,
+        &facts,
+        &talk::memory_lines(&memory, today),
+        &talk::recent_lines(&session),
+    );
     println!("--- 第一轮 goal 长度 {} 字 ---", goal.chars().count());
 
     let (handle, mut events) = start_runtime();

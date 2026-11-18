@@ -24,12 +24,13 @@
 //! the user watches progress instead of driving a chat turn by turn. The user
 //! can still gate sensitive actions, resolve permissions and stop at any time.
 
-mod runner;
 pub mod routine;
+mod runner;
+mod workspace;
 
-/// 只给桌面端用：没有 `gui` 时没人消费，单独编 `--features agent` 会报警告。
-#[cfg(feature = "gui")]
-pub(crate) use runner::cli_path;
+/// Absolute paths of the binaries that ship beside the GUI. Callers use these
+/// instead of searching `PATH`, which may resolve to a stale copy.
+pub use runner::{butler_bin, mns_bin};
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};

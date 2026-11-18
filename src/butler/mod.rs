@@ -25,7 +25,7 @@ pub use orchestrator::{AccountFacts, Butler, ButlerState, DriftRow, WakeReport};
 pub use schedule::{SilentBecause, SpeakCandidate, SpeakDecision, SpeakPolicy, SpeakReason};
 pub use schedule::{WakeScheduler, WakeSource, WakeVerdict};
 pub use session::{Message, Role, Session};
-pub use tasks::{TaskBoard, TaskState, TaskVerdict};
+pub use tasks::{TaskBoard, TaskKind, TaskOrigin, TaskState, TaskVerdict};
 
 /// 管家数据根：`~/.mns/agent/butler`。
 ///

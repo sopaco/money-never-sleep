@@ -19,7 +19,7 @@ use super::schedule::{
     WakeSource, WakeVerdict,
 };
 use super::store::{read_json, write_json};
-use super::tasks::{ButlerTask, TaskBoard};
+use super::tasks::{ButlerTask, TaskBoard, TaskKind};
 
 /// 一条腿的偏离，直接抄 `Snapshot.categories`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,11 +202,23 @@ pub fn candidates(
     let mut rows = Vec::new();
 
     for task in due_tasks {
+        // Check 回显用户要求检查什么；Talk 是用户明确要管家到点开口，
+        // 送一句问候而不是把指令原文念回去。两者都只有一句话。
+        let (draft, fallback) = match task.kind {
+            TaskKind::Check => (
+                format!("到点了：{}", task.intent),
+                "到点了，按你自己定的那件事检查一下。",
+            ),
+            TaskKind::Talk => (
+                "到点了，我在。想聊两句吗？".to_owned(),
+                "到点了，我在。",
+            ),
+        };
         rows.push(candidate(
             SpeakReason::TaskDue,
             format!("task:{}", task.id),
-            format!("到点了：{}", task.intent),
-            "到点了，按你自己定的那件事检查一下。",
+            draft,
+            fallback,
         ));
     }
 
@@ -571,6 +583,13 @@ impl Butler {
         })
     }
 
+    /// 落盘 state + memory + tasks 三个文件。**调用方必须已持有写锁**
+    /// （[`crate::butler::writer_lock`]）：本函数自己不加锁，「load → 改 →
+    /// save」必须是一个临界区，跨进程互斥由最外层负责。
+    ///
+    /// 不要在持锁路径里再嵌套调用会自己拿锁的接口（如 `Memory::update`）——
+    /// 同进程两次 `writer_lock()` 打开的是不同文件描述符，flock 会互相等满
+    /// 2 秒超时后降级为无锁写入。
     pub fn save(&self) -> Result<()> {
         self.state.save()?;
         self.memory.save()?;
@@ -607,11 +626,30 @@ impl Butler {
 
         self.maintain_if_due(now);
 
-        let due = self.tasks.due(now);
+        let mut due = self.tasks.due(now);
+        // 被这条唤醒源点名的那条任务排最前：多条同时到点时，先把「叫醒
+        // 管家的那一条」处理掉，别让另一条同优先级任务把它挤成幽灵。
+        if let WakeSource::Task { id } = source {
+            due.sort_by_key(|task| task.id != *id);
+        }
         let rows = candidates(facts, &due, now);
         let decision = schedule::decide(&rows, now, &self.state.policy, &self.state.ledger);
-        if let SpeakDecision::Speak(row) = &decision {
-            self.state.ledger.record(now, row);
+        match &decision {
+            SpeakDecision::Speak(row) => {
+                self.state.ledger.record(now, row);
+                // 到点任务说出去就算处理完：留着会在待办里挂 24 小时，
+                // 用户看到「还没执行完」，GUI 也会每分钟重试同一条。
+                if let Some(id) = row.trigger.strip_prefix("task:") {
+                    self.tasks.complete(id, now);
+                }
+            }
+            // 同一任务在崩溃重放时已经说过：补做完成，别留幽灵。
+            SpeakDecision::Silent(super::schedule::SilentBecause::Duplicate) => {
+                if let WakeSource::Task { id } = source {
+                    self.tasks.complete(id, now);
+                }
+            }
+            _ => {}
         }
         // 只保留最近 30 天的开口记录：频控只需要一周，留 30 天足够审计。
         self.state.ledger.trim(now, 30);
@@ -761,6 +799,55 @@ mod tests {
     }
 
     #[test]
+    fn 到点任务开口后立刻完成而不是留成幽灵() {
+        let mut butler = Butler::default();
+        let TaskVerdict::Accepted { id } = butler.tasks.propose(
+            ButlerTask::new("t", "到点检查当天是否有计划外操作", at(20, 9), at(20, 8)),
+            at(20, 8),
+        ) else {
+            panic!("任务应被接受");
+        };
+        let report = butler.wake(
+            &WakeSource::Task { id: id.clone() },
+            at(20, 9),
+            &AccountFacts::default(),
+        );
+        assert!(matches!(report.speak, Some(SpeakDecision::Speak(_))));
+        assert!(
+            butler.tasks.pending().is_empty(),
+            "说出去的任务不能继续挂在待办里"
+        );
+        assert_eq!(butler.tasks.archived.len(), 1);
+        assert_eq!(butler.tasks.archived[0].state, crate::butler::TaskState::Done);
+    }
+
+    #[test]
+    fn 到点问候用问候语而不是复读任务原文() {
+        let mut board = TaskBoard::default();
+        let TaskVerdict::Accepted { id } = board.propose_as(
+            ButlerTask::new("talk", "到点主动打个招呼", at(20, 9), at(20, 8))
+                .with_kind(TaskKind::Talk),
+            at(20, 8),
+            crate::butler::tasks::TaskOrigin::User,
+        ) else {
+            panic!("任务应被接受");
+        };
+        let due = board.due(at(20, 9));
+        let rows = candidates(&AccountFacts::default(), &due, at(20, 9));
+        let row = rows
+            .iter()
+            .find(|row| row.trigger == format!("task:{id}"))
+            .expect("应有到点候选");
+        assert!(row.draft.contains("我在"), "实际 {}", row.draft);
+        assert!(
+            !row.draft.contains("主动打个招呼"),
+            "不该复读任务原文，实际 {}",
+            row.draft
+        );
+        assert!(schedule::validate_notification(&row.draft).is_ok());
+    }
+
+    #[test]
     fn 高频查看不再单独构成开口由头() {
         // 只看高频查看就开口会变成催促；而项目没有指数级行情，无法判断
         // 「市场动了多少」。所以这条由头整体移除，行为日志只留作上下文。
@@ -902,7 +989,11 @@ mod tests {
         assert_eq!(last[0].outcome, AgentInitOutcome::Silent, "第 4 次是沉默");
         assert_eq!(last[2].outcome, AgentInitOutcome::Spoke, "最后一条是开口");
         assert_eq!(last[2].detail, None);
-        assert_eq!(read_init_records_at(&path, 99).len(), 6, "limit 大于总数时全读");
+        assert_eq!(
+            read_init_records_at(&path, 99).len(),
+            6,
+            "limit 大于总数时全读"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

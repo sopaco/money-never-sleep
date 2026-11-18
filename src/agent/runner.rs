@@ -28,6 +28,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use super::workspace::{self, Binaries, Profile};
 use super::{
     AgentCommand, AgentEvent, AgentHandle, AgentSettings, DecisionReport, EntryKind, GoalSource,
     PermissionChoice, PermissionPolicy, PermissionPrompt, RunState, TimelineEntry,
@@ -114,7 +115,13 @@ pub(crate) fn start_runtime_impl() -> (AgentHandle, UnboundedReceiver<AgentEvent
                             let task_shared = shared.clone();
                             let task = tokio::spawn(async move {
                                 run_session(
-                                    goal, source, settings, events, task_shared, stop_rx, ask_rx,
+                                    goal,
+                                    source,
+                                    settings,
+                                    events,
+                                    task_shared,
+                                    stop_rx,
+                                    ask_rx,
                                 )
                                 .await;
                             });
@@ -243,7 +250,7 @@ fn emit_entry(events: &EventTx, kind: EntryKind, text: impl Into<String>) {
 /// this GUI should call one known path, not search the filesystem. The
 /// installed-bundle fallback covers `cargo run`, where the GUI lives under
 /// `target/debug` and may not have a sibling CLI.
-pub(crate) fn cli_path() -> Option<PathBuf> {
+pub fn mns_bin() -> Option<PathBuf> {
     let name = if cfg!(windows) { "mns.exe" } else { "mns" };
 
     if let Some(from_env) = std::env::var_os("MNS_BIN") {
@@ -257,6 +264,50 @@ pub(crate) fn cli_path() -> Option<PathBuf> {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
+        let sibling = dir.join(name);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        for root in roots {
+            let candidate = root.join("MNS.app/Contents/MacOS").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Absolute path of the butler CLI that ships beside `mns`.
+///
+/// `MNS_BUTLER_BIN` wins for tests and unusual installs. Otherwise the sibling
+/// of the `mns` binary is authoritative, so the two always come from the same
+/// bundle. `None` is a real state: the workspace skill says the butler is
+/// unavailable instead of printing a path that cannot run.
+pub fn butler_bin() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "mns-butler.exe"
+    } else {
+        "mns-butler"
+    };
+
+    if let Some(from_env) = std::env::var_os("MNS_BUTLER_BIN") {
+        let candidate = PathBuf::from(from_env);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(dir) = mns_bin().and_then(|mns| mns.parent().map(Path::to_path_buf)) {
         let sibling = dir.join(name);
         if sibling.is_file() {
             return Some(sibling);
@@ -304,7 +355,125 @@ fn agent_env(cli: &Path, existing_path: &str) -> Vec<(String, String)> {
     vars
 }
 
-/// Optional model override handed to the external agent as an extra env var.
+/// One V2 permission rule: `{action, resource, effect}`.
+///
+/// V2 rule names matter: `shell` replaces V1 `bash`, `subagent` replaces `task`,
+/// and the `edit` action covers `edit`, `write` and `patch`. Action names are
+/// free strings in the schema, so a future plugin action still validates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Rule {
+    action: &'static str,
+    /// `String` rather than `&'static str`: the guard is generated from the
+    /// installed CLI path, and quoting/`mns.exe` variants would otherwise need
+    /// dozens of hand-written constants.
+    resource: String,
+    effect: &'static str,
+}
+
+impl Rule {
+    fn deny(action: &'static str, resource: impl Into<String>) -> Self {
+        Self {
+            action,
+            resource: resource.into(),
+            effect: "deny",
+        }
+    }
+}
+
+/// One-line permission note in the timeline.
+///
+/// Capability wording on purpose: it says what is enabled and that everything
+/// else follows the agent default. "Read-only" or "all tools denied" would
+/// contradict the policy after the capability-first change.
+const PERMISSION_NOTE: &str = "权限：已启用 mns 账本写入保护（其他工具按 Agent 默认）";
+
+/// Best-effort ledger guard shared by both profiles.
+///
+/// Capability comes first: the task page is an agent workspace, and the butler
+/// is allowed to run commands, browse and use skills. This list is **not a
+/// sandbox** — it only stops the obvious accident of asking an agent to run a
+/// command that writes the ledger:
+///
+/// * `init`, `add`, `buy`, `sell`, `price`, `remove`, `sentiment`, `report`,
+///   `today`, `update-prices`, `cash set|deposit|withdraw`,
+///   `backtest update-data`.
+///
+/// `config` is deliberately out of scope: it guards strategy knobs, not the
+/// ledger, and changing one is a visible action the user can take in the
+/// settings page. Its subcommand shapes also proved unpredictable across
+/// opencode builds — a `config * *` rule was verified to swallow the
+/// one-argument read `config thresholds.fear` — so no rule is better than a
+/// rule that misfires on a documented read.
+///
+/// Three deliberate limits:
+/// * Exact spellings only (bare `mns`, the real absolute path, the quoted
+///   absolute path, and the `.exe` forms). A leading `*` would also match
+///   `rm -rf ~/mns cash`, turning a guard into an allowlist.
+/// * Appended after nothing else: opencode's default is `allow`, so a deny is
+///   the only rule MNS needs for ordinary work to keep working.
+/// * `OPENCODE_CONFIG_CONTENT` is only read by opencode. With another ACP agent
+///   the guard does not apply at all; the prompt still asks it not to write.
+fn ledger_guard(cli: &Path) -> Vec<Rule> {
+    let mut rules = Vec::new();
+    for command in [
+        "init",
+        "add",
+        "buy",
+        "sell",
+        "price",
+        "remove",
+        "sentiment",
+        "report",
+        "today",
+        "update-prices",
+        "cash set",
+        "cash deposit",
+        "cash withdraw",
+        "backtest update-data",
+    ] {
+        deny_mns(&mut rules, cli, command);
+    }
+    rules
+}
+
+/// Every spelling of the CLI a shell command may start with.
+///
+/// Bare `mns` (PATH is redirected to the bundle), the real absolute path, the
+/// quoted absolute path (the workspace contract quotes it), and the Windows
+/// `.exe` forms.
+fn mns_heads(cli: &Path) -> Vec<String> {
+    let path = cli.display().to_string();
+    vec![
+        "mns".to_owned(),
+        path.clone(),
+        format!("\"{path}\""),
+        "mns.exe".to_owned(),
+        "\"mns.exe\"".to_owned(),
+    ]
+}
+
+/// Deny one mns write command in every spelling the shell may hand us.
+///
+/// Two patterns per spelling: the bare command and the form with arguments.
+/// opencode's matcher does not treat a trailing ` *` as optional, so a single
+/// `mns today *` rule would let a bare `mns today` through. The guard only
+/// names mns write commands; `rm -rf ~` in a compound command is left to the
+/// agent's own default policy — this is a guardrail, not a sandbox.
+fn deny_mns(rules: &mut Vec<Rule>, cli: &Path, command: &str) {
+    for head in mns_heads(cli) {
+        rules.push(Rule::deny("shell", format!("{head} {command}")));
+        rules.push(Rule::deny("shell", format!("{head} {command} *")));
+    }
+}
+
+fn permission_rules(_profile: Profile, cli: Option<&Path>) -> Vec<Rule> {
+    // With no CLI the guard has nothing to name, and opencode keeps its
+    // default allow policy. That is the intended capability-first behavior:
+    // the prompt still tells the agent not to touch the ledger.
+    cli.map(ledger_guard).unwrap_or_default()
+}
+
+/// Optional overrides handed to the external agent as `OPENCODE_CONFIG_CONTENT`.
 ///
 /// Why an env var instead of an argument: `opencode acp` accepts no `--model`
 /// flag, and the ACP version this crate speaks has no `session/set_model`
@@ -314,38 +483,67 @@ fn agent_env(cli: &Path, existing_path: &str) -> Vec<(String, String)> {
 ///
 /// `OPENCODE_CONFIG_CONTENT` is opencode's inline config layer: it is parsed as
 /// one more config document that merges over the user's own file *for this
-/// child process only*. Verified end to end: the file said one model, this var
-/// said another, and the ACP session used the var. An empty value returns
-/// `None` so an unset field really means "leave the agent alone".
-fn model_env(model: &str) -> Option<(String, String)> {
-    let model = model.trim();
-    if model.is_empty() {
-        return None;
-    }
-
-    // Respect an inline config the user may already have exported: merge into
-    // it rather than replacing it, so a model field never eats other keys.
+/// child process only*. Verified end to end for `model`; the same channel
+/// carries `permissions`, which is the only place a deny rule can be enforced.
+///
+/// Permissions are always injected: even a task session appends its policy,
+/// otherwise the field could silently disappear whenever the model is empty.
+fn agent_config_env(
+    settings: &AgentSettings,
+    cli: Option<&Path>,
+    profile: Profile,
+) -> (String, String) {
+    let model = settings.model.trim();
+    let rules = permission_rules(profile, cli);
     let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-    Some((
+    (
         "OPENCODE_CONFIG_CONTENT".to_owned(),
-        merge_model_config(existing.as_deref(), model),
-    ))
+        merge_agent_config(existing.as_deref(), model, &rules),
+    )
 }
 
-/// Put `model` into an inline opencode config, keeping whatever the user had.
-fn merge_model_config(existing: Option<&str>, model: &str) -> String {
+/// Merge the model and permission rules into an inline opencode config.
+///
+/// Existing keys are preserved: a user who exported `OPENCODE_CONFIG_CONTENT`
+/// keeps their theme, providers and earlier permission rules. New rules are
+/// appended because opencode resolves the *last* matching rule — appended
+/// rules therefore win over earlier ones.
+fn merge_agent_config(existing: Option<&str>, model: &str, rules: &[Rule]) -> String {
     let mut content = existing
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    content.insert(
-        "model".to_owned(),
-        serde_json::Value::String(model.to_owned()),
-    );
+
+    if !model.is_empty() {
+        content.insert(
+            "model".to_owned(),
+            serde_json::Value::String(model.to_owned()),
+        );
+    }
+
+    let permissions = content
+        .entry("permissions".to_owned())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !permissions.is_array() {
+        // A non-array value cannot be extended; replacing it is the only way to
+        // keep the deny rules enforceable (V1 `permission` is a different key
+        // and is left untouched).
+        *permissions = serde_json::Value::Array(Vec::new());
+    }
+    if let Some(array) = permissions.as_array_mut() {
+        for rule in rules {
+            array.push(serde_json::json!({
+                "action": rule.action,
+                "resource": &rule.resource,
+                "effect": rule.effect,
+            }));
+        }
+    }
+
     serde_json::Value::Object(content).to_string()
 }
 
-fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig {
+fn launch_config(settings: &AgentSettings, cli: Option<&Path>, profile: Profile) -> AcpAgentConfig {
     let base = if settings.agent_cli.trim().is_empty() {
         detect_agent_cli()
     } else {
@@ -371,20 +569,13 @@ fn launch_config(settings: &AgentSettings, cli: Option<&Path>) -> AcpAgentConfig
         AcpAgentConfig::new(base).args(args)
     };
 
-    let mut vars: Vec<(String, String)> = Vec::new();
-    if let Some(model) = model_env(&settings.model) {
-        vars.push(model);
-    }
+    let mut vars: Vec<(String, String)> = vec![agent_config_env(settings, cli, profile)];
     if let Some(cli) = cli {
         let existing = std::env::var("PATH").unwrap_or_default();
         vars.extend(agent_env(cli, &existing));
     }
 
-    if vars.is_empty() {
-        config
-    } else {
-        config.envs(vars)
-    }
+    config.envs(vars)
 }
 
 fn resolve_cwd(settings: &AgentSettings) -> PathBuf {
@@ -420,24 +611,14 @@ fn resolve_cwd(settings: &AgentSettings) -> PathBuf {
 ///   user is chatting: the autonomy contract made the model narrate in-progress
 ///   work and append `action:` fields, which is exactly what a butler must not
 ///   do. It gets a short dialogue contract instead.
-fn compose_goal(goal: &str, source: GoalSource, cwd: &Path, cli: Option<&Path>) -> String {
-    let cli_rule = match cli {
-        Some(cli) => {
-            let cli = cli.display();
-            format!(
-                "- 数据入口只有 mns CLI，绝对路径 `{cli}`，已随本应用安装。\
-                 账户、持仓、绩效、报告、定投计划一律通过它读取，例如 `{cli} portfolio`、\
-                 `{cli} today`、`{cli} --help`。不要用 find / mdfind / ls 搜索 mns，\
-                 也不要依赖 PATH 上的同名命令——那可能是旧版本。\n\
-                 - 不要绕过 CLI 访问底层存储：禁止用 sqlite3 打开 `~/.mns/mns.db`，\
-                 禁止解析 `~/.mns/config.toml` 的内部结构，禁止阅读 mns 源码。\
-                 CLI 没有提供的数据，说明它不该由你获取。"
-            )
-        }
-        None => "- 未检测到随应用安装的 mns CLI。任务若需要账户数据，请停止并告知用户，\
-                 不要自行搜索文件系统，也不要改用其他数据源。"
-            .to_owned(),
-    };
+fn compose_goal(
+    goal: &str,
+    source: GoalSource,
+    cwd: &Path,
+    cli: Option<&Path>,
+    managed: bool,
+) -> String {
+    let cli_rule = cli_rule(cli, managed);
 
     let contract = match source {
         GoalSource::Manual | GoalSource::DailyReview => format!(
@@ -446,8 +627,15 @@ fn compose_goal(goal: &str, source: GoalSource, cwd: &Path, cli: Option<&Path>) 
              不要逐步向用户提问，也不要等待用户补充信息。\n\
              - 工作目录：{cwd}\n\
              {cli_rule}\n\
-             - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
-             - 工作目录可写，但不要另建记录或存档文件：最终结论只通过回答里的 mns-decision 块回传，由 MNS 统一保存与展示。\n\
+             - 可以使用 shell、联网、编辑与子代理；需要账户数据时用 mns 的只读子命令\
+             （portfolio / cash / performance / plan / guard / history / market）。\n\
+             - MNS 只加了一条 best-effort 护栏：会改账本的 mns 子命令和 `init`\
+             （buy / sell / cash set / today 等）在 opencode 下会被拒绝；\
+             其余子命令（含 `config params` 等查询）照常可用。不要再尝试绕过。\
+             换其他 ACP agent 时这条护栏不生效，请自己遵守。\n\
+             - 工作目录可写；但不要把结论另存成记录文件，最终结论仍通过回答里的 mns-decision 块回传，\
+             由 MNS 统一保存与展示。\n\
+             - 不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
              - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
              MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。\n\
              - 完成后用中文输出：已完成事项、涉及的文件或命令、以及未完成或有风险的事项。",
@@ -455,14 +643,21 @@ fn compose_goal(goal: &str, source: GoalSource, cwd: &Path, cli: Option<&Path>) 
         ),
         GoalSource::Conversation => format!(
             "【MNS 桌面端对话约定】\n\
-             - 这是一次对话，不是任务：不要拆解步骤，不要写「我先查一下」「接下来我会…」这类过程旁白。\
-             需要数据可以看下面的清单或调用 mns CLI，查完直接给结论，不要播报你正在查什么。\n\
+             - 这是一次对话，不是任务：不要拆解步骤，不要写「我先查一下」「接下来我会…」这类过程旁白。\n\
+             - 账户事实已经注入在上下文里：够答就直接答；缺数据可以用 mns 只读命令查，查不到就直说没有。\n\
+             - 可以执行命令、联网、使用技能；不要写任意文件，也不要动账本；\
+             管家状态与到点任务只用 mns-butler 改。\n\
+             - 管家状态与到点任务用 mns-butler（路径和命令清单见工作目录 AGENTS.md 与 mns-butler 技能）。\n\
+             - 提醒只能靠真的建任务：`mns-butler task add \"<到点检查什么>\" --at \"YYYY-MM-DD HH:MM\"`；\
+             先用 `date \"+%Y-%m-%d %H:%M\"` 取当前时间再算。看到「已接受」才能说记下了；\
+             不要用 sleep / osascript / display notification 假装提醒。\n\
+             - 回执要说清前提：到点提醒需要 MNS 开着（托盘也算）；静音时段、主动开口关闭或额度用完都会压住。\n\
              - 用中文回答，像真人聊天：先给结论，再给一两句理由；不要逐条汇报「已完成事项 / 涉及命令」。\n\
              - 不要输出 mns-decision 块，也不要在正文里写 action、effective、monthly_amount 之类的字段。\n\
-             - 工作目录：{cwd}\n\
-             {cli_rule}\n\
-             - 仅在该目录内读写；不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
-             - 不要另建记录或存档文件。\n\
+             - 工作目录：{cwd}。\n\
+             - 不要执行下单、交易、资金划转、删除仓库、推送远端或对外发送数据的操作。\n\
+             - 「记住 / 忘掉」由管家界面在消息进入你之前解析并落盘；不要调用 remember / forget，\
+             也不要声称自己写了记忆。\n\
              - 模型名可能由 MNS 设置指定；推理端点与凭据始终由你自己的配置文件管理（例如 opencode 的 provider 配置）。\
              MNS 不提供 URL 或 API Key，也不要向用户索要这些内容。",
             cwd = cwd.display()
@@ -470,6 +665,38 @@ fn compose_goal(goal: &str, source: GoalSource, cwd: &Path, cli: Option<&Path>) 
     };
 
     format!("{goal}\n\n---\n{contract}")
+}
+
+/// The one line of standing rules the prompt keeps.
+///
+/// When the managed workspace was written, the details live in `AGENTS.md` and
+/// the prompt only needs to name the binary, keep the storage ban, and point
+/// at the contract. A user-chosen `working_dir` gets the full fallback: MNS
+/// does not write into someone else's repository, so the prompt must carry
+/// everything the agent needs.
+fn cli_rule(cli: Option<&Path>, managed: bool) -> String {
+    let Some(cli) = cli else {
+        return "- 未检测到随应用安装的 mns CLI。任务若需要账户数据，请停止并告知用户，\
+                不要自行搜索文件系统，也不要改用其他数据源。"
+            .to_owned();
+    };
+    let cli = cli.display();
+    let entry = format!(
+        "- 数据入口只有 mns CLI，绝对路径 `{cli}`，已随本应用安装。\
+         账户、持仓、绩效、报告、定投计划一律通过它读取。\
+         不要用 find / mdfind / ls 搜索 mns，也不要依赖 PATH 上的同名命令——那可能是旧版本。"
+    );
+    let storage = "- 不要绕过 CLI 访问底层存储：禁止用 sqlite3 打开 `~/.mns/mns.db`，\
+                   禁止解析 `~/.mns/config.toml` 的内部结构，禁止阅读 mns 源码。\
+                   CLI 没有提供的数据，说明它不该由你获取。";
+    if managed {
+        format!("{entry}\n{storage}\n- 工作约定、可用技能与只读命令清单见工作目录下的 AGENTS.md。")
+    } else {
+        format!(
+            "{entry}\n{storage}\n- 常用只读示例：`{cli} portfolio`、`{cli} performance`、`{cli} --help`。\n\
+             `mns today` / `mns report` 会写入快照与报告，不要运行；需要刷新时请用户自行运行。"
+        )
+    }
 }
 
 /// Pull the last ```mns-decision block out of an assistant message.
@@ -518,8 +745,15 @@ async fn run_session(
         return;
     }
 
-    let cli = cli_path();
-    let config = launch_config(&settings, cli.as_deref());
+    // The profile decides both the workspace contract and the permission set,
+    // so it has to exist before the launch environment is built.
+    let profile = match source {
+        GoalSource::Conversation => Profile::Butler,
+        GoalSource::Manual | GoalSource::DailyReview => Profile::Task,
+    };
+
+    let cli = mns_bin();
+    let config = launch_config(&settings, cli.as_deref(), profile);
     emit_entry(
         &events,
         EntryKind::System,
@@ -553,9 +787,35 @@ async fn run_session(
             model => format!("模型：{model}"),
         },
     );
+    // The guard is invisible in the UI otherwise, and "why did it refuse that
+    // command" deserves an answer in the run log.
+    emit_entry(&events, EntryKind::System, PERMISSION_NOTE);
+
+    // Write the standing contract before the agent starts. Only MNS-owned
+    // workspaces are touched; a user-chosen directory keeps its own rules and
+    // gets the full rule set in the prompt instead.
+    let butler = butler_bin();
+    let managed = match workspace::bootstrap(
+        &cwd,
+        profile,
+        Binaries {
+            mns: cli.as_deref(),
+            butler: butler.as_deref(),
+        },
+    ) {
+        Ok(managed) => managed,
+        Err(error) => {
+            emit_entry(
+                &events,
+                EntryKind::Error,
+                format!("工作区约定未写入，本次改用 prompt 兜底：{error}"),
+            );
+            false
+        }
+    };
 
     let agent = AcpAgent::new(config);
-    let prompt_text = compose_goal(&goal, source, &cwd, cli.as_deref());
+    let prompt_text = compose_goal(&goal, source, &cwd, cli.as_deref(), managed);
 
     let events_for_updates = events.clone();
     let events_for_permissions = events.clone();
@@ -644,11 +904,7 @@ async fn run_session(
                 if let Ok(mut guard) = message_buffer.lock() {
                     guard.clear();
                 }
-                emit_state(
-                    &events_for_foreground,
-                    RunState::Running,
-                    "Agent 正在分析…",
-                );
+                emit_state(&events_for_foreground, RunState::Running, "Agent 正在分析…");
 
                 let response = connection
                     .send_request(PromptRequest::new(
@@ -1190,7 +1446,7 @@ mod tests {
             agent_cli: "/opt/bin/opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, None, Profile::Task);
         assert_eq!(config.command(), std::path::Path::new("/opt/bin/opencode"));
         assert_eq!(config.arguments(), ["acp"]);
     }
@@ -1206,7 +1462,7 @@ mod tests {
             ],
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, None, Profile::Task);
         assert_eq!(
             config.arguments(),
             ["--log-level", "warn", "acp"],
@@ -1220,7 +1476,7 @@ mod tests {
             agent_cli: "npx opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, None, Profile::Task);
         assert_eq!(config.command(), std::path::Path::new("npx"));
         assert_eq!(config.arguments(), ["opencode", "acp"]);
     }
@@ -1231,7 +1487,7 @@ mod tests {
             agent_cli: r"D:\Program Files (x86)\QuickBin\opencode.exe".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, None, Profile::Task);
         assert_eq!(
             config.command(),
             std::path::Path::new(r"D:\Program Files (x86)\QuickBin\opencode.exe"),
@@ -1243,7 +1499,7 @@ mod tests {
             agent_cli: "/Applications/My Agents/opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&mac, None);
+        let config = launch_config(&mac, None, Profile::Task);
         assert_eq!(
             config.command(),
             std::path::Path::new("/Applications/My Agents/opencode")
@@ -1258,7 +1514,7 @@ mod tests {
             ..AgentSettings::default()
         };
         let cli = Path::new("/Applications/MNS.app/Contents/MacOS/mns");
-        let config = launch_config(&settings, Some(cli));
+        let config = launch_config(&settings, Some(cli), Profile::Task);
 
         assert_eq!(
             config.environment().get("MNS_BIN").map(String::as_str),
@@ -1282,7 +1538,7 @@ mod tests {
             model: "  opencode/deepseek-v4.1-flash-free  ".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, None, Profile::Task);
         let raw = config
             .environment()
             .get("OPENCODE_CONFIG_CONTENT")
@@ -1295,30 +1551,345 @@ mod tests {
     }
 
     #[test]
-    fn launch_config_leaves_the_agent_alone_without_a_model() {
+    fn launch_config_keeps_the_deny_rules_even_without_a_model() {
         let settings = AgentSettings {
             agent_cli: "opencode".to_owned(),
             ..AgentSettings::default()
         };
-        let config = launch_config(&settings, None);
+        let config = launch_config(&settings, Some(test_cli()), Profile::Task);
+        let raw = config
+            .environment()
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("the deny rules must reach the agent even when no model is set");
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(
-            config.environment().is_empty(),
-            "an empty field must not override the agent's own default: {:?}",
-            config.environment()
+            value["permissions"]
+                .as_array()
+                .is_some_and(|rules| !rules.is_empty()),
+            "task sessions still carry their command deny list"
+        );
+        let fresh: serde_json::Value = serde_json::from_str(&merge_agent_config(
+            None,
+            "",
+            &permission_rules(Profile::Task, Some(test_cli())),
+        ))
+        .unwrap();
+        assert!(
+            fresh.get("model").is_none(),
+            "an empty model must not be invented"
         );
     }
 
     #[test]
-    fn merge_model_config_keeps_what_the_user_already_exported() {
-        let merged =
-            merge_model_config(Some(r#"{"theme":"dark","model":"old/model"}"#), "new/model");
+    fn timeline_note_talks_about_capability_not_prohibition() {
+        assert_eq!(
+            PERMISSION_NOTE,
+            "权限：已启用 mns 账本写入保护（其他工具按 Agent 默认）"
+        );
+        for stale in ["只读", "全部禁用", "拒绝工具", "无工具"] {
+            assert!(
+                !PERMISSION_NOTE.contains(stale),
+                "the timeline must not describe the old fail-closed policy"
+            );
+        }
+    }
+
+    #[test]
+    fn both_profiles_only_carry_the_ledger_guard() {
+        for profile in [Profile::Task, Profile::Butler] {
+            let rules = permission_rules(profile, Some(test_cli()));
+            assert!(!rules.is_empty(), "{profile:?} must still guard the ledger");
+            assert!(
+                rules
+                    .iter()
+                    .all(|rule| rule.action == "shell" && rule.effect == "deny"),
+                "{profile:?} may only add shell deny rules"
+            );
+            assert!(
+                rules.iter().all(|rule| !rule.resource.starts_with('*')),
+                "a leading wildcard would turn the guard into a prefix hole"
+            );
+            assert!(
+                !rules.iter().any(|rule| rule.resource == "*"),
+                "there must be no blanket shell deny"
+            );
+            // `config` is out of scope: it guards strategy knobs, not the
+            // ledger, and a `config * *` rule was verified to swallow the
+            // one-argument read `config thresholds.fear`.
+            assert!(
+                rules.iter().all(|rule| !rule.resource.contains(" config")),
+                "no rule may mention `mns config`: its read shapes must stay usable"
+            );
+            for action in [
+                "edit",
+                "write",
+                "webfetch",
+                "websearch",
+                "subagent",
+                "execute",
+                "skill",
+            ] {
+                assert!(
+                    !rules.iter().any(|rule| rule.action == action),
+                    "{profile:?} must keep opencode's default for {action}"
+                );
+            }
+        }
+        assert_eq!(
+            permission_rules(Profile::Task, Some(test_cli())),
+            permission_rules(Profile::Butler, Some(test_cli())),
+            "both profiles share the same best-effort guard"
+        );
+    }
+
+    #[test]
+    fn write_commands_are_denied_in_every_spelling() {
+        for command in [
+            "mns init",
+            "mns init --force",
+            "mns add 000001",
+            "mns buy 007605 100 1.0",
+            "mns sell 007605 1",
+            "mns price 007605 1.0",
+            "mns remove 007605",
+            "mns sentiment",
+            "mns report",
+            "mns today",
+            "mns update-prices",
+            "mns cash set 0",
+            "mns cash deposit 1000",
+            "mns cash withdraw 1000",
+            "mns backtest update-data",
+            "/Applications/MNS.app/Contents/MacOS/mns buy 007605 100 1.0",
+            "\"/Applications/MNS.app/Contents/MacOS/mns\" cash set 0",
+            "/Applications/MNS.app/Contents/MacOS/mns backtest update-data",
+            "/Applications/MNS.app/Contents/MacOS/mns today",
+            "\"/Applications/MNS.app/Contents/MacOS/mns\" report",
+            "mns.exe buy 007605 100 1.0",
+            "\"mns.exe\" init --force",
+            "mns.exe today",
+            // A denied subcommand anywhere in a compound command is enough.
+            "mns portfolio && mns buy 1",
+            "mns cash; mns cash set 0",
+        ] {
+            assert!(
+                denied(Profile::Task, command),
+                "{command} must be denied by the ledger guard"
+            );
+            assert!(
+                denied(Profile::Butler, command),
+                "the butler uses the same guard: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_and_default_tools_stay_available() {
+        for command in [
+            "mns portfolio",
+            "mns cash",
+            "mns performance",
+            "mns guard",
+            "mns market",
+            "mns history 5",
+            "mns history --limit 10",
+            "mns config",
+            "mns config params",
+            "mns config params --json",
+            "mns config thresholds.fear",
+            "/Applications/MNS.app/Contents/MacOS/mns config params --json",
+            "mns plan --monthly 3000",
+            "mns --help",
+            "mns --version",
+            "/Applications/MNS.app/Contents/MacOS/mns portfolio",
+            "\"/Applications/MNS.app/Contents/MacOS/mns\" plan --monthly 3000",
+            "/Applications/MNS.app/Contents/MacOS/mns config params",
+            "mns.exe portfolio",
+            // Two reads may be chained; every subcommand is checked.
+            "mns portfolio && mns cash",
+            "mns plan --monthly 3000; mns cash",
+            // Everything else is opencode's default, not MNS's business.
+            "rm -rf /tmp/x",
+            "curl https://example.com",
+            "osascript -e 'display notification 1'",
+            "sleep 5",
+        ] {
+            assert!(
+                !denied(Profile::Task, command),
+                "{command} is not a ledger write and must stay usable"
+            );
+        }
+    }
+
+    fn test_cli() -> &'static Path {
+        Path::new("/Applications/MNS.app/Contents/MacOS/mns")
+    }
+
+    #[test]
+    fn without_a_cli_the_guard_has_nothing_to_name() {
+        assert!(permission_rules(Profile::Task, None).is_empty());
+        assert!(permission_rules(Profile::Butler, None).is_empty());
+    }
+
+    fn denied(profile: Profile, command: &str) -> bool {
+        let rules = permission_rules(profile, Some(test_cli()));
+        shell_segments(command)
+            .iter()
+            .any(|segment| resolve_one(&rules, "shell", segment.trim()) == Some("deny"))
+    }
+
+    /// Minimal V2 matcher used by the tests: `*` spans `/`, `?` is one char,
+    /// and a pattern ending in ` *` also matches the bare command.
+    fn rule_matches(pattern: &str, command: &str) -> bool {
+        // Faithful to a plain glob: no implicit optional argument, which is why
+        // the guard writes both the bare and the ` *` spelling.
+        wildcard(pattern, command)
+    }
+
+    fn wildcard(pattern: &str, text: &str) -> bool {
+        let pattern: Vec<char> = pattern.chars().collect();
+        let text: Vec<char> = text.chars().collect();
+        let (mut p, mut t) = (0usize, 0usize);
+        let (mut star, mut mark) = (None, 0usize);
+        while t < text.len() {
+            if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+                p += 1;
+                t += 1;
+            } else if p < pattern.len() && pattern[p] == '*' {
+                star = Some(p);
+                p += 1;
+                mark = t;
+            } else if let Some(s) = star {
+                p = s + 1;
+                mark += 1;
+                t = mark;
+            } else {
+                return false;
+            }
+        }
+        while p < pattern.len() && pattern[p] == '*' {
+            p += 1;
+        }
+        p == pattern.len()
+    }
+
+    fn resolve_one(rules: &[Rule], action: &str, resource: &str) -> Option<&'static str> {
+        let mut effect = None;
+        for rule in rules {
+            if rule.action == action && rule_matches(&rule.resource, resource) {
+                effect = Some(rule.effect);
+            }
+        }
+        effect
+    }
+
+    /// Split a shell command the way opencode's scanner does for the cases in
+    /// these tests: outside quotes, on `;`, `&&`, `||`, `|` and newlines.
+    /// `$(…)` and backticks stay in one segment.
+    fn shell_segments(command: &str) -> Vec<String> {
+        let chars: Vec<char> = command.chars().collect();
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(q) = quote {
+                current.push(c);
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                '`' => {
+                    current.push(c);
+                    quote = Some('`');
+                }
+                '(' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(c);
+                }
+                _ if depth > 0 => current.push(c),
+                ';' | '\n' => {
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
+                }
+                '&' | '|' => {
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
+                    // `&&` / `||` are one operator, not an empty segment.
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 1;
+                    }
+                }
+                _ => current.push(c),
+            }
+            i += 1;
+        }
+        if !current.trim().is_empty() {
+            segments.push(current);
+        }
+        segments
+    }
+
+    #[test]
+    fn merge_agent_config_preserves_user_keys_and_appends_rules() {
+        let existing = r#"{"theme":"dark","model":"old/model","permissions":[{"action":"read","resource":"*.env","effect":"deny"}]}"#;
+        let merged = merge_agent_config(
+            Some(existing),
+            "new/model",
+            &permission_rules(Profile::Task, Some(test_cli())),
+        );
         let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(value["theme"], "dark", "unrelated keys survive");
         assert_eq!(value["model"], "new/model", "the settings field wins");
 
-        let broken = merge_model_config(Some("not json"), "new/model");
-        let value: serde_json::Value = serde_json::from_str(&broken).unwrap();
-        assert_eq!(value["model"], "new/model");
+        let permissions = value["permissions"].as_array().unwrap();
+        assert_eq!(
+            permissions[0]["resource"], "*.env",
+            "the user's earlier rule stays first"
+        );
+        assert!(
+            permissions[1..]
+                .iter()
+                .all(|rule| rule["action"] == "shell"),
+            "our guard is appended after the user's rule and only touches the shell"
+        );
+        assert_eq!(
+            permissions[1]["resource"], "mns init",
+            "the first guard entry names the bare write command"
+        );
+        let last = permissions.last().unwrap();
+        assert_eq!(last["effect"], "deny");
+        assert_eq!(last["resource"], "\"mns.exe\" backtest update-data *");
+    }
+
+    #[test]
+    fn merge_agent_config_survives_broken_inline_json() {
+        let merged = merge_agent_config(
+            Some("not json"),
+            "",
+            &permission_rules(Profile::Butler, Some(test_cli())),
+        );
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(value.get("model").is_none());
+        assert_eq!(
+            value["permissions"].as_array().unwrap().len(),
+            permission_rules(Profile::Butler, Some(test_cli())).len()
+        );
     }
 
     #[test]
@@ -1331,7 +1902,10 @@ mod tests {
         assert_eq!(vars[1].1, format!("/tmp/bin{separator}/usr/bin:/bin"));
 
         let empty = agent_env(Path::new("/tmp/bin/mns"), "");
-        assert_eq!(empty[1].1, "/tmp/bin", "an empty PATH must not gain a separator");
+        assert_eq!(
+            empty[1].1, "/tmp/bin",
+            "an empty PATH must not gain a separator"
+        );
     }
 
     #[test]
@@ -1342,6 +1916,7 @@ mod tests {
                 source,
                 Path::new("/work"),
                 Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+                true,
             );
             assert!(prompt.starts_with("检查数据"));
             assert!(prompt.contains("这是一个自主执行任务"));
@@ -1351,6 +1926,7 @@ mod tests {
             assert!(prompt.contains("/work"));
             assert!(prompt.contains("不要执行下单、交易"));
             assert!(prompt.contains("工作目录可写"));
+            assert!(!prompt.contains("工作目录只读"));
             assert!(prompt.contains("mns-decision"));
             assert!(prompt.contains("已完成事项"));
         }
@@ -1378,8 +1954,30 @@ mod tests {
             prompt.contains("不要输出 mns-decision"),
             "the machine channel is only for task runs"
         );
-        assert!(prompt.contains("不要执行下单、交易"), "safety rules still apply");
-        assert!(prompt.contains("不要用 find"), "the CLI rule still applies");
+        assert!(
+            prompt.contains("不要执行下单、交易"),
+            "safety rules still apply"
+        );
+        assert!(
+            prompt.contains("账户事实已经注入") && prompt.contains("查不到就直说没有"),
+            "the butler answers from injected facts, with the CLI as a fallback"
+        );
+        assert!(
+            prompt.contains("mns-butler task add"),
+            "a reminder must become a real due task"
+        );
+        assert!(
+            prompt.contains("可以执行命令、联网"),
+            "capability first: the butler is allowed to use tools"
+        );
+        assert!(
+            !prompt.contains("不要调用工具") && !prompt.contains("不要执行命令"),
+            "the old blanket tool ban must be gone"
+        );
+        assert!(
+            !prompt.contains("仅在该目录内读写"),
+            "the old read-write sentence contradicts the deny policy"
+        );
     }
 
     #[test]
@@ -1398,6 +1996,7 @@ mod tests {
             GoalSource::Conversation,
             Path::new("/work"),
             Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+            true,
         )
     }
 
@@ -1408,12 +2007,16 @@ mod tests {
             GoalSource::Manual,
             Path::new("/work"),
             Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+            true,
         );
         assert!(
             prompt.contains("/Applications/MNS.app/Contents/MacOS/mns"),
             "the agent must be told the absolute path instead of searching for it"
         );
-        assert!(prompt.contains("不要用 find"), "search commands are ruled out");
+        assert!(
+            prompt.contains("不要用 find"),
+            "search commands are ruled out"
+        );
         assert!(
             prompt.contains("sqlite3") && prompt.contains("~/.mns/mns.db"),
             "reading the database directly must be named as forbidden"
@@ -1423,13 +2026,55 @@ mod tests {
 
     #[test]
     fn goal_prompt_without_a_cli_forbids_guessing() {
-        let prompt = compose_goal("生成今日报告", GoalSource::Manual, Path::new("/work"), None);
+        let prompt = compose_goal(
+            "生成今日报告",
+            GoalSource::Manual,
+            Path::new("/work"),
+            None,
+            true,
+        );
         assert!(prompt.contains("未检测到随应用安装的 mns CLI"));
         assert!(prompt.contains("不要自行搜索文件系统"));
         assert!(
             !prompt.contains("sqlite3"),
             "no path is offered, so there is no storage rule to state"
         );
+    }
+
+    #[test]
+    fn managed_prompt_points_at_agents_md_instead_of_listing_commands() {
+        let prompt = compose_goal(
+            "生成今日报告",
+            GoalSource::Manual,
+            Path::new("/work"),
+            Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+            true,
+        );
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(
+            !prompt.contains("--help"),
+            "the command catalogue lives in the skill, not the prompt"
+        );
+    }
+
+    #[test]
+    fn custom_working_dir_keeps_the_full_command_examples() {
+        let prompt = compose_goal(
+            "生成今日报告",
+            GoalSource::Manual,
+            Path::new("/work"),
+            Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
+            false,
+        );
+        assert!(
+            prompt.contains("--help"),
+            "no AGENTS.md is written for this directory"
+        );
+        assert!(
+            prompt.contains("会写入"),
+            "the fallback must not present `mns today` as read-only"
+        );
+        assert!(!prompt.contains("AGENTS.md"));
     }
 
     #[test]
@@ -1624,9 +2269,14 @@ mod tests {
         let cwd = resolve_cwd(&AgentSettings::default());
         assert_eq!(
             cwd,
-            crate::config::app_data_dir().join("agent").join("workspace")
+            crate::config::app_data_dir()
+                .join("agent")
+                .join("workspace")
         );
-        assert!(cwd.is_dir(), "workspace must exist for the agent to write into");
+        assert!(
+            cwd.is_dir(),
+            "workspace must exist for the agent to write into"
+        );
         assert_ne!(cwd, std::path::PathBuf::from("/"));
     }
 }

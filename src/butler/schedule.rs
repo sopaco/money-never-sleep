@@ -329,15 +329,16 @@ pub fn gate(
 }
 
 /// 判定要不要开口。纯函数：给定候选、策略、历史与当前时间，结果可复算。
+///
+/// 到点任务走的是「用户自己设的闹钟」通道：它不受每日/每周额度、静音时段
+/// 和主动开口开关影响。那些约束是防止管家**自己**找话说，不是用来吞掉用户
+/// 亲口要的提醒。其余候选仍走完整闸门。
 pub fn decide(
     candidates: &[SpeakCandidate],
     now: DateTime<Local>,
     policy: &SpeakPolicy,
     ledger: &SpeakLedger,
 ) -> SpeakDecision {
-    if !policy.enabled {
-        return SpeakDecision::Silent(SilentBecause::Paused);
-    }
     if candidates.is_empty() {
         return SpeakDecision::Silent(SilentBecause::NothingToSay);
     }
@@ -354,11 +355,16 @@ pub fn decide(
     // 任务带时效，过期即作废；其余按「可执行 → 计划外 → 承诺」排。
     fresh.sort_by_key(|candidate| candidate.reason);
 
+    let chosen = fresh[0].clone();
+    if chosen.reason == SpeakReason::TaskDue {
+        return SpeakDecision::Speak(chosen);
+    }
+
     if let Err(reason) = gate(policy, ledger, now) {
         return SpeakDecision::Silent(reason);
     }
 
-    SpeakDecision::Speak(fresh[0].clone())
+    SpeakDecision::Speak(chosen)
 }
 
 /// 静音时段是否覆盖 `now`。默认 22:00–08:00，跨零点。
@@ -572,6 +578,43 @@ mod tests {
         let row = candidate(SpeakReason::ActionableStep, "2026-11-20:us_stocks");
         assert_eq!(
             decide(std::slice::from_ref(&row), at(16, 10), &policy, &SpeakLedger::default()),
+            SpeakDecision::Silent(SilentBecause::Paused)
+        );
+    }
+
+    #[test]
+    fn 到点任务不受静音额度与总开关影响() {
+        // 到点任务是用户自己设的闹钟，不是管家自己找话说：频控、静音、
+        // 主动开口开关都不该把它吞掉。
+        let policy = SpeakPolicy {
+            enabled: false,
+            daily_cap: 1,
+            weekly_cap: 1,
+            quiet_start_hour: 23,
+            quiet_end_hour: 6,
+            ..SpeakPolicy::default()
+        };
+        let mut ledger = SpeakLedger::default();
+        ledger.record(at(16, 9), &candidate(SpeakReason::ActionableStep, "x"));
+
+        match decide(
+            &[candidate(SpeakReason::TaskDue, "task:t1")],
+            at(16, 23),
+            &policy,
+            &ledger,
+        ) {
+            SpeakDecision::Speak(row) => assert_eq!(row.reason, SpeakReason::TaskDue),
+            other => panic!("到点任务不应被吞掉，实际 {other:?}"),
+        }
+
+        // 同一时刻的普通候选仍然按原规则拦下。
+        assert_eq!(
+            decide(
+                &[candidate(SpeakReason::ActionableStep, "y")],
+                at(16, 23),
+                &policy,
+                &ledger
+            ),
             SpeakDecision::Silent(SilentBecause::Paused)
         );
     }

@@ -54,7 +54,7 @@ CLI 有两种合法来源，按序取第一个：
 
 不要用 `~/mns`，也不要默认信任 PATH 上的 `mns`：本机 PATH 命中过 `~/QuickBins/mns`（0.7.0），而应用包已是 0.8.0，两份口径不同，读出来的账户数据无法与 GUI 对上。定位后先跑 `--version`，与 `Cargo.toml` 的 `version` 对齐再继续。`scripts/collect_state.sh` 已按同一顺序解析，优先用它而不是手拼命令。
 
-只经 CLI 取数：禁止用 `sqlite3` 打开 `~/.mns/mns.db`、禁止解析 `~/.mns/config.toml` 的内部结构、禁止读源码。数据库 schema、表名与字段是实现细节，不是可依赖的接口；CLI 没有提供的数据说明它不该由 agent 获取。GUI 启动外部 agent 时会在权限层直接拒绝这类调用。
+只经 CLI 取数：禁止用 `sqlite3` 打开 `~/.mns/mns.db`、禁止解析 `~/.mns/config.toml` 的内部结构、禁止读源码。数据库 schema、表名与字段是实现细节，不是可依赖的接口；CLI 没有提供的数据说明它不该由 agent 获取。GUI 会在工作区 AGENTS.md 与 prompt 里写明这条约定；默认 opencode 下 MNS 只额外拦会改账本的 mns 子命令和 `init`，这是 best-effort 护栏，不是沙箱。
 
 ## 工作流
 

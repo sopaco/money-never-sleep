@@ -1329,11 +1329,7 @@ impl AppShell {
         let mut butler = match crate::butler::Butler::load() {
             Ok(butler) => butler,
             Err(error) => {
-                self.show_toast(
-                    format!("管家状态读取失败：{error:#}"),
-                    ToastTone::Error,
-                    cx,
-                );
+                self.show_toast(format!("管家状态读取失败：{error:#}"), ToastTone::Error, cx);
                 return;
             }
         };
@@ -1557,7 +1553,7 @@ impl AppShell {
                 // `weekday_label` uses 1..=7 (Monday..Sunday) to match the
                 // `decision_weekday` config, while chrono counts from 0.
                 let weekday = crate::app::weekday_label(now.weekday().num_days_from_monday() + 1);
-                let cli = crate::agent::cli_path();
+                let cli = crate::agent::mns_bin();
                 let prompt = routine::daily_review_prompt(&date, weekday, &report, cli.as_deref());
                 self.begin_session(
                     format!("每日巡检 · {date}"),
@@ -1791,11 +1787,9 @@ impl AppShell {
                 } else if exchange_traded {
                     // 账本只记场外基金：场内 ETF/LOF 走证券账户，成本、份额、
                     // 分红都不在 MNS 的口径里，硬塞进来只会让偏离算错。
-                    Err(
-                        "MNS 只记场外基金。场内 ETF/LOF 请在证券账户单独管理，\
+                    Err("MNS 只记场外基金。场内 ETF/LOF 请在证券账户单独管理，\
                          这里可以添加它对应的场外联接基金"
-                            .to_owned(),
-                    )
+                        .to_owned())
                 } else if name.is_empty()
                     && !(code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()))
                 {
@@ -2034,10 +2028,7 @@ pub fn run() {
     // GUI 重启后要立刻重新握手：守护进程上次连接已经断了，只有它主动
     // `Hello` 才知道「现在有 GUI 可以投递」。这条 poke 触发它重连。
     if daemon_present {
-        let _ = crate::ipc::poke(
-            "mns-butlerd",
-            &crate::ipc::Signal::Wake { ledger: None },
-        );
+        let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger: None });
     }
 
     // `--butler` 冷启动同样把主窗口建成隐藏载体：用户要的是管家会话，
@@ -2229,10 +2220,7 @@ fn due_task_ids() -> Vec<String> {
 }
 
 /// 通知点击回调只置位，窗口由主线程打开——回调线程不能直接碰 GPUI。
-fn spawn_notification_clicks(
-    cx: &mut App,
-    mut requests: tokio::sync::mpsc::UnboundedReceiver<()>,
-) {
+fn spawn_notification_clicks(cx: &mut App, mut requests: tokio::sync::mpsc::UnboundedReceiver<()>) {
     cx.spawn(async move |cx| {
         // 挂起等事件，不做定时轮询：一次点击唤醒一次，空闲时零开销。
         while requests.recv().await.is_some() {
@@ -2319,6 +2307,12 @@ fn write_pending_offset(offset: u64) {
 /// `conversation.json` 始终只有 GUI 一个写者：守护进程只往 `pending.jsonl`
 /// 追加，投递与去重都在这里完成。
 fn consume_pending(cx: &mut App) {
+    consume_pending_with(cx, false);
+}
+
+/// `assume_seen` 给「用户正在打开管家窗口」这条路径用：窗口可能还没拿到
+/// 焦点，但那一眼就是要看积压，不该再补一条横幅。
+fn consume_pending_with(cx: &mut App, assume_seen: bool) {
     let offset = read_pending_offset();
     let Ok((new_offset, notices)) = crate::butler::orchestrator::take_pending(offset) else {
         return;
@@ -2328,23 +2322,35 @@ fn consume_pending(cx: &mut App) {
     }
 
     let now = chrono::Local::now();
+    // 窗口存在 ≠ 用户看得见：管家窗口在后面、最小化、⌘W 隐藏时，
+    // `butler_view` 仍然是 Some。只有它真是当前焦点窗口，才算「已看见」；
+    // 否则消息照样进会话，但要保留未读并继续走横幅与托盘。
+    let window_focused = cx
+        .global::<GuiState>()
+        .butler_window
+        .as_ref()
+        .copied()
+        .is_some_and(|handle| cx.active_window() == Some(handle));
     let open = cx.global::<GuiState>().butler_view.clone();
-    let window_open = open.is_some();
+    let seen_now = assume_seen || (open.is_some() && window_focused);
 
     // 先落盘、再推进偏移。反过来写的话，会话保存失败就等于消息永久丢失：
     // 偏移已经越过它，下次也不会重投。
     let persisted = match open {
         Some(view) => {
-            // 窗口开着：用户看得见，直接进会话并算已读。
             let saved = view.update(cx, |view, cx| {
                 let mut saved = true;
                 for notice in &notices {
-                    saved &= view.receive_notice(notice);
+                    saved &= view.receive_notice(notice, seen_now);
                 }
-                cx.notify();
+                if seen_now {
+                    cx.notify();
+                }
                 saved
             });
-            cx.global_mut::<GuiState>().butler_notice = None;
+            if seen_now {
+                cx.global_mut::<GuiState>().butler_notice = None;
+            }
             saved
         }
         None => match crate::butler::Session::load() {
@@ -2381,7 +2387,7 @@ fn consume_pending(cx: &mut App) {
     }
     write_pending_offset(new_offset);
 
-    if !window_open {
+    if !seen_now {
         if let Some(last) = notices.last() {
             cx.global_mut::<GuiState>().butler_notice = Some(last.draft.clone());
         }
@@ -2479,15 +2485,28 @@ fn run_butler_wake_with(cx: &mut App, source: crate::butler::WakeSource) {
         eprintln!("[mns-gui] butler outbox append failed: {error:#}");
     }
 
+    let window_focused = cx
+        .global::<GuiState>()
+        .butler_window
+        .as_ref()
+        .copied()
+        .is_some_and(|handle| cx.active_window() == Some(handle));
     let open = cx.global::<GuiState>().butler_view.clone();
     match open {
         Some(view) => {
-            // 窗口开着，用户看得见，直接进会话并算已读。
             view.update(cx, |view, cx| {
-                view.receive(&candidate);
-                cx.notify();
+                view.receive(&candidate, window_focused);
+                if window_focused {
+                    cx.notify();
+                }
             });
-            cx.global_mut::<GuiState>().butler_notice = None;
+            if window_focused {
+                cx.global_mut::<GuiState>().butler_notice = None;
+            } else {
+                // 窗口在，但用户没在看：仍然要留未读、托盘提示与横幅。
+                cx.global_mut::<GuiState>().butler_notice = Some(candidate.draft.clone());
+                notify::send(&candidate.draft);
+            }
         }
         None => {
             // 窗口没开：落进会话存档但不标已读，托盘菜单作为可点击的提示面。
@@ -2514,8 +2533,8 @@ fn run_butler_wake_with(cx: &mut App, source: crate::butler::WakeSource) {
 
 fn open_butler_window(cx: &mut App) {
     // 守护进程可能在 GUI 关着时已经开口：先把待投递的条目并进会话，
-    // 窗口打开时才能看到完整对话。
-    consume_pending(cx);
+    // 窗口打开时才能看到完整对话。用户正在打开窗口，积压不该再补横幅。
+    consume_pending_with(cx, true);
     if let Some(handle) = cx.global::<GuiState>().butler_window.clone() {
         let _ = handle.update(cx, |_, window, _| window.activate_window());
     } else {
@@ -2580,7 +2599,8 @@ fn open_butler_window(cx: &mut App) {
     refresh_tray(cx);
 }
 
-fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {    cx.spawn(async move |cx| {
+fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {
+    cx.spawn(async move |cx| {
         while let Some(event) = events.recv().await {
             let _ = cx.update(|cx| {
                 let view = cx.global::<GuiState>().view.clone();
@@ -4114,7 +4134,11 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
                 Button::new("asset-search")
                     .compact()
                     .primary()
-                    .label(if form.searching { "搜索中…" } else { "搜索" })
+                    .label(if form.searching {
+                        "搜索中…"
+                    } else {
+                        "搜索"
+                    })
                     .disabled(form.searching)
                     .on_click(cx.listener(|shell, _, _, cx| shell.start_fund_search(cx))),
             )
@@ -4148,11 +4172,9 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
                 .border_1()
                 .border_color(rgb(if active { ACCENT } else { BORDER }))
                 .cursor_pointer()
-                .on_click(
-                    cx.listener(move |shell, _, _, cx| {
-                        shell.select_fund_candidate(picked.clone(), cx);
-                    }),
-                )
+                .on_click(cx.listener(move |shell, _, _, cx| {
+                    shell.select_fund_candidate(picked.clone(), cx);
+                }))
                 .child(
                     div()
                         .v_flex()
@@ -4168,10 +4190,7 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(TEXT_TERTIARY))
-                                .child(format!(
-                                    "{} · {}",
-                                    candidate.fund_type, candidate.company
-                                )),
+                                .child(format!("{} · {}", candidate.fund_type, candidate.company)),
                         ),
                 )
                 .child(
@@ -4247,16 +4266,18 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
                         ),
                 )
                 .child(
-                    bordered_chip("asset-clear", "清除", TEXT_SECONDARY, SURFACE, BORDER).on_click(
-                        cx.listener(|shell, _, _, cx| shell.clear_fund_candidate(cx)),
-                    ),
+                    bordered_chip("asset-clear", "清除", TEXT_SECONDARY, SURFACE, BORDER)
+                        .on_click(cx.listener(|shell, _, _, cx| shell.clear_fund_candidate(cx))),
                 )
                 .into_any_element(),
         );
     }
 
     // ── 类别：三选一，默认不选 ──────────────────────────────────────
-    let suggested = form.selected.as_ref().and_then(|candidate| candidate.suggested);
+    let suggested = form
+        .selected
+        .as_ref()
+        .and_then(|candidate| candidate.suggested);
     let blocked = form
         .selected
         .as_ref()
@@ -4334,7 +4355,9 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
             div()
                 .v_flex()
                 .gap(px(8.))
-                .child(caption("或直接填写。6 位基金代码可留空名称，保存时自动带出。"))
+                .child(caption(
+                    "或直接填写。6 位基金代码可留空名称，保存时自动带出。",
+                ))
                 .child(
                     div()
                         .h_flex()
@@ -4346,13 +4369,7 @@ fn asset_dialog(form: &AssetForm, _window: &mut Window, cx: &mut Context<AppShel
         );
     }
 
-    dialog_shell(
-        "添加标的",
-        "只记录成本，不代下单",
-        body,
-        form.error.clone(),
-    )
-    .child(
+    dialog_shell("添加标的", "只记录成本，不代下单", body, form.error.clone()).child(
         div()
             .h_flex()
             .justify_end()

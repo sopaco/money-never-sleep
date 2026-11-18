@@ -18,7 +18,7 @@ use gpui_kit::*;
 use crate::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource};
 use crate::butler::events::{self, page_label};
 use crate::butler::expression;
-use crate::butler::memory::{self, Fact, Memory, Remembered};
+use crate::butler::memory::{self, Fact, Forgot, Memory, Remembered};
 use crate::butler::talk;
 use crate::butler::{AccountFacts, Message, Role, Session, SpeakCandidate};
 
@@ -276,7 +276,10 @@ impl ButlerView {
     }
 
     /// 托盘/定时巡检判定开口后，把结论送进已经打开的窗口。
-    pub(crate) fn receive(&mut self, candidate: &SpeakCandidate) {
+    ///
+    /// `seen` 只在窗口真的是当前焦点时为 true：窗口存在但不活跃（在后面、
+    /// 最小化、⌘W 隐藏）时，消息要保留未读并继续走横幅，不能悄悄算已读。
+    pub(crate) fn receive(&mut self, candidate: &SpeakCandidate, seen: bool) {
         let now = Local::now();
         self.session.push(Message {
             at: now,
@@ -285,7 +288,9 @@ impl ButlerView {
             reason: Some(candidate.reason),
             trigger: Some(candidate.trigger.clone()),
         });
-        self.session.mark_read(now);
+        if seen {
+            self.session.mark_read(now);
+        }
         let _ = self.persist();
         self.scroll.scroll_to_bottom();
     }
@@ -297,7 +302,11 @@ impl ButlerView {
     ///
     /// 返回是否落盘成功：调用方要据此决定能不能推进 pending 偏移，否则
     /// 保存失败时消息已丢、偏移已过，不会重投。
-    pub(crate) fn receive_notice(&mut self, notice: &crate::butler::orchestrator::Notice) -> bool {
+    pub(crate) fn receive_notice(
+        &mut self,
+        notice: &crate::butler::orchestrator::Notice,
+        seen: bool,
+    ) -> bool {
         self.session.push(Message {
             at: notice.at,
             role: Role::Butler,
@@ -305,7 +314,9 @@ impl ButlerView {
             reason: Some(notice.reason),
             trigger: Some(notice.trigger.clone()),
         });
-        self.session.mark_read(Local::now());
+        if seen {
+            self.session.mark_read(Local::now());
+        }
         let saved = self.persist();
         self.scroll.scroll_to_bottom();
         saved
@@ -368,7 +379,7 @@ impl ButlerView {
     /// 返回 `Some(回复)` 表示这句话已被记忆层接住。识别不了就返回 `None`，
     /// 交给模板问答——不能让「周五要不要补仓」被当成一条承诺记下来。
     fn handle_memory(&mut self, text: &str, now: chrono::DateTime<Local>) -> Option<String> {
-        let intent = memory::parse_intent(text)?;
+        let intent = memory::parse_intent(text, now.date_naive())?;
         if !self.memory_readable {
             return Some("记忆文件这次读不出来，我没记，也没动原有记录。".to_owned());
         }
@@ -384,11 +395,23 @@ impl ButlerView {
                             .facts
                             .clone()
                             .with_promises(&self.memory, now.date_naive());
+                        let due_note = match due {
+                            Some(day) => format!("（到期 {}）", day.format("%Y-%m-%d")),
+                            None => String::new(),
+                        };
                         let reply = match verdict {
                             Remembered::Merged => {
-                                format!("这条我记过了，又确认了一次：{}。", clip(&text, 40))
+                                format!(
+                                    "这条我记过了，又确认了一次：{}{}。",
+                                    clip(&text, 40),
+                                    due_note
+                                )
                             }
-                            _ => format!("记下了：{}。要改口径就说「忘掉…」。", clip(&text, 40)),
+                            _ => format!(
+                                "记下了：{}{}。要改口径就说「忘掉…」。",
+                                clip(&text, 40),
+                                due_note
+                            ),
                         };
                         Some(valid_or(reply, "记下了。"))
                     }
@@ -398,22 +421,18 @@ impl ButlerView {
                     }
                 }
             }
-            memory::Intent::Forget { needle } => {
-                match self.update_memory(|memory| memory.forget(&needle)) {
-                    Ok(hits) if hits.is_empty() => {
+            memory::Intent::Forget { needle, due } => {
+                match self.update_memory(|memory| memory.forget(&needle, due)) {
+                    Ok(Forgot::NotFound) => {
                         let reply = format!("没找到和「{}」对得上的记忆。", clip(&needle, 20));
                         Some(valid_or(reply, "没找到对得上的记忆，我没动其他记录。"))
                     }
-                    Ok(hits) => {
+                    Ok(Forgot::Removed(hits)) => {
                         self.facts = self
                             .facts
                             .clone()
                             .with_promises(&self.memory, now.date_naive());
-                        let names: Vec<String> = hits
-                            .iter()
-                            .take(3)
-                            .map(|fact| clip(&fact.text, 24))
-                            .collect();
+                        let names: Vec<String> = hits.iter().take(3).map(fact_label).collect();
                         let reply = format!(
                             "从常驻记忆里拿掉了：{}。归档里还留一份，随时能查。",
                             names.join("；")
@@ -421,6 +440,20 @@ impl ButlerView {
                         Some(valid_or(
                             reply,
                             "从常驻记忆里拿掉了。归档里还留一份，随时能查。",
+                        ))
+                    }
+                    Ok(Forgot::Ambiguous(candidates)) => {
+                        // 宁可不删也不误删：候选带日期念出来，等用户指明那条。
+                        let names: Vec<String> =
+                            candidates.iter().take(3).map(fact_label).collect();
+                        let reply = format!(
+                            "「{}」对上了几条：{}。带上日期说要忘哪条，比如「忘掉下周五补美股」。",
+                            clip(&needle, 20),
+                            names.join("；")
+                        );
+                        Some(valid_or(
+                            reply,
+                            "这句对上了不止一条，我没动。带上日期说要忘哪条，比如「忘掉下周五补美股」。",
                         ))
                     }
                     Err(error) => {
@@ -475,7 +508,10 @@ impl ButlerView {
         let rows: Vec<String> = active
             .iter()
             .take(5)
-            .map(|fact| clip(&fact.text, 24))
+            .map(|fact| match fact.expires_at {
+                Some(day) => format!("{} · 到期 {}", clip(&fact.text, 24), day.format("%Y-%m-%d")),
+                None => clip(&fact.text, 24),
+            })
             .collect();
         Some(valid_or(
             format!(
@@ -597,6 +633,11 @@ impl ButlerView {
         // 不记管家自己的措辞——复述自己的话会让记忆越走越偏。写之前重读
         // 磁盘：窗口开着的时候 CLI / 守护进程可能也写过记忆。
         let _ = self.update_memory(|memory| memory.summarize(now, vec![clip(&text, 60)]));
+        // 首轮注入的取数口径：记忆取**刚重读过的**磁盘快照——CLI / 守护
+        // 进程写进来的条目也要进上下文；最近对话取本句入档之前的——正在
+        // 问的这句已经在【用户的问题】里，不该在【最近的对话】里再念一遍。
+        let memory_for_goal = talk::memory_lines(&self.memory, now.date_naive());
+        let recent_for_goal = talk::recent_lines(&self.session);
         self.session.push(Message::user(now, text.clone()));
 
         let previous = self.previous_user_text();
@@ -632,7 +673,7 @@ impl ButlerView {
         } else {
             chat.started = true;
             AgentCommand::Start {
-                goal: talk::opening_goal(&text, &self.facts, crate::agent::cli_path().as_deref()),
+                goal: talk::opening_goal(&text, &self.facts, &memory_for_goal, &recent_for_goal),
                 settings: chat_settings(),
                 source: GoalSource::Conversation,
             }
@@ -796,6 +837,14 @@ impl ButlerView {
         } else {
             self.session = Session::default();
             self.session.mark_read(Local::now());
+            // 清空会话也要把 ACP 那头的 session 一并作废：只删本地存档
+            // 的话，agent 仍持有清空前的上下文，下一句会以续问接在旧对话
+            // 上——用户以为清了，其实没清。`started` 归位后下一问重新走
+            // Start（带人设与记忆的首轮），而不是 Ask（续问）。
+            if let Some(chat) = self.chat.as_mut() {
+                let _ = chat.handle.send(AgentCommand::Stop);
+                chat.started = false;
+            }
             // 清空会话也要清掉等待中的回答（连同屏幕上的半截气泡）：它接
             // 的是已经被删掉的上下文。序号加一就够了，迟到的正文落不进
             // 新会话。
@@ -1131,6 +1180,15 @@ fn clip(text: &str, limit: usize) -> String {
     let mut clipped: String = text.chars().take(limit).collect();
     clipped.push('…');
     clipped
+}
+
+/// 一条事实在对话里的展示：到期日必须带上——同文不同日期的条目，日期是
+/// 唯一区分符，不带日期用户没法指认要忘哪条。
+fn fact_label(fact: &Fact) -> String {
+    match fact.expires_at {
+        Some(day) => format!("{} · 到期 {}", clip(&fact.text, 24), day.format("%Y-%m-%d")),
+        None => clip(&fact.text, 24),
+    }
 }
 
 /// 空态的三个一键提问。文案与 `expression::intent_for` 的主干意图对齐：
@@ -1918,7 +1976,15 @@ mod tests {
         });
 
         assert!(remember_reply.contains("记下了"), "实际 {remember_reply}");
+        assert!(
+            remember_reply.contains("（到期"),
+            "回执应回显到期日，误解析才看得见，实际 {remember_reply}"
+        );
         assert!(forget_reply.contains("拿掉了"), "实际 {forget_reply}");
+        assert!(
+            forget_reply.contains("· 到期"),
+            "删除回执要带日期，实际 {forget_reply}"
+        );
         assert!(
             crate::butler::schedule::validate_dialogue(&remember_reply).is_ok(),
             "回复越过表达边界：{remember_reply}"
@@ -1926,6 +1992,64 @@ mod tests {
         assert!(
             crate::butler::schedule::validate_dialogue(&forget_reply).is_ok(),
             "回复越过表达边界：{forget_reply}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn 同文不同到期日忘掉必须带日期消歧(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, facts());
+        let mut ambiguous = String::new();
+        let mut removed = String::new();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                // 用绝对日期，避免测试依赖运行当天的日历。
+                view.input.update(cx, |input, cx| {
+                    input.set_value("记住 2026-12-27 截止 补美股", window, cx)
+                });
+                view.send(window, cx);
+                view.input.update(cx, |input, cx| {
+                    input.set_value("记住 2026-12-30 截止 补美股", window, cx)
+                });
+                view.send(window, cx);
+                assert_eq!(view.memory.facts.len(), 2, "不同到期日应各存一条");
+
+                // 不带日期：同文两条 → 歧义，一条不动，候选带日期。
+                view.input
+                    .update(cx, |input, cx| input.set_value("忘掉补美股", window, cx));
+                view.send(window, cx);
+                ambiguous = view.session.messages.last().expect("应有回复").text.clone();
+                assert_eq!(view.memory.facts.len(), 2, "歧义时一条都不能动");
+
+                // 带日期：只删那一天的那条。
+                view.input.update(cx, |input, cx| {
+                    input.set_value("忘掉 2026-12-27 截止 补美股", window, cx)
+                });
+                view.send(window, cx);
+                removed = view.session.messages.last().expect("应有回复").text.clone();
+                assert_eq!(view.memory.facts.len(), 1, "带日期只删那一条");
+            });
+        });
+
+        assert!(
+            ambiguous.contains("2026-12-27") && ambiguous.contains("2026-12-30"),
+            "候选要带日期，实际 {ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("带上日期"),
+            "要引导用户带日期，实际 {ambiguous}"
+        );
+        assert!(
+            removed.contains("2026-12-27"),
+            "回执要带删掉那条的日期，实际 {removed}"
+        );
+        assert!(
+            crate::butler::schedule::validate_dialogue(&ambiguous).is_ok(),
+            "回复越过表达边界：{ambiguous}"
+        );
+        assert!(
+            crate::butler::schedule::validate_dialogue(&removed).is_ok(),
+            "回复越过表达边界：{removed}"
         );
     }
 
@@ -1947,9 +2071,12 @@ mod tests {
             });
         });
 
+        // 「周五」被识别成到期日摘出了正文：条目原文是「补美股」，
+        // recall 必须把到期日念出来——用户要能核对管家记的日子对不对。
+        assert!(recall.contains("补美股"), "应念出条目原文，实际 {recall}");
         assert!(
-            recall.contains("周五补美股"),
-            "应念出条目原文，实际 {recall}"
+            recall.contains("· 到期"),
+            "recall 应回显到期日，误解析才看得见，实际 {recall}"
         );
         assert!(
             crate::butler::schedule::validate_dialogue(&recall).is_ok(),
@@ -1974,6 +2101,33 @@ mod tests {
         view.update(cx, |view, _| {
             assert!(!view.clear_armed);
             assert!(view.session.messages.is_empty(), "第二次点击才清空");
+        });
+    }
+
+    /// 清空会话必须把 ACP session 一并作废（`AgentCommand::Stop` +
+    /// `started` 归位）：只删本地存档的话，下一句会以续问接在被清掉的
+    /// 上下文上——用户以为清了，其实没清。
+    ///
+    /// 测试窗口照常只起 runtime 的命令环：`Start` 从未发出，外部 agent
+    /// 进程不会存在；`Stop` 落在无活动会话上只是记一条系统行。
+    #[gpui_kit::test]
+    fn 清空会话后ACP会话一并作废下一问重新走start(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ButlerView::with_session(Session::default(), facts(), window, cx).with_agent()
+        });
+        view.update(cx, |view, _| {
+            let chat = view.chat.as_mut().expect("真实窗口挂 ACP 会话");
+            chat.started = true; // 之前聊过：清空前 session 是续问状态
+        });
+
+        view.update(cx, |view, cx| view.clear_session(cx)); // 第一次：待确认
+        view.update(cx, |view, cx| view.clear_session(cx)); // 第二次：真清
+
+        view.update(cx, |view, _| {
+            let chat = view.chat.as_ref().expect("ACP 会话仍在");
+            assert!(!chat.started, "清空后下一问必须重新走 Start 而不是续问");
+            assert!(!view.turn.waiting, "等待中的回答随会话一起作废");
         });
     }
 }

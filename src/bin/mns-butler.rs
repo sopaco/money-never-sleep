@@ -12,7 +12,9 @@ use chrono::{Local, NaiveDate, NaiveDateTime};
 use clap::{Parser, Subcommand};
 use money_never_sleep::butler::events;
 use money_never_sleep::butler::orchestrator::{self, agent_init_backoff};
-use money_never_sleep::butler::tasks::ButlerTask;
+use money_never_sleep::butler::tasks::{
+    ButlerTask, MAX_ACTIVE, MAX_NEW_PER_DAY, TaskKind, TaskOrigin, TaskVerdict,
+};
 use money_never_sleep::butler::{AccountFacts, Butler, memory, schedule};
 
 #[derive(Parser)]
@@ -26,6 +28,10 @@ use money_never_sleep::butler::{AccountFacts, Butler, memory, schedule};
   mns-butler tick               跑一次每周自整理（记忆合并、任务复盘）
   mns-butler remember \"周五补美股\" --due 2026-11-20   写入一条事实
   mns-butler memory             查看常驻记忆（--archived 看归档）
+  mns-butler tasks              查看待执行与已归档任务
+  mns-butler task add \"下个决策日核对计划\" --at \"2026-11-20 09:30\"
+  mns-butler task add \"提醒我喝水\" --in 5m --user
+  mns-butler task add \"到点陪我聊两句\" --in 1h --talk
   mns-butler outbox             查看最近已授权但未送达的通知"
 )]
 struct Cli {
@@ -81,14 +87,23 @@ enum Command {
 
 #[derive(Subcommand)]
 enum TaskAction {
-    /// 提议一个到点检查任务
+    /// 提议一个到点任务
     Add {
-        /// 到时检查什么（不能写成预测）
+        /// 到时提醒/检查什么（不能写成预测）
         intent: String,
-        /// 到点时间，格式 `2026-11-20 09:30`
+        /// 到点时间，格式 `2026-11-20 09:30` 或 `2026-11-20 09:30:15`
+        #[arg(long, conflicts_with = "within")]
+        at: Option<String>,
+        /// 从现在起多久，格式 `90s` / `5m` / `2h` / `1d`
+        #[arg(long = "in", conflicts_with = "at")]
+        within: Option<String>,
+        /// 用户亲口要的提醒：跳过「必须是检查」的措辞校验，也不占管家的每日额度
         #[arg(long)]
-        at: String,
-        /// 去重键，同一事件只允许一个任务；缺省用意图前 24 字
+        user: bool,
+        /// 到点主动说一句问候，而不是回显任务原文（隐含 --user）
+        #[arg(long)]
+        talk: bool,
+        /// 去重键，同一事件只允许一个任务；缺省用「意图前 24 字 @ 到点时刻」
         #[arg(long)]
         key: Option<String>,
     },
@@ -344,8 +359,8 @@ fn tick() -> Result<()> {
     butler.save()?;
 
     println!(
-        "记忆整理：合并 {} 条、归档过期 {} 条、压掉摘要 {} 条",
-        memory.merged, memory.expired, memory.summaries_archived
+        "记忆整理：合并 {} 条、归档过期 {} 条、压掉摘要 {} 条、清出归档 {} 条",
+        memory.merged, memory.expired, memory.summaries_archived, memory.archived_trimmed
     );
     println!(
         "任务复盘：合并 {} 条、丢弃失效 {} 条、清出归档 {} 条",
@@ -363,7 +378,7 @@ fn tick() -> Result<()> {
 
 fn remember(text: &str, due: Option<&str>) -> Result<()> {
     let now = Local::now();
-    let (kind, body, inline_due) = match memory::parse_intent(text) {
+    let (kind, body, inline_due) = match memory::parse_intent(text, now.date_naive()) {
         Some(memory::Intent::Remember { kind, text, due }) => (kind, text, due),
         Some(memory::Intent::Forget { .. }) => {
             anyhow::bail!("这是「忘掉」的句子，请改用 mns-butler forget");
@@ -439,23 +454,42 @@ fn list_memory(archived: bool) -> Result<()> {
 }
 
 fn forget(text: &str) -> Result<()> {
-    // 允许直接粘贴会话里的话（「忘掉补美股」），前缀由意图层去掉。
-    let needle = match memory::parse_intent(text) {
-        Some(memory::Intent::Forget { needle }) => needle,
-        _ => text.trim().to_owned(),
+    // 允许直接粘贴会话里的话（「忘掉补美股」），前缀与日期由意图层去掉。
+    let (needle, due) = match memory::parse_intent(text, Local::now().date_naive()) {
+        Some(memory::Intent::Forget { needle, due }) => (needle, due),
+        _ => (text.trim().to_owned(), None),
     };
     // 锁内重读再落盘：GUI 窗口可能正开着，别拿启动快照覆盖它的条目。
-    let (_, hits) = memory::Memory::update(|memory| memory.forget(&needle))?;
-    if hits.is_empty() {
-        println!("没有匹配「{needle}」的记忆");
-        return Ok(());
+    let (_, outcome) = memory::Memory::update(|memory| memory.forget(&needle, due))?;
+    match outcome {
+        memory::Forgot::NotFound => {
+            println!("没有匹配「{needle}」的记忆");
+        }
+        memory::Forgot::Removed(hits) => {
+            for fact in &hits {
+                println!("已忘掉（{}）：{}", fact.kind.label(), fact_label(fact));
+            }
+            println!("已移入归档，仍可通过 memory.json 查阅");
+            // 只有真的动了记忆才需要守护进程重排程。
+            nudge_daemon();
+        }
+        memory::Forgot::Ambiguous(candidates) => {
+            println!("「{needle}」对上了多条，一条都没动：");
+            for fact in &candidates {
+                println!("  - （{}）：{}", fact.kind.label(), fact_label(fact));
+            }
+            println!("带上日期说要忘哪条，比如「忘掉下周五补美股」");
+        }
     }
-    for fact in &hits {
-        println!("已忘掉（{}）：{}", fact.kind.label(), fact.text);
-    }
-    println!("已移入归档，仍可通过 memory.json 查阅");
-    nudge_daemon();
     Ok(())
+}
+
+/// 一条事实在终端里的展示：到期日是区分同文条目的唯一信息，必须带上。
+fn fact_label(fact: &memory::Fact) -> String {
+    match fact.expires_at {
+        Some(day) => format!("{} · 到期 {}", fact.text, day.format("%Y-%m-%d")),
+        None => fact.text.clone(),
+    }
 }
 
 fn list_tasks() -> Result<()> {
@@ -465,13 +499,18 @@ fn list_tasks() -> Result<()> {
         println!("没有任务");
         return Ok(());
     }
-    println!("待执行：");
-    for task in &butler.tasks.tasks {
-        let status = if task.state == money_never_sleep::butler::TaskState::Pending {
-            if task.is_expired(now) { "已过期待清理" } else { "待执行" }
-        } else {
-            "已结束"
-        };
+    // 新版本在 `task done` 当刻就搬进归档；这里再按状态分栏，是为了兼容
+    // 旧版本留下的「已结束但还在 tasks 里」的记录，别让 agent 以为它还挂着。
+    let (pending, leftover): (Vec<_>, Vec<_>) = butler
+        .tasks
+        .tasks
+        .iter()
+        .partition(|task| task.state == money_never_sleep::butler::TaskState::Pending);
+    if !pending.is_empty() {
+        println!("待执行：");
+    }
+    for task in pending {
+        let status = if task.is_expired(now) { "已过期待清理" } else { "待执行" };
         println!(
             "  {} [{}] {} · 到点 {} · {}",
             task.id,
@@ -480,6 +519,17 @@ fn list_tasks() -> Result<()> {
             task.due_at.format("%Y-%m-%d %H:%M"),
             task.key
         );
+    }
+    if !leftover.is_empty() {
+        println!("已结束（待归档，下次巡检迁入归档）：");
+        for task in leftover {
+            let status = match task.state {
+                money_never_sleep::butler::TaskState::Done => "完成",
+                money_never_sleep::butler::TaskState::Dropped => "作废",
+                money_never_sleep::butler::TaskState::Pending => "待执行",
+            };
+            println!("  {} [{}] {}", task.id, status, task.intent);
+        }
     }
     if !butler.tasks.archived.is_empty() {
         println!("已归档（保留 7 天）：");
@@ -505,19 +555,61 @@ fn task(action: TaskAction) -> Result<()> {
     let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
     match action {
-        TaskAction::Add { intent, at, key } => {
-            let due = parse_local(&at).with_context(|| format!("无法解析时间「{at}」"))?;
-            let key = key.unwrap_or_else(|| intent.chars().take(24).collect());
-            let verdict = butler
-                .tasks
-                .propose(ButlerTask::new(key, intent, due, now), now);
+        TaskAction::Add {
+            intent,
+            at,
+            within,
+            user,
+            talk,
+            key,
+        } => {
+            let due = match (at, within) {
+                (Some(at), None) => {
+                    parse_local(&at).with_context(|| format!("无法解析时间「{at}」"))?
+                }
+                (None, Some(within)) => {
+                    let wait = parse_duration(&within)
+                        .with_context(|| format!("无法解析时长「{within}」"))?;
+                    now + wait
+                }
+                (None, None) => {
+                    anyhow::bail!(
+                        "要指定到点时间：相对时间用 --in 5m / --in 90s，绝对时刻用 --at \"YYYY-MM-DD HH:MM\""
+                    )
+                }
+                _ => anyhow::bail!("--at 和 --in 必须二选一"),
+            };
+            let kind = if talk { TaskKind::Talk } else { TaskKind::Check };
+            let origin = if user || talk {
+                TaskOrigin::User
+            } else {
+                TaskOrigin::Butler
+            };
+            // 同一句话可以在不同时间各提醒一次：默认键带上到点时刻，否则
+            // 「提醒我喝水」第二次会被自己的去重挡住。
+            let key = key.unwrap_or_else(|| {
+                format!(
+                    "{}@{}",
+                    intent.chars().take(24).collect::<String>(),
+                    due.format("%Y-%m-%d %H:%M")
+                )
+            });
+            let verdict = butler.tasks.propose_as(
+                ButlerTask::new(key, intent, due, now).with_kind(kind),
+                now,
+                origin,
+            );
             match verdict {
-                money_never_sleep::butler::TaskVerdict::Accepted { id } => {
+                TaskVerdict::Accepted { id } => {
                     butler.save_tasks()?;
-                    println!("已接受任务 {id}，到点 {}", due.format("%Y-%m-%d %H:%M"));
+                    println!(
+                        "已接受任务 {id}，到点 {}（{}）",
+                        due.format("%Y-%m-%d %H:%M:%S"),
+                        describe_wait(due - now)
+                    );
                     nudge_daemon();
                 }
-                other => println!("未接受：{other:?}"),
+                other => println!("{}", reject_reason(&other)),
             }
         }
         TaskAction::Done { id } => {
@@ -531,6 +623,32 @@ fn task(action: TaskAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 把 `TaskVerdict` 翻成 agent 能直接转述的中文。
+///
+/// agent 拿到的 `{:?}` 是 Rust 调试文本（`IntentNotCheck(...)` /
+/// `DailyLimit`），它要么照抄给用户，要么自己猜意思。这里把原因写成一句
+/// 人话，失败时也保持诚实。
+fn reject_reason(verdict: &TaskVerdict) -> String {
+    match verdict {
+        TaskVerdict::Accepted { id } => format!("已接受任务 {id}"),
+        TaskVerdict::Duplicate => {
+            "未接受：同一件事已经有任务了，先处理完或换个说法".to_owned()
+        }
+        TaskVerdict::DailyLimit => {
+            format!("未接受：今天已经建了 {MAX_NEW_PER_DAY} 条待办任务，明天再来；用户亲口要的提醒请加 --user")
+        }
+        TaskVerdict::QueueFull => {
+            format!("未接受：待执行任务已达 {MAX_ACTIVE} 条上限，先完成或等旧的作废")
+        }
+        TaskVerdict::TooSoon { now, due_at } => format!(
+            "未接受：到点时间 {} 已经过去（现在 {}）。要现在起算就用 --in 5m / --in 60s，别自己算绝对时刻",
+            due_at.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Y-%m-%d %H:%M:%S")
+        ),
+        TaskVerdict::IntentNotCheck(reason) => format!("未接受：{reason}"),
+    }
 }
 
 fn outbox() -> Result<()> {
@@ -575,9 +693,98 @@ fn page_label(key: &str) -> &str {
 }
 
 fn parse_local(text: &str) -> Result<chrono::DateTime<Local>> {
-    let naive = NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M")?;
-    naive
-        .and_local_timezone(Local)
-        .single()
-        .context("本地时间不唯一")
+    let text = text.trim();
+    // 先试带秒的：`%H:%M` 解析不了 `17:28:00`，反过来会吞掉秒。
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(text, format) {
+            return naive
+                .and_local_timezone(Local)
+                .single()
+                .context("本地时间不唯一");
+        }
+    }
+    anyhow::bail!("时间要写成 `YYYY-MM-DD HH:MM` 或 `YYYY-MM-DD HH:MM:SS`")
+}
+
+/// 解析相对时长：`90s` / `5m` / `2h` / `1d`。
+///
+/// 只认一个数字 + 一个 ASCII 单位。刻意不认自然语言：模型会把「5 分钟」
+/// 算成整分边界，那正是这次提前 8 秒触发的根因。
+fn parse_duration(text: &str) -> Result<chrono::Duration> {
+    let text = text.trim();
+    let unit = text.chars().last().context("时长不能为空")?;
+    let number = &text[..text.len() - unit.len_utf8()];
+    let value: i64 = number
+        .trim()
+        .parse()
+        .context("时长要写成 90s / 5m / 2h / 1d")?;
+    if value <= 0 {
+        anyhow::bail!("时长必须大于 0");
+    }
+    let duration = match unit.to_ascii_lowercase() {
+        's' => chrono::Duration::seconds(value),
+        'm' => chrono::Duration::minutes(value),
+        'h' => chrono::Duration::hours(value),
+        'd' => chrono::Duration::days(value),
+        _ => anyhow::bail!("时长单位只支持 s/m/h/d，例如 90s、5m、2h、1d"),
+    };
+    Ok(duration)
+}
+
+/// 给模型一句能直接转述的「还有多久」，省得它自己算。
+fn describe_wait(wait: chrono::Duration) -> String {
+    let secs = wait.num_seconds().max(0);
+    if secs < 60 {
+        format!("还有 {secs} 秒")
+    } else if secs < 3600 {
+        let (minutes, seconds) = (secs / 60, secs % 60);
+        if seconds == 0 {
+            format!("还有 {minutes} 分钟")
+        } else {
+            format!("还有 {minutes} 分 {seconds} 秒")
+        }
+    } else if secs < 86_400 {
+        format!("还有 {} 小时 {} 分钟", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("还有 {} 天", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 相对时长支持秒分时天() {
+        assert_eq!(parse_duration("90s").unwrap(), chrono::Duration::seconds(90));
+        assert_eq!(parse_duration("5m").unwrap(), chrono::Duration::minutes(5));
+        assert_eq!(parse_duration("2h").unwrap(), chrono::Duration::hours(2));
+        assert_eq!(parse_duration("1d").unwrap(), chrono::Duration::days(1));
+        assert!(parse_duration("5分钟").is_err(), "自然语言不该被猜");
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("5w").is_err());
+    }
+
+    #[test]
+    fn 绝对时间支持到秒() {
+        let with_secs = parse_local("2026-11-18 17:28:54").unwrap();
+        assert_eq!(with_secs.format("%H:%M:%S").to_string(), "17:28:54");
+        let minute = parse_local("2026-11-18 17:28").unwrap();
+        assert_eq!(minute.format("%H:%M:%S").to_string(), "17:28:00");
+    }
+
+    #[test]
+    fn 回执把等待时长说成人话() {
+        assert_eq!(describe_wait(chrono::Duration::seconds(42)), "还有 42 秒");
+        assert_eq!(
+            describe_wait(chrono::Duration::seconds(90)),
+            "还有 1 分 30 秒"
+        );
+        assert_eq!(describe_wait(chrono::Duration::minutes(5)), "还有 5 分钟");
+        assert_eq!(
+            describe_wait(chrono::Duration::minutes(130)),
+            "还有 2 小时 10 分钟"
+        );
+        assert_eq!(describe_wait(chrono::Duration::days(2)), "还有 2 天");
+    }
 }
