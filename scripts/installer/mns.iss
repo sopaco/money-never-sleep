@@ -64,7 +64,9 @@ PrivilegesRequired=lowest
 OutputDir={#OutputDir}
 OutputBaseFilename=MNS-{#AppVersion}-win-{#ArchName}-setup
 SetupIconFile={#IconFile}
-UninstallDisplayIcon={app}\app.ico
+; 图标由 mns-gui.exe 内嵌的 ID-1 资源提供（build.rs 按 bin 编入 app.ico），
+; 不再把一个单独的 app.ico 释放到安装目录。
+UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppDisplayName}
 LicenseFile={#LicenseFile}
 Compression=lzma2/max
@@ -97,16 +99,15 @@ Source: "{#SourceDir}\{#ButlerExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; 程序，由带 CREATE_NO_WINDOW 的 GUI 启动，不会闪黑框。
 Source: "{#SourceDir}\{#ButlerdExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#IconFile}"; DestDir: "{app}"; DestName: "app.ico"; Flags: ignoreversion
 ; 帮助截图（可选目录，没有图片时占位存在但为空，Inno 不会报错）。
 Source: "{#SourceDir}\help\*"; DestDir: "{app}\help"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
-Name: "{autoprograms}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
 ; 帮助中心的图标来自 mns-help.exe 自身嵌入的 ID-1 资源（build.rs 按 bin 编入
 ; icon_help.ico），所以快捷方式直接引用 exe，不再复用主程序的 app.ico。
 Name: "{autoprograms}\{#AppDisplayName} 帮助中心"; Filename: "{app}\{#HelpExeName}"; IconFilename: "{app}\{#HelpExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app.ico"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppDisplayName}"; Flags: nowait postinstall skipifsilent

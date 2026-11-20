@@ -6,13 +6,15 @@
 //! apply. So the title-bar and taskbar icon of a binary is whatever ID-1 icon
 //! resource we compile into it.
 //!
-//! Most binaries use `assets/app.ico`. `mns-help.exe` uses
-//! `assets/icon_help.ico` instead — the help viewer is a separate process and
-//! should not look like the main app in the taskbar. `mns-butler.exe` and
-//! `mns-butlerd.exe` use `assets/icon_butler.ico`: they are the butler's own
-//! processes, so Explorer / the task manager should show the butler face.
-//! (The butler *window* lives inside `mns-gui.exe`, so it shares that process's
-//! icon; its avatar is drawn in the GUI itself and is not a system icon.)
+//! Only the binaries that can surface a system icon carry a custom resource:
+//! `mns-gui.exe` uses `assets/app.ico`, `mns-help.exe` uses
+//! `assets/icon_help.ico` (the help viewer is a separate process and should not
+//! look like the main app in the taskbar), and `mns-butlerd.exe` uses
+//! `assets/icon_butler.ico` (the resident daemon that Explorer / Task Manager
+//! may list). The CLI binaries `mns.exe` and `mns-butler.exe` keep Windows'
+//! default icon. (The butler *window* lives inside `mns-gui.exe`, so it shares
+//! that process's icon; its avatar is drawn in the GUI itself and is not a
+//! system icon.)
 //!
 //! Why not just call `WindowsResource::compile()` twice? Because that prints
 //! *global* link directives (`rustc-link-lib=static=resource` on GNU,
@@ -59,14 +61,10 @@ fn main() {
 
     // Attach exactly one icon to each binary. Keep this list in sync with the
     // [[bin]] targets in Cargo.toml: a binary with no link-arg gets Windows'
-    // generic icon.
-    for bin in ["mns", "mns-gui"] {
-        println!("cargo:rustc-link-arg-bin={}={}", bin, app_obj.display());
-    }
-    for bin in ["mns-butler", "mns-butlerd"] {
-        println!("cargo:rustc-link-arg-bin={}={}", bin, butler_obj.display());
-    }
+    // generic icon, which is what `mns` / `mns-butler` want.
+    println!("cargo:rustc-link-arg-bin=mns-gui={}", app_obj.display());
     println!("cargo:rustc-link-arg-bin=mns-help={}", help_obj.display());
+    println!("cargo:rustc-link-arg-bin=mns-butlerd={}", butler_obj.display());
 }
 
 /// Compile a .rc that declares `1 ICON "<path>"` into a linker input, returning

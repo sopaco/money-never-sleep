@@ -6,12 +6,18 @@ source: .
 ---
 
 ## 项目概览
+
+
 MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具（Rust），服务于中长线逆情绪投资者。五个二进制共享同一引擎库 `money_never_sleep`：CLI `mns`、GPUII have enough evidence to update the document. Producing the full revised markdown now.
 
 ## 项目概览
+
+
 MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具（Rust），服务于中长线逆情绪投资者。五个二进制共享同一引擎库 `money_never_sleep`：CLI `mns`、GPUI 桌面壳 `mns-gui`（`gui` feature）、独立帮助中心 `mns-help`、管家审计 CLI `mns-butler`、常驻守护 `mns-butlerd`（`agent` feature）。核心命题：把 CNN 恐贪指数（0–100）映射为风险资产目标仓位（越恐慌越高，35%–85%），再按**逐腿**偏离带（默认 ±4pp）给出买/卖/持有建议；情绪只设定敞口，已被证伪为择时依据。v0.9 增补「管家」：常驻人格，只在唤醒源（定时巡检/账本事件/任务与承诺到期/agent-init 失败重试）成立时评估是否开口，「说不说」全程确定性、可离线复算。硬约束：零券商连接、零服务端、零模型/凭据托管；报告先留档再决策；`~/.mns/` 是唯一可写根，任何写入都经 `config::resolve_data_path()`，不依赖 cwd。
 
 ## 架构设计
+
+
 | 层 | 容器 | 职责 | 关键路径 |
 |---|---|---|---|
 | 交互层 | clap CLI | 串行命令与参数、终端表格渲染 | `src/cli.rs`、`src/main.rs` |
@@ -34,9 +40,11 @@ MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具�
 - 管家已不再只是只认可事实的聊天框：它读取的是同一个工作区契约（Butler Profile 版）中的 `mns-butler` 技能，可以只读查询账户、并把用户口头提醒真的落成 `mns-butler task add` 任务；护栏靠 opencode 注入的 deny 规则（`OPENCODE_CONFIG_CONTENT`）尽力限制（best-effort，非沙箱）。
 - 帮助中心是**独立进程**，复用 `gui::theme`/`gui::components`（提升为 `pub(crate)` 共享），只读渲染，不持有任何投资规则；`help/content.rs` 用 `include_str!` 在编译期把 `help/*.md` 内嵌进二进制。
 - 跨进程协作有三种机制：本地 IPC 通道（Unix `<数据目录>/run/<app>.sock`，Windows `\\.\pipe\mns-<app>-<用户名>`，NDJSON 一行一条，支持一次性 `poke` 与双向长连接；**绑定失败即已有实例**、**连接断开即对方死亡**）；Windows 命名互斥体 + 命名事件（可携带二次启动意图：主窗/管家窗）；文件型深链 `~/.mns/help-request`（temp + rename 原子写、mtime 判过期）。
-- 平台适配集中在 `gui::command`（Windows `CREATE_NO_WINDOW`）、`gui::autostart`（只写系统登录项）、`notify`（macOS `UNUserNotificationCenter`）、`build.rs`（仅 Windows 按二进制嵌 `app`/`help`/`butler` 三套 `.ico` 资源）。
+- 平台适配集中在 `gui::command`（Windows `CREATE_NO_WINDOW`）、`gui::autostart`（只写系统登录项）、`notify`（macOS `UNUserNotificationCenter`）、`build.rs`（仅 Windows 给 `mns-gui`/`mns-help`/`mns-butlerd` 嵌 `app`/`help`/`butler` 三套 `.ico` 资源；CLI `mns`/`mns-butler` 保留系统默认图标）。
 
 ## 模块地图
+
+
 | Module | 责任 | 主要路径 |
 |---|---|---|
 | 库入口/feature 导出 | 常驻 `app`/`butler`/`ipc`/`notify`；feature 门控 `agent`/`gui`/`help`/`single_instance` | `src/lib.rs` |
@@ -54,6 +62,8 @@ MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具�
 | 信号/策略/纪律/报告/审计 | 7 天平滑 + 3 天区间确认 + 决策日；逐腿带宽再平衡；冷静期护栏；年度交易预算复盘；中文章节报告；实盘审计与 point-in-time 数据集 | `src/{signal,strategy,guardrail,discipline,report,audit,backtest,live_data,metrics}.rs` |
 
 ## 核心流程
+
+
 **① 日常决策与观察（`update-prices` → `report`/`today`；`plan`；`guard`）**
 1. 抓取 CNN 恐贪指数，解析 score/rating，当日快照落 `fear_greed_snapshots`。
 2. `signal::compute` 读历史算有效决策分数（平滑、区间确认、决策日判定），历史不足自动降级。
@@ -98,6 +108,8 @@ MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具�
 10. `mns-butler` 只读/改正状态文件；守护进程在跑时 `wake`/`mute`/`unmute`/`task add` 转交给它，避免两个进程重复消耗额度并互覆 `state.json`；三者写状态时统一持 `writers.lock`。
 
 ## 技术选型
+
+
 - **语言**：Rust edition 2024；包 `money-never-sleep` 0.9.0，库 `money_never_sleep`，五个二进制（`mns` / `mns-gui` / `mns-help` / `mns-butler` / `mns-butlerd`）。
 - **CLI**：clap 4（derive 子命令树）；`mns-butler` 复用同一风格，输出面向审计。
 - **桌面 UI（`gui`）**：`gpui-kit 0.9.0` + `gpui-tray 0.3.0`（`gpui-kit`/`menu-state`，统一到 `gpui-pre`）；`gui-test` 打开 `gpui-pre/test-support` 做 headless 布局断言；管家头像/纸纹用 `include_bytes!` + `OnceLock` 只解码一次。
@@ -111,6 +123,8 @@ MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具�
 - **打包**：`scripts/make-dmg.sh`（五可执行同版本入 `.app`，截图进 `Contents/Resources` 以过 codesign）、`scripts/make-installer.ps1` + `scripts/installer/mns.iss`（按用户安装、无 UAC、不改 PATH、附帮助中心快捷方式）、`scripts/make-help-diagrams.sh` 生成 `help/diagrams/*.svg`、`make-icons.swift` 生成图标、`make-texture.py` 生成管家纸纹与头像资源；`build.rs` 在 Windows 上按二进制嵌 `app`/`help`/`butler` 三套 ID-1 图标。
 
 ## 系统边界
+
+
 | 边界 | 对象 | 说明 / 信任边界 |
 |---|---|---|
 | 外部 API | CNN Fear & Greed `production.dataviz.cnn.io/index/fearandgreed/graphdata` | 只读、需网络、可 418；决策与数据集共同来源 |
@@ -126,6 +140,8 @@ MNS（Money Never Sleeps，v0.9.0）是本机运行的个人投资决策工具�
 | 人机边界 | 用户 / 券商 | MNS 只记账与建议，不下单、不阻断；管家的记忆/任务/通知同样不自动执行交易，提醒必须真的建任务、看到「已接受」才可声张，责任在用户 |
 
 ## 代码映射索引
+
+
 | Concept | Location | Notes |
 |---|---|---|
 | 库入口/feature 导出 | `src/lib.rs` | `app`/`butler`/`ipc`/`notify` 常驻；`agent`/`gui`/`help`/`single_instance` 按 feature |
