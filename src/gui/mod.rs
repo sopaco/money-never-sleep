@@ -28,7 +28,7 @@ use crate::agent::{
     PermissionPolicy, PermissionPrompt, RunState, TimelineEntry, load_settings, routine,
     save_settings, start_runtime,
 };
-use crate::app::{BuyGuardrail, PlanView, Snapshot};
+use crate::app::{BuyGuardrail, Snapshot};
 use crate::notify;
 use crate::quote::FundCandidate;
 
@@ -77,6 +77,8 @@ actions!(
         StopCurrentTask,
         QuitApplication,
         StopButlerDaemon,
+        StartButlerDaemon,
+        RestartButlerDaemon,
         CloseAgentPanel,
         CloseMainWindow,
         ShowAbout,
@@ -148,6 +150,19 @@ impl Page {
             Page::Agent => "agent",
             Page::Settings => "settings",
         }
+    }
+
+    /// 窗口子进程用 slug 传页：`mns-gui --window --page plan`。
+    /// 中文标签也接受，方便 `MNS_GUI_PAGE` 这类旧入口继续工作。
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        let slug = slug.trim();
+        Self::ALL
+            .into_iter()
+            .find(|page| page.key() == slug || page.label() == slug)
+    }
+
+    pub(crate) fn slug(self) -> &'static str {
+        self.key()
     }
 
     /// Fluent navigation always carries a glyph; the label alone reads as a
@@ -283,15 +298,6 @@ pub(crate) struct Toast {
     pub tone: ToastTone,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct AgentSnapshot {
-    pub state: Option<RunState>,
-    pub detail: String,
-    pub timeline: Vec<TimelineEntry>,
-    pub pending: Option<PermissionPrompt>,
-    pub error: Option<String>,
-}
-
 /// Agent panel state. Kept separate from the account data so an agent run can
 /// stream while the user browses positions without clobbering either.
 pub(crate) struct AgentState {
@@ -310,21 +316,14 @@ pub(crate) struct AgentState {
 }
 
 impl AgentState {
-    fn new(restore: Option<AgentSnapshot>) -> Self {
-        let restore = restore.unwrap_or_default();
-        let state = restore.state.unwrap_or_default();
-        let detail = if restore.detail.trim().is_empty() {
-            "尚未提交目标".to_owned()
-        } else {
-            restore.detail
-        };
+    fn new() -> Self {
         Self {
-            state,
-            detail,
-            timeline: restore.timeline,
+            state: RunState::default(),
+            detail: "尚未提交目标".to_owned(),
+            timeline: Vec::new(),
             streaming: None,
-            pending: restore.pending,
-            error: restore.error,
+            pending: None,
+            error: None,
             started: false,
             decision: None,
             open: false,
@@ -339,16 +338,6 @@ impl AgentState {
                 | RunState::WaitingPermission
                 | RunState::Stopping
         )
-    }
-
-    fn snapshot(&self) -> AgentSnapshot {
-        AgentSnapshot {
-            state: Some(self.state),
-            detail: self.detail.clone(),
-            timeline: self.timeline.clone(),
-            pending: self.pending.clone(),
-            error: self.error.clone(),
-        }
     }
 
     fn push(&mut self, kind: EntryKind, text: impl Into<String>) {
@@ -467,14 +456,6 @@ fn write_last_daily(date: &str) {
     let _ = std::fs::write(path, date);
 }
 
-#[derive(Clone, Default)]
-struct ShellSnapshot {
-    agent: AgentSnapshot,
-    /// Metadata of the conversation still being appended to, so a re-created
-    /// window does not start a second archive file for the same session.
-    conversation: Option<ConversationMeta>,
-}
-
 /// A past conversation shown in place of the live one. The ACP context lives
 /// in the external agent, which MNS never re-opens, so a replay is explicitly
 /// read-only rather than pretending the model remembers the thread.
@@ -486,30 +467,34 @@ pub(crate) struct ViewedConversation {
 
 struct GuiState {
     window: Option<AnyWindowHandle>,
-    /// Id of `window`, so the closed observer can ignore a window that is
-    /// being replaced (autostart creates a hidden one, then rebuilds it).
-    window_id: Option<WindowId>,
-    /// 启动时创建的是隐藏窗口（登录自启动只驻留托盘）。这类窗口没有跨平台
-    /// 的“显示”接口，用户点「打开 MNS」时按可见参数重建。
-    window_hidden: bool,
     view: Option<Entity<AppShell>>,
     /// 管家独立窗口与视图。与主窗口各存一份句柄，关闭其中一个不影响另一个。
     butler_window: Option<AnyWindowHandle>,
     butler_view: Option<Entity<butler::ButlerView>>,
     /// 最近一条已授权但用户还没在窗口里看到的管家结论，用于托盘菜单。
     butler_notice: Option<String>,
-    /// 管家守护进程是否在跑。在跑时巡检归它，GUI 只负责算事实与显示。
+    /// 管家守护进程是否在跑。在跑时巡检归它，宿主只负责送达与显示。
     butler_daemon: bool,
     /// 守护进程那条连接的 id；断开时要能辨认出是它，而不是别的临时连接。
     butler_daemon_conn: Option<u64>,
+    /// 管家窗口进程是否连着宿主（它启动时握手，退出即断开）。
+    butler_window_conn: Option<u64>,
     tray: Option<Tray>,
     jobs: Option<Jobs>,
-    snapshot: Option<ShellSnapshot>,
+    /// 托盘简报：数字由守护进程算好送来，宿主只排版（P2：宿主没有 AppShell）。
+    brief: Option<crate::brief::BriefData>,
     /// Last brief actually pushed into the native menu. `refresh_menu` always
     /// bumps its generation, so an unchanged brief must not be pushed again or
     /// macOS rebuilds the NSMenu (and closes an open one) once per minute.
     last_tray_brief: Option<TrayBrief>,
+    /// 当前托盘图标是否是红色告警态。只在状态翻转时换图，避免每分钟重设。
+    tray_alert: bool,
+    /// 本进程的本地通道监听器。它同时是单实例锁，必须活到进程退出——
+    /// 放进启动闭包的局部变量会在闭包返回时被 drop，socket 随之被删掉，
+    /// 之后所有 `poke` 都会失败。只作守卫持有，从不读取。
+    _listener: Option<crate::ipc::Listener>,
 }
+
 
 impl Global for GuiState {}
 
@@ -592,12 +577,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
         jobs: Jobs,
-        restore: Option<ShellSnapshot>,
+        page: Option<Page>,
+        about: bool,
     ) -> Self {
         let agent_settings = load_settings();
-        let conversation = restore
-            .as_ref()
-            .and_then(|snapshot| snapshot.conversation.clone());
         let goal = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("想问什么？例如「今天需要操作吗」")
@@ -669,12 +652,11 @@ impl AppShell {
         });
 
         let shell = Self {
-            page: std::env::var("MNS_GUI_PAGE")
-                .ok()
-                .and_then(|key| {
-                    Page::ALL
-                        .into_iter()
-                        .find(|page| page.label() == key.trim())
+            page: page
+                .or_else(|| {
+                    std::env::var("MNS_GUI_PAGE")
+                        .ok()
+                        .and_then(|key| Page::from_slug(key.trim()))
                 })
                 .unwrap_or(Page::Dashboard),
             data: None,
@@ -684,7 +666,7 @@ impl AppShell {
             toast: None,
             toast_seq: 0,
             dialog: None,
-            agent: AgentState::new(restore.map(|s| s.agent)),
+            agent: AgentState::new(),
             agent_settings,
             jobs,
             goal,
@@ -708,12 +690,12 @@ impl AppShell {
             agent_panel: None,
             conversation_scroll: ScrollHandle::new(),
             agent_panel_focus: cx.focus_handle(),
-            about_open: false,
+            about_open: about,
             history: Vec::new(),
             history_loaded: false,
             history_error: None,
             history_pending_delete: None,
-            current_conversation: conversation,
+            current_conversation: None,
             conversation_dirty: false,
             viewing_history: None,
             report_expanded: false,
@@ -730,20 +712,6 @@ impl AppShell {
             ));
         });
         shell
-    }
-
-    fn agent_snapshot(&self) -> ShellSnapshot {
-        // A replay must never become the restored "current" conversation when
-        // a window is rebuilt on another platform.
-        let agent = self
-            .live_agent
-            .as_deref()
-            .map(AgentState::snapshot)
-            .unwrap_or_else(|| self.agent.snapshot());
-        ShellSnapshot {
-            agent,
-            conversation: self.current_conversation.clone(),
-        }
     }
 
     /// Show feedback that goes away on its own. Each message owns its own
@@ -881,7 +849,7 @@ impl AppShell {
 
     fn show_history_record(&mut self, record: ConversationRecord, cx: &mut Context<Self>) {
         if self.live_agent.is_none() {
-            let live = std::mem::replace(&mut self.agent, AgentState::new(None));
+            let live = std::mem::replace(&mut self.agent, AgentState::new());
             self.live_agent = Some(Box::new(live));
         }
         self.agent.timeline = conversations::restore_entries(&record.entries);
@@ -1493,11 +1461,15 @@ impl AppShell {
                 self.data = Some(snapshot);
                 self.load_error = None;
                 self.loading = false;
-                // 每次加载都刷新管家事实：这是唯一一次「账户画面变了」，而
-                // 守护进程只读这份快照。没有账本事件时走定时巡检（`None`），
-                // 它会被 `WakeScheduler` 按间隔拦下，不会多说话。
+                // 账本变了：叫守护进程立刻看一眼。判定与数字都在它那边，
+                // 窗口只负责把事件送过去；它不在时没有任何本地兜底路径。
                 let ledger = self.pending_ledger_wake.take();
-                cx.defer(move |cx| run_butler_wake_from(cx, ledger));
+                cx.defer(move |_cx| {
+                    let _ = crate::ipc::poke(
+                        "mns-butlerd",
+                        &crate::ipc::Signal::Wake { ledger },
+                    );
+                });
             }
             JobEvent::Loaded(Err(error)) => {
                 self.load_error = Some(error);
@@ -1962,33 +1934,63 @@ thread_local! {
     static AGENT: std::cell::RefCell<Option<AgentHandle>> = const { std::cell::RefCell::new(None) };
 }
 
+/// `mns-gui` 的进程角色。
+///
+/// P2 起一个二进制承担三种进程：
+/// - `Host`：托盘宿主，无窗口，负责通知投递与管家守护进程生命周期；
+/// - `MainWindow`：主窗口短命子进程，关窗即退；
+/// - `ButlerWindow`：管家窗口短命子进程，关窗即退。
+///
+/// 窗口进程由宿主用 `--window` 拉起，自己不再常驻。宿主持有唯一的 Dock
+/// 图标，窗口进程是 `Accessory`，所以开关窗口不会让 Dock 里出现第二个 MNS。
+///
+/// `show_main` 是「这次启动要不要顺手开一扇主窗」：无参数双击 = 是（首启
+/// 必须看得见东西）；`--tray` / `--background`（登录项）= 否，只驻留；已有
+/// 实例时的二次启动根本不进这里，由本地通道把意图交给宿主置前。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Role {
+    Host { open_butler: bool, show_main: bool },
+    MainWindow {
+        page: Option<Page>,
+        about: bool,
+        refresh: bool,
+    },
+    ButlerWindow { notice: Option<String> },
+}
+
+fn parse_role() -> Role {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
+    let value_after = |flag: &str| {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+    };
+
+    if !has("--window") {
+        let quiet = has("--tray") || has("--background") || has("--butler");
+        return Role::Host {
+            open_butler: has("--butler"),
+            show_main: !quiet,
+        };
+    }
+
+    let kind = value_after("--window");
+    if has("--butler") || kind.as_deref() == Some("butler") {
+        // `--notice <id>`：用户点系统通知进来，窗口要落到那一条开口上。
+        return Role::ButlerWindow {
+            notice: value_after("--notice"),
+        };
+    }
+    Role::MainWindow {
+        page: value_after("--page").as_deref().and_then(Page::from_slug),
+        about: has("--about"),
+        refresh: has("--refresh"),
+    }
+}
+
 pub fn run() {
-    // 登录自启动带 `--tray`：只常驻托盘，不打开窗口。手动启动保持原行为。
-    let background = autostart::launched_in_background();
-    // 点通知拉起 / 守护进程 `launch_gui`：用户要的是管家会话，不是主界面。
-    let open_butler_at_start = std::env::args().any(|arg| arg == "--butler");
-
-    // 单实例：常驻托盘的程序被重复双击时，用户要的是「把已有窗口提到前面」，
-    // 不是第二个进程。后启动的进程通知 Primary 后直接退出；`--butler` 的
-    // 通知会落到「打开管家窗口」那条事件上，而不是只把主界面提到前面。
-    let intent = if open_butler_at_start {
-        crate::single_instance::Intent::OpenButler
-    } else {
-        crate::single_instance::Intent::Open
-    };
-    let instance = match crate::single_instance::acquire_with_intent("mns-gui", intent) {
-        crate::single_instance::Acquired::Primary(guard) => guard,
-        crate::single_instance::Acquired::AlreadyRunning => {
-            // 命名事件是主路径（Primary 还没建好事件或跑的是旧版本时可能落空），
-            // 本地通道再补一枪：新版本对重复的 OpenButler 只会把已有管家窗口
-            // 置前，不会开出第二个。普通启动保持只走事件，行为与之前一致。
-            if open_butler_at_start {
-                let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::OpenButler);
-            }
-            return;
-        }
-    };
-
     // Finder 启动时进程 cwd 是 `/`（macOS 系统卷只读）。所有自有路径都已
     // 改为绝对解析，这里再把 cwd 固定到应用数据目录，让外部 ACP agent 及
     // 其他子进程继承到的一律是可写位置。
@@ -1996,6 +1998,27 @@ pub fn run() {
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::env::set_current_dir(&data_dir);
 
+    match parse_role() {
+        Role::Host {
+            open_butler,
+            show_main,
+        } => run_host(open_butler, show_main),
+        Role::MainWindow {
+            page,
+            about,
+            refresh,
+        } => run_main_window(page, about, refresh),
+        Role::ButlerWindow { notice } => run_butler_window(notice),
+    }
+}
+
+/// 托盘宿主：没有 AppShell，也没有窗口。
+///
+/// 它只做四件事：Dock 入口与托盘界面、系统通知投递、管家守护进程启停、
+/// 拉起短命窗口子进程。托盘上的数字向 `mns-butlerd` 要（`RequestBrief`），
+/// 不再自己读库。宿主是进程组里唯一常驻的进程，也是唯一持有 Dock 图标的
+/// 进程；窗口子进程用 `Accessory`，不会在 Dock 里多出一个 MNS。
+fn run_host(open_butler_at_start: bool, show_main: bool) {
     // 安装位置可能在升级后变化，启动时按当前 exe 路径刷新一次登录项；
     // 关闭状态则不写入任何系统项。
     if crate::agent::load_settings().launch_at_login
@@ -2004,127 +2027,343 @@ pub fn run() {
         eprintln!("[mns-gui] 无法同步开机自启动：{error}");
     }
 
-    let (agent, agent_events) = start_runtime();
-    let (jobs, job_events) = Jobs::spawn();
-    AGENT.with(|cell| *cell.borrow_mut() = Some(agent.clone()));
-
-    // 本地唤醒通道：管家守护进程与「二次启动」都从这条流进来。监听失败
-    // 只影响这两件事，不应挡住主流程（例如同一台机器上另一个用户的实例
-    // 已经占住了通道）。
-    let (ipc_listener, ipc_events) = match crate::ipc::listen("mns-gui") {
-        Ok((listener, events)) => (Some(listener), Some(events)),
-        Err(error) => {
-            eprintln!("[mns-gui] 本地唤醒通道不可用：{error}");
-            (None, None)
+    // Windows 保留互斥体 + 命名事件：二次启动的意图（主窗/管家窗）走事件，
+    // 早于本地通道建好也不会丢。其他平台由下面的监听本身充当实例锁。
+    #[cfg(windows)]
+    let instance = {
+        let intent = if open_butler_at_start {
+            crate::single_instance::Intent::OpenButler
+        } else {
+            crate::single_instance::Intent::Open
+        };
+        match crate::single_instance::acquire_with_intent("mns-gui", intent) {
+            crate::single_instance::Acquired::Primary(guard) => guard,
+            crate::single_instance::Acquired::AlreadyRunning => return,
         }
     };
-    let _ipc_listener = ipc_listener;
 
-    // 管家守护进程：把「判定」放到独立进程里，主窗口关掉之后它继续守着
-    // （账本事件、到点任务、定时巡检）。已经在跑时不重复启动。没有守护
-    // 进程时（单文件开发构建、通道被占）才退回 GUI 内巡检。
+    // 本地唤醒通道兼作跨平台单实例锁：能监听 = 本进程是唯一宿主。
+    let (listener, events) = match crate::ipc::listen("mns-gui") {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            // 已有宿主：把这次启动的意图交给它，自己退出。
+            let signal = if open_butler_at_start {
+                crate::ipc::Signal::OpenButler
+            } else {
+                crate::ipc::Signal::Open
+            };
+            let _ = crate::ipc::poke("mns-gui", &signal);
+            return;
+        }
+        Err(error) => {
+            eprintln!("[mns-gui] 本地唤醒通道不可用：{error}");
+            // 没有实例锁就不该再起第二个宿主，避免通知投递出现两个写者。
+            return;
+        }
+    };
+
+    // 管家守护进程：把「判定」放到独立进程里，宿主退出后它继续守着。
     let daemon_present = ensure_butler_daemon();
 
-    // GUI 重启后要立刻重新握手：守护进程上次连接已经断了，只有它主动
-    // `Hello` 才知道「现在有 GUI 可以投递」。这条 poke 触发它重连。
-    if daemon_present {
-        let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger: None });
-    }
-
-    // `--butler` 冷启动同样把主窗口建成隐藏载体：用户要的是管家会话，
-    // 不该先弹一次主界面。
-    let hidden = background || open_butler_at_start;
-
-    gpui_kit::application()
+    let app = gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
-        .with_quit_mode(QuitMode::Explicit)
-        .run(move |cx| {
+        .with_quit_mode(QuitMode::Explicit);
+
+    // macOS：应用已在运行时再次双击图标 / 从 Dock 点开会走 reopen，不会走
+    // 单实例事件。点通知进来的那一次仍然优先去管家窗口。
+    app.on_reopen(|cx| {
+        if notify::take_click_pending() {
+            match notify::recent_click_notice().flatten() {
+                Some(notice_id) => open_butler_notice_from_host(cx, &notice_id),
+                None => open_butler_from_host(cx),
+            }
+        } else {
+            open_main_from_host(cx, None, false, false);
+        }
+    });
+
+    app.run(move |cx| {
             gpui_kit::init(cx);
             theme::apply(cx);
+            // 宿主是唯一持有 Dock 图标的进程（Regular）：点 Dock / 双击应用
+            // 都会走 on_reopen 打开或置前主窗，Dock 右键退出也会完整收尾。
+            // 窗口子进程在 run_main_window / run_butler_window 里显式设为
+            // Accessory，否则会有两个 MNS Dock 图标。
+            #[cfg(target_os = "macos")]
+            cx.set_activation_policy(gpui_kit::ActivationPolicy::Regular);
             cx.set_global(GuiState {
                 window: None,
-                window_id: None,
-                window_hidden: hidden,
                 view: None,
                 butler_window: None,
                 butler_view: None,
                 butler_notice: None,
                 butler_daemon: daemon_present,
                 butler_daemon_conn: None,
+                butler_window_conn: None,
                 tray: None,
-                jobs: Some(jobs.clone()),
-                snapshot: None,
+                jobs: None,
+                brief: None,
                 last_tray_brief: None,
+                tray_alert: false,
+                _listener: Some(listener),
             });
 
-            // Outside macOS the traffic lights and ctrl-w really destroy the
-            // window; clear the handle so `ensure_window` can rebuild it from
-            // the tray. macOS hides instead, so its handle stays valid.
-            cx.on_window_closed(|cx, closed| {
-                let state = cx.global_mut::<GuiState>();
-                // Replacing the hidden startup window must not clobber the new
-                // visible one when the old window's close lands later.
-                if state.window_id == Some(closed) {
-                    state.window = None;
-                    state.window_id = None;
-                }
-                if state
-                    .butler_window
-                    .as_ref()
-                    .is_some_and(|handle| handle.window_id() == closed)
-                {
-                    state.butler_window = None;
-                    state.butler_view = None;
-                }
+            register_host_actions(cx);
+            // 宿主是唯一常驻的 Regular 进程：窗口活着时 macOS 保留的正是
+            // 宿主这份菜单栏，所以它要和窗口里的入口保持一致。
+            #[cfg(target_os = "macos")]
+            {
+                cx.bind_keys([
+                    KeyBinding::new("cmd-q", QuitApplication, None),
+                    KeyBinding::new("cmd-w", CloseMainWindow, None),
+                    KeyBinding::new("cmd-r", RefreshData, None),
+                ]);
+                cx.set_menus(host_menus());
+            }
+            if let Err(error) = setup_tray(cx) {
+                eprintln!("[mns-gui] tray unavailable: {error}");
+                cx.quit();
+                return;
+            }
+
+            let opens = notify::init();
+            spawn_notification_clicks(cx, opens);
+            spawn_ipc_bridge(cx, events);
+            spawn_host_ticker(cx);
+            // 系统发来的 terminate（macOS 的 Apple Event / Dock 右键退出）不
+            // 经过我们的菜单：同样要收子进程并撤掉实例锁，否则窗口、守护
+            // 进程和 socket 文件都会留在原地等人踩。
+            cx.on_app_quit(|cx| {
+                shutdown_children();
+                release_listener(cx);
+                async {}
             })
             .detach();
 
-            register_actions(cx);
+            #[cfg(windows)]
+            spawn_instance_watcher(cx, instance);
 
-            if let Err(error) = setup_tray(cx) {
-                eprintln!("[mns-gui] tray unavailable: {error}");
+            if open_butler_at_start {
+                open_butler_from_host(cx);
+            } else if show_main {
+                // 首启可见：双击应用（无参数）直接开一次主窗。登录项带
+                // `--tray`，只驻留 Dock/托盘，不打扰。
+                open_main_from_host(cx, None, false, false);
             }
-            let open_requests = notify::init();
-            // 后台启动也创建窗口，只是不显示：定时巡检与托盘简报都依赖
-            // 窗口里的界面状态，隐藏窗口让它们保持可用，又不会弹到用户面前。
-            if let Err(error) = open_main_window(cx, None, !hidden) {
+            // 启动即要一份简报；守护进程不在时先显示「正在读取」，由下一次
+            // tick 或用户点「启动管家进程」补齐。
+            request_brief(cx);
+            refresh_tray(cx);
+        });
+}
+
+/// 主窗口短命子进程：`mns-gui --window [--page <slug>] [--about] [--refresh]`。
+///
+/// `QuitMode::LastWindowClosed` + 关窗即退：进程跟着窗口结束，操作系统回收
+/// 全部内存，不存在「窗口关了但进程还在」的累积。
+fn run_main_window(page: Option<Page>, about: bool, refresh: bool) {
+    let (listener, events) = match crate::ipc::listen("mns-gui-window") {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            // 窗口已经开着：把这次请求交给它，自己退出。
+            let signal = match (page, about, refresh) {
+                (Some(page), _, _) => crate::ipc::Signal::OpenPage {
+                    page: page.slug().to_owned(),
+                },
+                (_, true, _) => crate::ipc::Signal::OpenAbout,
+                (_, _, true) => crate::ipc::Signal::RefreshData,
+                _ => crate::ipc::Signal::Open,
+            };
+            let _ = crate::ipc::poke("mns-gui-window", &signal);
+            return;
+        }
+        Err(error) => {
+            eprintln!("[mns-gui] 窗口实例锁不可用：{error}");
+            return;
+        }
+    };
+
+    let (agent, agent_events) = start_runtime();
+    let (jobs, job_events) = Jobs::spawn();
+    AGENT.with(|cell| *cell.borrow_mut() = Some(agent.clone()));
+    announce_to_host("window");
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .with_quit_mode(QuitMode::LastWindowClosed)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            theme::apply(cx);
+            // 窗口进程不持有 Dock 图标：宿主是唯一的 MNS Dock 入口，窗口只是
+            // 它拉起的短命子进程（Accessory 仍可显示窗口、拿焦点、出菜单栏）。
+            #[cfg(target_os = "macos")]
+            cx.set_activation_policy(gpui_kit::ActivationPolicy::Accessory);
+            cx.set_global(GuiState {
+                window: None,
+                view: None,
+                butler_window: None,
+                butler_view: None,
+                butler_notice: None,
+                butler_daemon: false,
+                butler_daemon_conn: None,
+                butler_window_conn: None,
+                tray: None,
+                jobs: Some(jobs.clone()),
+                brief: None,
+                last_tray_brief: None,
+                tray_alert: false,
+                _listener: Some(listener),
+            });
+
+            // 红灯关闭按钮 / 系统关窗不会走 `close_window`：在这里撤掉 socket，
+            // 否则文件会留到下次开窗才被 `listen` 的探活清理。
+            cx.on_window_closed(|cx, _| release_listener(cx)).detach();
+
+            register_window_actions(cx, true);
+            if let Err(error) = open_main_window(cx, page, about) {
                 eprintln!("[mns-gui] failed to open window: {error}");
                 cx.quit();
                 return;
             }
-            refresh_tray(cx);
-
-            if open_butler_at_start {
-                open_butler_window(cx);
+            // 窗口进程是 Accessory，建窗不会自动变成前台应用；宿主刚在
+            // Dock 上被点过，这里显式激活，窗口才会真的到用户眼前。
+            activate_any_window(cx);
+            if refresh
+                && let Some(view) = cx.global::<GuiState>().view.clone()
+            {
+                view.update(cx, |shell, cx| shell.refresh(cx));
             }
 
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
             spawn_daily_scheduler(cx);
-            spawn_butler_loop(cx);
-            spawn_notification_clicks(cx, open_requests);
-            if let Some(events) = ipc_events {
-                spawn_ipc_bridge(cx, events);
-            }
-            // 单实例的「有人又启动了」信号：Windows 用命名事件（互斥体 + 事件
-            // 在进程启动早期就判定完了，早于本地唤醒通道建好），macOS/Linux 由
-            // 系统保证不重复启动。两者都不再靠 400ms 轮询。
-            #[cfg(windows)]
-            spawn_instance_watcher(cx, instance);
-            #[cfg(not(windows))]
-            drop(instance);
+            spawn_window_bridge(cx, events);
         });
 }
 
-/// 等待「又有人启动了 mns-gui」的信号，并按那次启动的意图唤起窗口。
+/// 管家窗口短命子进程：`mns-gui --window --butler [--notice <id>]`。
+fn run_butler_window(notice: Option<String>) {
+    let (listener, events) = match crate::ipc::listen("mns-gui-butler") {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            // 窗口已经开着：把「定位到哪一条」交给它，自己退出。
+            let signal = match notice {
+                Some(notice_id) => crate::ipc::Signal::NoticeFocus { notice_id },
+                None => crate::ipc::Signal::Open,
+            };
+            let _ = crate::ipc::poke("mns-gui-butler", &signal);
+            return;
+        }
+        Err(error) => {
+            eprintln!("[mns-gui] 管家窗口实例锁不可用：{error}");
+            return;
+        }
+    };
+
+    // 打开即告诉宿主「用户在看管家」：mark_read 与会话合并都由宿主负责。
+    // 长连接 Hello 让宿主知道窗口进程还在，关窗断开即感知。
+    announce_to_host("window-butler");
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .with_quit_mode(QuitMode::LastWindowClosed)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            theme::apply(cx);
+            // 窗口进程不持有 Dock 图标：宿主是唯一的 MNS Dock 入口，窗口只是
+            // 它拉起的短命子进程（Accessory 仍可显示窗口、拿焦点、出菜单栏）。
+            #[cfg(target_os = "macos")]
+            cx.set_activation_policy(gpui_kit::ActivationPolicy::Accessory);
+            cx.set_global(GuiState {
+                window: None,
+                view: None,
+                butler_window: None,
+                butler_view: None,
+                butler_notice: None,
+                butler_daemon: false,
+                butler_daemon_conn: None,
+                butler_window_conn: None,
+                tray: None,
+                jobs: None,
+                brief: None,
+                last_tray_brief: None,
+                tray_alert: false,
+                _listener: Some(listener),
+            });
+
+            // 红灯关闭按钮 / 系统关窗不会走 `close_window`：在这里撤掉 socket。
+            cx.on_window_closed(|cx, _| release_listener(cx)).detach();
+
+            register_window_actions(cx, false);
+            if let Err(error) = open_butler_window_view(cx, notice.clone()) {
+                eprintln!("[mns-gui] failed to open butler window: {error}");
+                cx.quit();
+                return;
+            }
+            activate_any_window(cx);
+            spawn_window_bridge(cx, events);
+        });
+}
+
+/// 向宿主声明「我是哪个窗口」，并持有这条连接直到进程退出。
 ///
-/// `Intent::Open` 与托盘菜单「打开 MNS」走同一条路径：窗口被关到托盘时
-/// `ensure_window` 会按快照重建一个可见窗口；窗口只是被最小化或被压在后面
-/// 时 `Window::activate_window` 负责还原并置前（Windows 上 `App::activate`
-/// 是空实现）。`Intent::OpenButler`（`mns-gui --butler`）直接打开管家窗口，
-/// 与托盘里的「管家」入口共用 `open_butler_window`。
+/// 宿主据此判断窗口是否还开着（断开事件即关窗），不需要轮询进程名。
+fn announce_to_host(role: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name("mns-host-hello".to_owned())
+        .spawn(move || {
+            let Ok(mut client) = crate::ipc::connect("mns-gui") else {
+                return;
+            };
+            if client
+                .send(&crate::ipc::Signal::Hello {
+                    role: role.to_owned(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            // 宿主收到了这句问候。管家窗口的离线横幅靠宿主拉起守护进程
+            // （窗口自己不 spawn），从这一刻起「重试」按钮才有资格亮。
+            butler::mark_host_alive();
+            // 进程退出时内核关闭这条连接，宿主收到断开事件。窗口进程没有
+            // 需要主动发送的内容，睡到进程结束即可。
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        });
+}
+
+/// 拉起一个短命窗口子进程，并在线程里 `wait` 收割——Unix 上不 wait 会留下
+/// 僵尸，正好破坏「开关 20 次无进程累积」。
+fn spawn_window(args: &[&str]) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = command(&exe);
+    cmd.arg("--window");
+    for arg in args {
+        cmd.arg(arg);
+    }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::Builder::new()
+                .name("mns-window-reaper".to_owned())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+                .ok();
+        }
+        Err(error) => eprintln!("[mns-gui] 无法启动窗口进程：{error}"),
+    }
+}
+
+
+/// 等待「又有人启动了 mns-gui」的信号，并按那次启动的意图拉起窗口。
 ///
-/// 等待发生在专用线程上，阻塞在内核事件里：命中才醒，不做周期轮询。
+/// `Intent::Open` 与托盘菜单「打开 MNS」走同一条路径；`Intent::OpenButler`
+/// （`mns-gui --butler`）直接拉起管家窗口。等待发生在专用线程上，阻塞在
+/// 内核事件里：命中才醒，不做周期轮询。
 #[cfg(windows)]
 fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
     let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
@@ -2140,23 +2379,20 @@ fn spawn_instance_watcher(cx: &mut App, guard: crate::single_instance::Guard) {
     cx.spawn(async move |cx| {
         while let Some(intent) = requests.recv().await {
             let _ = cx.update(|cx| match intent {
-                crate::single_instance::Intent::Open => {
-                    ensure_window(cx);
-                    if let Some(handle) = cx.global::<GuiState>().window.clone() {
-                        let _ = handle.update(cx, |_, window, _| window.activate_window());
-                    }
-                    cx.activate(true);
-                }
-                crate::single_instance::Intent::OpenButler => open_butler_window(cx),
+                crate::single_instance::Intent::Open => open_main_from_host(cx, None, false, false),
+                crate::single_instance::Intent::OpenButler => open_butler_from_host(cx),
             });
         }
     })
     .detach();
 }
 
-/// Minute-resolution scheduler for the unattended review.
+/// Minute-resolution scheduler for the unattended review, inside the main
+/// window process only. With no window there is no place to show a review, so
+/// the host does not run it; butler notifications are still delivered by the
+/// daemon.
 ///
-/// A real timer loop beats a launch hook: the app may stay open for days, and
+/// A real timer loop beats a launch hook: the window may stay open for days, and
 /// the machine may sleep through the target minute. The check is idempotent —
 /// `maybe_start_daily` keeps one date stamp per process — so a coarse poll is
 /// safer than a precise one-shot that a sleep/wake cycle can swallow.
@@ -2178,8 +2414,23 @@ fn spawn_daily_scheduler(cx: &mut App) {
                         }
                     });
                 }
-                // "今日已触发" must change even on a day where the run was
-                // skipped, so the minute tick refreshes the tray regardless.
+            });
+        }
+    })
+    .detach();
+}
+
+/// Host ticker: refresh the tray once a minute and ask butlerd for a fresh
+/// brief. `poke` doubles as liveness detection — success means the daemon is
+/// listening, failure flips the tray to red without a second probe connection.
+fn spawn_host_ticker(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(60))
+                .await;
+            let _ = cx.update(|cx| {
+                request_brief(cx);
                 refresh_tray(cx);
             });
         }
@@ -2187,54 +2438,29 @@ fn spawn_daily_scheduler(cx: &mut App) {
     .detach();
 }
 
-/// 管家巡检循环。与每日巡检分开：管家有自己的 ≥4h 间隔与开口频控，状态
-/// 持久化在 `~/.mns/agent/butler/state.json`，重启不会重复开口。
-fn spawn_butler_loop(cx: &mut App) {
+/// 通知点击回调只置位，窗口由主线程拉起——回调线程不能直接碰 GPUI。
+fn spawn_notification_clicks(
+    cx: &mut App,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+) {
     cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(60))
-                .await;
-            let _ = cx.update(|cx| {
-                // 到点任务是独立唤醒源：4 小时的巡检间隔不该决定一条「到点
-                // 提醒」迟多久。有守护进程时这里会各自被它接管。
-                for id in due_task_ids() {
-                    run_butler_wake_with(cx, crate::butler::WakeSource::Task { id });
-                }
-                run_butler_wake(cx);
+        // 挂起等事件，不做定时轮询：一次点击唤醒一次，空闲时零开销。
+        while let Some(notice_id) = requests.recv().await {
+            cx.update(|cx| match notice_id {
+                // 新格式：带着通知 id 进来，窗口要定位到那一条。
+                Some(notice_id) => open_butler_notice_from_host(cx, &notice_id),
+                // 旧版通知没有 userInfo：退回只开窗，至少不丢这次点击。
+                None => open_butler_from_host(cx),
             });
         }
     })
     .detach();
 }
 
-/// 到点且还没被唤醒过的任务 id。去重由 `WakeScheduler` 兜底，这里只负责
-/// 「有哪些任务到点了」。
-fn due_task_ids() -> Vec<String> {
-    crate::butler::tasks::TaskBoard::load()
-        .map(|board| board.due(chrono::Local::now()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|task| task.id)
-        .collect()
-}
-
-/// 通知点击回调只置位，窗口由主线程打开——回调线程不能直接碰 GPUI。
-fn spawn_notification_clicks(cx: &mut App, mut requests: tokio::sync::mpsc::UnboundedReceiver<()>) {
-    cx.spawn(async move |cx| {
-        // 挂起等事件，不做定时轮询：一次点击唤醒一次，空闲时零开销。
-        while requests.recv().await.is_some() {
-            cx.update(|cx| open_butler_window(cx));
-        }
-    })
-    .detach();
-}
-
-/// 本地唤醒通道的消费端。
+/// 宿主侧本地通道的消费端。
 ///
-/// `Open` 来自二次启动（等价于点托盘里的「打开 MNS」），`OpenButler` 来自
-/// 管家守护进程。连接断开会在 `Disconnected` 里体现——守护进程崩溃时这条
-/// 事件立刻到达，不需要心跳阈值。
+/// 它同时是「谁还活着」的传感器：守护进程与窗口进程各自握手/断开，宿主
+/// 不需要查进程名，也不会把另一个干净环境里的同名进程认成自己的。
 fn spawn_ipc_bridge(
     cx: &mut App,
     mut events: tokio::sync::mpsc::UnboundedReceiver<crate::ipc::Event>,
@@ -2243,40 +2469,87 @@ fn spawn_ipc_bridge(
         while let Some(event) = events.recv().await {
             match event {
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::Open) => {
-                    let _ = cx.update(|cx| {
-                        ensure_window(cx);
-                        cx.activate(true);
-                        refresh_tray(cx);
-                    });
+                    let _ = cx.update(|cx| open_main_from_host(cx, None, false, false));
                 }
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenButler) => {
-                    let _ = cx.update(|cx| open_butler_window(cx));
+                    let _ = cx.update(|cx| open_butler_from_host(cx));
                 }
-                // 守护进程上线：它接手巡检与系统通知。GUI 让出通知 delegate，
-                // 否则同一 bundle 里会有两个 delegate，点击落到谁家是未定义的。
+                // 窗口进程里的「退出 MNS」：托盘宿主才是整个程序的拥有者。
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Shutdown) => {
+                    eprintln!("[mns-gui] 收到退出请求");
+                    let _ = cx.update(|cx| quit_host(cx));
+                }
                 crate::ipc::Event::Signal(id, crate::ipc::Signal::Hello { role })
                     if role == "daemon" =>
                 {
                     let _ = cx.update(|cx| {
-                        eprintln!("[mns-gui] 管家守护进程上线，判定交给它");
+                        eprintln!("[mns-gui] 管家守护进程上线");
                         cx.global_mut::<GuiState>().butler_daemon = true;
                         cx.global_mut::<GuiState>().butler_daemon_conn = Some(id);
-                        // GUI 关着的时候守护进程可能已经开口过：补齐会话。
-                        consume_pending(cx);
+                        // P4 起开口由 butlerd 自己并进会话（单写者），宿主
+                        // 只管要简报与托盘。
+                        request_brief(cx);
+                        refresh_tray(cx);
                     });
                 }
-                // 守护进程刚开口，来读 `pending.jsonl`。
-                crate::ipc::Event::Signal(_, crate::ipc::Signal::Pending) => {
-                    let _ = cx.update(|cx| consume_pending(cx));
+                crate::ipc::Event::Signal(id, crate::ipc::Signal::Hello { role })
+                    if role == "window-butler" =>
+                {
+                    let _ = cx.update(|cx| {
+                        cx.global_mut::<GuiState>().butler_window_conn = Some(id);
+                        // 用户刚打开窗口：会话已读由 butlerd 在挂载帧的
+                        // `ChatSeen` 里写，宿主只清托盘提示，不再碰会话。
+                        cx.global_mut::<GuiState>().butler_notice = None;
+                        refresh_tray(cx);
+                    });
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Brief { json }) => {
+                    let _ = cx.update(|cx| {
+                        if let Ok(brief) = serde_json::from_str::<crate::brief::BriefData>(&json) {
+                            cx.global_mut::<GuiState>().brief = Some(brief);
+                            cx.global_mut::<GuiState>().butler_daemon = true;
+                            refresh_tray(cx);
+                        }
+                    });
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::ButlerSeen) => {
+                    let _ = cx.update(|cx| {
+                        // 会话已读标记由 butlerd 在 `ChatSeen` 里写，宿主只
+                        // 撤自己的托盘提示。
+                        cx.global_mut::<GuiState>().butler_notice = None;
+                        refresh_tray(cx);
+                    });
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::DeliverNotice { json }) => {
+                    let _ = cx.update(|cx| deliver_notice(cx, &json));
+                }
+                // 管家窗口离线横幅的「重试」：守护进程的生命周期归宿主，
+                // 窗口只请、不自己拉起。
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::StartButler) => {
+                    let _ = cx.update(|cx| start_butler_daemon(cx));
                 }
                 crate::ipc::Event::Disconnected(id) => {
                     let _ = cx.update(|cx| {
-                        let state = cx.global_mut::<GuiState>();
-                        if state.butler_daemon_conn == Some(id) {
-                            eprintln!("[mns-gui] 管家守护进程离线，判定回到本进程");
-                            state.butler_daemon = false;
-                            state.butler_daemon_conn = None;
-                            run_butler_wake(cx);
+                        let daemon_lost = {
+                            let state = cx.global_mut::<GuiState>();
+                            if state.butler_daemon_conn == Some(id) {
+                                eprintln!("[mns-gui] 管家守护进程离线");
+                                state.butler_daemon = false;
+                                state.butler_daemon_conn = None;
+                                state.brief = None;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        {
+                            let state = cx.global_mut::<GuiState>();
+                            if state.butler_window_conn == Some(id) {
+                                state.butler_window_conn = None;
+                            }
+                        }
+                        if daemon_lost {
+                            refresh_tray(cx);
                         }
                     });
                 }
@@ -2287,317 +2560,246 @@ fn spawn_ipc_bridge(
     .detach();
 }
 
-/// 已消费到的 `pending.jsonl` 偏移。丢了就当 0，重读会去重。
-fn read_pending_offset() -> u64 {
-    std::fs::read_to_string(crate::butler::orchestrator::pending_offset_path())
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-fn write_pending_offset(offset: u64) {
-    let _ = crate::butler::store::write_json(
-        &crate::butler::orchestrator::pending_offset_path(),
-        &offset,
-    );
-}
-
-/// 把守护进程判定过的开口并进会话。
-///
-/// `conversation.json` 始终只有 GUI 一个写者：守护进程只往 `pending.jsonl`
-/// 追加，投递与去重都在这里完成。
-fn consume_pending(cx: &mut App) {
-    consume_pending_with(cx, false);
-}
-
-/// `assume_seen` 给「用户正在打开管家窗口」这条路径用：窗口可能还没拿到
-/// 焦点，但那一眼就是要看积压，不该再补一条横幅。
-fn consume_pending_with(cx: &mut App, assume_seen: bool) {
-    let offset = read_pending_offset();
-    let Ok((new_offset, notices)) = crate::butler::orchestrator::take_pending(offset) else {
-        return;
-    };
-    if notices.is_empty() {
-        return;
-    }
-
-    let now = chrono::Local::now();
-    // 窗口存在 ≠ 用户看得见：管家窗口在后面、最小化、⌘W 隐藏时，
-    // `butler_view` 仍然是 Some。只有它真是当前焦点窗口，才算「已看见」；
-    // 否则消息照样进会话，但要保留未读并继续走横幅与托盘。
-    let window_focused = cx
-        .global::<GuiState>()
-        .butler_window
-        .as_ref()
-        .copied()
-        .is_some_and(|handle| cx.active_window() == Some(handle));
-    let open = cx.global::<GuiState>().butler_view.clone();
-    let seen_now = assume_seen || (open.is_some() && window_focused);
-
-    // 先落盘、再推进偏移。反过来写的话，会话保存失败就等于消息永久丢失：
-    // 偏移已经越过它，下次也不会重投。
-    let persisted = match open {
-        Some(view) => {
-            let saved = view.update(cx, |view, cx| {
-                let mut saved = true;
-                for notice in &notices {
-                    saved &= view.receive_notice(notice, seen_now);
+/// 窗口子进程的本地通道消费端：置前、翻页、刷新、被宿主关闭。
+fn spawn_window_bridge(
+    cx: &mut App,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<crate::ipc::Event>,
+) {
+    cx.spawn(async move |cx| {
+        while let Some(event) = events.recv().await {
+            let _ = cx.update(|cx| match event {
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Open) => {
+                    activate_any_window(cx);
                 }
-                if seen_now {
-                    cx.notify();
-                }
-                saved
-            });
-            if seen_now {
-                cx.global_mut::<GuiState>().butler_notice = None;
-            }
-            saved
-        }
-        None => match crate::butler::Session::load() {
-            Ok(mut session) => {
-                for notice in &notices {
-                    session.push(crate::butler::Message {
-                        at: notice.at,
-                        role: crate::butler::Role::Butler,
-                        text: notice.draft.clone(),
-                        reason: Some(notice.reason),
-                        trigger: Some(notice.trigger.clone()),
-                    });
-                }
-                match session.save() {
-                    Ok(()) => true,
-                    Err(error) => {
-                        eprintln!("[mns-gui] butler session save failed: {error:#}");
-                        false
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenPage { page }) => {
+                    if let Some(page) = Page::from_slug(&page) {
+                        navigate_window(cx, page);
                     }
+                    activate_any_window(cx);
                 }
-            }
-            Err(error) => {
-                // 存档读不出来：重投也读不出来，推进偏移避免每次启动都卡在
-                // 同一条上；原文件不覆盖，用户仍可自行修复。
-                eprintln!("[mns-gui] butler session unreadable: {error:#}");
-                true
-            }
-        },
-    };
-
-    if !persisted {
-        // 不推进偏移：下次启动重投这几条，总比静默丢掉强。
-        return;
-    }
-    write_pending_offset(new_offset);
-
-    if !seen_now {
-        if let Some(last) = notices.last() {
-            cx.global_mut::<GuiState>().butler_notice = Some(last.draft.clone());
-        }
-        // 系统通知只能由本进程发（守护进程发会被系统拒绝），所以横幅在
-        // 这里补。只对刚产生的开口弹：启动时补齐的积压不该再响一遍。
-        if let Some(fresh) = notices
-            .iter()
-            .rev()
-            .find(|notice| now.signed_duration_since(notice.at) < chrono::Duration::minutes(5))
-        {
-            crate::notify::send(&fresh.draft);
-        }
-    }
-    refresh_tray(cx);
-}
-
-fn run_butler_wake(cx: &mut App) {
-    run_butler_wake_with(cx, crate::butler::WakeSource::Scheduled)
-}
-
-/// 账本事件用时间戳（毫秒）定位，构造唤醒源后走同一条判定路径。账本事件
-/// 不受定时巡检的 4 小时间隔约束——买完就该被看见，而不是等下一次巡检。
-fn run_butler_wake_from(cx: &mut App, ledger: Option<String>) {
-    let source = match ledger {
-        Some(id) => crate::butler::WakeSource::Ledger { id },
-        None => crate::butler::WakeSource::Scheduled,
-    };
-    run_butler_wake_with(cx, source)
-}
-
-fn run_butler_wake_with(cx: &mut App, source: crate::butler::WakeSource) {
-    let now = chrono::Local::now();
-    let facts = {
-        let Some(view) = cx.global::<GuiState>().view.clone() else {
-            return;
-        };
-        let shell = view.read(cx);
-        // 首屏还没加载完时不判定：空账户不是「没有偏离」，是「还不知道」。
-        if shell.data.is_none() {
-            return;
-        }
-        butler::facts_for(&shell, now)
-    };
-
-    // 事实先落盘：守护进程只读这一份，不碰数据库。GUI 自己做判定时也写，
-    // 因为「谁在判定」随时可能交接，事实不该有两份来源。
-    if let Err(error) = crate::butler::orchestrator::write_facts(now, &facts) {
-        eprintln!("[mns-gui] 管家事实落盘失败：{error:#}");
-    }
-
-    // 守护进程在跑：巡检归它，GUI 只负责算事实和显示。事实刚变过，叫它
-    // 立刻看一眼——它自己 5 分钟一次的 tick 太慢，用户刚记完账不该再等。
-    // 巡检间隔由它的 `WakeScheduler` 兜着，叫早了不会多说一句。
-    if cx.global::<GuiState>().butler_daemon {
-        let ledger = match &source {
-            crate::butler::WakeSource::Ledger { id } => Some(id.clone()),
-            _ => None,
-        };
-        if let Err(error) = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger }) {
-            eprintln!("[mns-gui] 管家守护进程暂不可达：{error}");
-        }
-        return;
-    }
-
-    // 读-改-写全程持锁：守护进程与 CLI 可能同时各跑一份判定，后保存的
-    // 会把先保存的去重键覆盖回旧值。送达（通知、会话）在锁外——那些
-    // 文件只有 GUI 一个写者。
-    let report = {
-        let _guard = crate::butler::writer_lock();
-        let mut butler = match crate::butler::Butler::load() {
-            Ok(butler) => butler,
-            Err(error) => {
-                eprintln!("[mns-gui] butler state unreadable: {error:#}");
-                return;
-            }
-        };
-        let report = butler.wake(&source, now, &facts);
-        if report.wake == crate::butler::WakeVerdict::Wake
-            && let Err(error) = butler.save()
-        {
-            eprintln!("[mns-gui] butler state save failed: {error:#}");
-        }
-        report
-    };
-    if report.wake != crate::butler::WakeVerdict::Wake {
-        return;
-    }
-
-    let Some(crate::butler::SpeakDecision::Speak(candidate)) = report.speak else {
-        return;
-    };
-
-    // 出站队列是「已授权开口」的审计记录：GUI 直接送达，也要留下同一行。
-    if let Err(error) = crate::butler::orchestrator::enqueue_notice(now, &candidate) {
-        eprintln!("[mns-gui] butler outbox append failed: {error:#}");
-    }
-
-    let window_focused = cx
-        .global::<GuiState>()
-        .butler_window
-        .as_ref()
-        .copied()
-        .is_some_and(|handle| cx.active_window() == Some(handle));
-    let open = cx.global::<GuiState>().butler_view.clone();
-    match open {
-        Some(view) => {
-            view.update(cx, |view, cx| {
-                view.receive(&candidate, window_focused);
-                if window_focused {
-                    cx.notify();
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenAbout) => {
+                    if let Some(view) = cx.global::<GuiState>().view.clone() {
+                        view.update(cx, |shell, cx| {
+                            shell.about_open = true;
+                            cx.notify();
+                        });
+                    }
+                    activate_any_window(cx);
                 }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::RefreshData) => {
+                    if let Some(view) = cx.global::<GuiState>().view.clone() {
+                        view.update(cx, |shell, cx| shell.refresh(cx));
+                    }
+                    activate_any_window(cx);
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::NoticeFocus { notice_id }) => {
+                    if let Some(view) = cx.global::<GuiState>().butler_view.clone() {
+                        view.update(cx, |view, cx| view.focus_notice(notice_id, cx));
+                    }
+                    activate_any_window(cx);
+                    // 窗口已在看这条：告诉宿主标记已读、清托盘提示。
+                    let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::ButlerSeen);
+                }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::Shutdown) => {
+                    close_window(cx);
+                }
+                _ => {}
             });
-            if window_focused {
-                cx.global_mut::<GuiState>().butler_notice = None;
-            } else {
-                // 窗口在，但用户没在看：仍然要留未读、托盘提示与横幅。
-                cx.global_mut::<GuiState>().butler_notice = Some(candidate.draft.clone());
-                notify::send(&candidate.draft);
-            }
         }
-        None => {
-            // 窗口没开：落进会话存档但不标已读，托盘菜单作为可点击的提示面。
-            if let Ok(mut session) = crate::butler::Session::load() {
-                session.push(crate::butler::Message {
-                    at: now,
-                    role: crate::butler::Role::Butler,
-                    text: candidate.draft.clone(),
-                    reason: Some(candidate.reason),
-                    trigger: Some(candidate.trigger.clone()),
-                });
-                if let Err(error) = session.save() {
-                    eprintln!("[mns-gui] butler session save failed: {error:#}");
-                }
-            }
-            cx.global_mut::<GuiState>().butler_notice = Some(candidate.draft.clone());
-            // 托盘是第一提示面，系统通知负责把话送到用户眼前；点击通知
-            // 回到管家窗口（`spawn_notification_clicks`）。
-            notify::send(&candidate.draft);
-        }
-    }
-    refresh_tray(cx);
+    })
+    .detach();
 }
 
-fn open_butler_window(cx: &mut App) {
-    // 守护进程可能在 GUI 关着时已经开口：先把待投递的条目并进会话，
-    // 窗口打开时才能看到完整对话。用户正在打开窗口，积压不该再补横幅。
-    consume_pending_with(cx, true);
-    if let Some(handle) = cx.global::<GuiState>().butler_window.clone() {
+/// 把当前进程里的任意窗口置前（主窗或管家窗）。
+fn activate_any_window(cx: &mut App) {
+    let state = cx.global::<GuiState>();
+    let handle = state
+        .window
+        .clone()
+        .or_else(|| state.butler_window.clone());
+    if let Some(handle) = handle {
         let _ = handle.update(cx, |_, window, _| window.activate_window());
-    } else {
-        let now = chrono::Local::now();
-        let facts = cx
-            .global::<GuiState>()
-            .view
-            .as_ref()
-            .map(|view| butler::facts_for(&view.read(cx), now))
-            .unwrap_or_default();
-        let options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("MNS · 管家".into()),
-                ..Default::default()
-            }),
-            window_bounds: Some(WindowBounds::centered(size(px(760.), px(640.)), cx)),
-            ..Default::default()
-        };
-        match gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| butler::ButlerView::new(facts, window, cx))
-        }) {
-            Ok((handle, view)) => {
-                // 点击通知会让系统把整个 app 激活，隐藏的主窗口也会被一并还原；
-                // 管家窗口必须自己拿到焦点，否则用户点的是「管家」却看到主界面。
-                let _ = handle.update(cx, |_, window, _| window.activate_window());
-                // 对话走 ACP：事件流要在拿到 Entity 之后才能挂，构造期还
-                // 拿不到 weak。窗口关掉时 view 被 drop，runtime 随之 Shutdown。
-                if let Some(mut events) = view.update(cx, |view, _| view.take_chat_events()) {
-                    let weak = view.downgrade();
-                    cx.spawn(async move |cx| {
-                        while let Some(event) = events.recv().await {
-                            if weak
-                                .update(cx, |view, cx| view.on_chat_event(event, cx))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    })
-                    .detach();
-                }
-                let state = cx.global_mut::<GuiState>();
-                state.butler_window = Some(handle);
-                state.butler_view = Some(view);
-            }
-            Err(error) => {
-                eprintln!("[mns-gui] failed to open butler window: {error}");
-                return;
-            }
-        }
     }
+    cx.activate(true);
+}
 
-    // 打开即已读：托盘提示与未读数都清掉。
-    if let Ok(mut session) = crate::butler::Session::load() {
-        session.mark_read(chrono::Local::now());
-        let _ = session.save();
+/// 在窗口进程里翻页；窗口不在时什么都不做。
+fn navigate_window(cx: &mut App, page: Page) {
+    if let Some(view) = cx.global::<GuiState>().view.clone() {
+        view.update(cx, |shell, cx| shell.navigate(page, cx));
     }
-    cx.global_mut::<GuiState>().butler_notice = None;
-    if let Some(view) = cx.global::<GuiState>().butler_view.clone() {
-        view.update(cx, |_, cx| cx.notify());
+}
+
+/// 释放本进程的实例锁并删掉 socket 文件。退出路径上的最后一步。
+fn release_listener(cx: &mut App) {
+    if let Some(mut listener) = cx.global_mut::<GuiState>()._listener.take() {
+        listener.release();
+    }
+}
+
+/// 关掉本进程的窗口。主窗先把 ACP 会话收尾并落盘，再移除窗口；
+/// `QuitMode::LastWindowClosed` 随后结束整个窗口进程。
+fn close_window(cx: &mut App) {
+    let state = cx.global::<GuiState>();
+    let handle = state
+        .window
+        .clone()
+        .or_else(|| state.butler_window.clone());
+    if let Some(view) = state.view.clone() {
+        view.update(cx, |shell, cx| shell.shutdown(cx));
+    }
+    // 窗口关掉之后没人再会连它：先撤掉 socket，免得残留文件让宿主误判
+    // 「窗口还开着」（`poke` 连不上，但目录里看得见）。
+    release_listener(cx);
+    match handle {
+        // 这个函数可能正在该窗口自己的 update 里跑（cmd-w 走的是窗口内的
+        // 事件回调），此时窗口已被借出 `cx.windows`，再 `handle.update`
+        // 只会拿到 None。推到本轮 effect 末尾再移除，窗口已经还回来了。
+        Some(handle) => cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }),
+        None => cx.quit(),
+    }
+}
+
+
+/// butlerd 递来一条开口：决定要不要弹系统通知。
+///
+/// P4 起会话存档与开口的并档全由 butlerd 单写（`pending.offset` 也由它推进），
+/// 宿主只剩两件事：管家窗口开着时话已经在会话里可见，撤托盘提示、不弹
+/// 横幅；窗口关着且这条开口还新鲜（≤5 分钟）、没投递过，才弹一次系统
+/// 通知并落审计。
+fn deliver_notice(cx: &mut App, json: &str) {
+    let Ok(notice) = serde_json::from_str::<crate::butler::orchestrator::Notice>(json) else {
+        return;
+    };
+    if cx.global::<GuiState>().butler_window_conn.is_some() {
+        // 窗口开着：消息经 butlerd 的快照直达会话，系统横幅只会重复打搅。
+        cx.global_mut::<GuiState>().butler_notice = None;
+        refresh_tray(cx);
+        return;
+    }
+    cx.global_mut::<GuiState>().butler_notice = Some(notice.draft.clone());
+    // 只对刚产生的开口弹：宿主重启后补递的旧积压不该再响一遍。
+    let now = chrono::Local::now();
+    let fresh = now.signed_duration_since(notice.at) < chrono::Duration::minutes(5);
+    // 同一 id 已经记过就不再弹，避免宿主重启后重复响一遍。
+    let already = crate::butler::orchestrator::delivered_notice(&notice.notice_id).is_some();
+    if fresh && !already && crate::notify::send(&notice.draft, &notice.notice_id) {
+        // 交给系统投递之后再落审计：开发二进制未打包时 `send` 返回
+        // false，不能把「没弹」记成「已送达」。
+        let _ = crate::butler::orchestrator::record_notice_delivered(&notice);
     }
     refresh_tray(cx);
 }
+
+
+/// 拉起或置前主窗口。窗口已经在跑时不重复开进程：先 poke 窗口自己的
+/// 通道，连不上才 spawn。窗口内部的单实例锁会兜住并发重复 spawn。
+fn open_main_from_host(cx: &mut App, page: Option<Page>, about: bool, refresh: bool) {
+    // 宿主先成为前台（最后一个 Regular 应用）：窗口进程是 Accessory，
+    // 它随后激活时 macOS 保留的菜单栏仍是宿主这一份 MNS 菜单。
+    cx.activate(true);
+    let signal = match (page, about, refresh) {
+        (Some(page), _, _) => crate::ipc::Signal::OpenPage {
+            page: page.slug().to_owned(),
+        },
+        (_, true, _) => crate::ipc::Signal::OpenAbout,
+        (_, _, true) => crate::ipc::Signal::RefreshData,
+        _ => crate::ipc::Signal::Open,
+    };
+    if crate::ipc::poke("mns-gui-window", &signal).is_ok() {
+        return;
+    }
+
+    let mut args = vec!["main"];
+    match page {
+        Some(page) => {
+            args.push("--page");
+            args.push(page.slug());
+        }
+        None if about => args.push("--about"),
+        None if refresh => args.push("--refresh"),
+        None => {}
+    }
+    spawn_window(&args);
+}
+
+/// 拉起或置前管家窗口。
+fn open_butler_from_host(cx: &mut App) {
+    cx.activate(true);
+    if crate::ipc::poke("mns-gui-butler", &crate::ipc::Signal::Open).is_ok() {
+        return;
+    }
+    spawn_window(&["butler"]);
+}
+
+/// 点系统通知进来：拉起或置前管家窗口，并定位到那条开口。
+///
+/// 窗口已经开着时只 poke 定位信号，不再重开进程；点击审计按 id 去重，
+/// 同一条通知点两次只留第一次记录。
+fn open_butler_notice_from_host(cx: &mut App, notice_id: &str) {
+    cx.activate(true);
+    if let Err(error) = crate::butler::orchestrator::record_notice_clicked(notice_id) {
+        eprintln!("[mns-gui] 记录通知点击失败：{error:#}");
+    }
+    let signal = crate::ipc::Signal::NoticeFocus {
+        notice_id: notice_id.to_owned(),
+    };
+    if crate::ipc::poke("mns-gui-butler", &signal).is_ok() {
+        return;
+    }
+    spawn_window(&["butler", "--notice", notice_id]);
+}
+
+/// 向守护进程要一份托盘简报。`poke` 同时是存活探测：连不上就把托盘拉红。
+fn request_brief(cx: &mut App) {
+    let alive = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::RequestBrief).is_ok();
+    let state = cx.global_mut::<GuiState>();
+    if state.butler_daemon != alive {
+        state.butler_daemon = alive;
+        if !alive {
+            state.butler_daemon_conn = None;
+        }
+    }
+    if !alive {
+        // 没有守护进程就没有可信数字：宁可显示「未运行」，也不拿旧值冒充。
+        state.brief = None;
+    }
+}
+
+/// 打开管家窗口实体。只跑在管家窗口子进程里：会话真相在 butlerd，
+/// 视图自己连守护进程拿快照（`ButlerView::new`），宿主不掺和。
+fn open_butler_window_view(cx: &mut App, notice: Option<String>) -> Result<()> {
+    let facts = crate::butler::chat::current_facts(chrono::Local::now());
+    let options = WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("MNS · 管家".into()),
+            ..Default::default()
+        }),
+        window_bounds: Some(WindowBounds::centered(size(px(760.), px(640.)), cx)),
+        focus: true,
+        show: true,
+        ..Default::default()
+    };
+    let (handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| butler::ButlerView::new(facts, window, cx))
+    })?;
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
+    let state = cx.global_mut::<GuiState>();
+    state.butler_window = Some(handle);
+    state.butler_view = Some(view.clone());
+    // 带 `--notice` 启动：窗口第一次渲染前就落到那条消息上，避免先空窗
+    // 再跳一下。会话真相要等快照，定位由视图自己等（`pending_notice`）。
+    if let Some(notice_id) = notice {
+        view.update(cx, |view, cx| view.focus_notice(notice_id, cx));
+        // 从系统通知点进来：撤掉宿主的托盘提示（会话已读由 butlerd 在
+        // 挂载帧的 `ChatSeen` 里写）。
+        let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::ButlerSeen);
+    }
+    Ok(())
+}
+
 
 fn spawn_job_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedReceiver<JobEvent>) {
     cx.spawn(async move |cx| {
@@ -2633,10 +2835,44 @@ fn spawn_agent_bridge(cx: &mut App, mut events: tokio::sync::mpsc::UnboundedRece
     .detach();
 }
 
-fn register_actions(cx: &mut App) {
-    // GPUI Kit deliberately leaves cmd-q / cmd-w / alt-f4 to the application
-    // (its own integration test asserts those bindings stay empty). Without an
-    // explicit binding here the menu bar can render but nothing happens.
+/// 宿主进程的动作：只拉起/置前窗口，不直接操作 AppShell 或 agent runtime。
+fn register_host_actions(cx: &mut App) {
+    cx.on_action(|_: &ShowMainWindow, cx| {
+        // 从管家通知点进来时，用户要的是会话窗口，不是主界面。
+        if !notify::take_click_pending() {
+            open_main_from_host(cx, None, false, false);
+        }
+        refresh_tray(cx);
+    });
+    cx.on_action(|_: &ShowAbout, cx| open_main_from_host(cx, None, true, false));
+    cx.on_action(|_: &RefreshData, cx| open_main_from_host(cx, None, false, true));
+    cx.on_action(|_: &OpenPlanPage, cx| open_main_from_host(cx, Some(Page::Plan), false, false));
+    cx.on_action(|_: &OpenAgentPage, cx| open_main_from_host(cx, Some(Page::Agent), false, false));
+    cx.on_action(|_: &OpenButlerWindow, cx| open_butler_from_host(cx));
+    cx.on_action(|_: &OpenHelpCenter, _| {
+        if let Err(error) = open_help_center(None) {
+            eprintln!("启动 mns-help 失败：{error}");
+        }
+    });
+    cx.on_action(|_: &StopButlerDaemon, cx| stop_butler_daemon(cx));
+    cx.on_action(|_: &StartButlerDaemon, cx| start_butler_daemon(cx));
+    cx.on_action(|_: &RestartButlerDaemon, cx| restart_butler_daemon(cx));
+    cx.on_action(|_: &QuitApplication, cx| quit_host(cx));
+
+    // 这些动作只会在主窗口进程里真正执行；宿主这一份是给「菜单栏停在宿主」
+    // 时用的——关闭窗口只需请窗口自己收尾，巡检/任务仍走窗口内的按钮。
+    cx.on_action(|_: &CloseMainWindow, _| {
+        let _ = crate::ipc::poke("mns-gui-window", &crate::ipc::Signal::Shutdown);
+    });
+    cx.on_action(|_: &CloseAgentPanel, _| {});
+    cx.on_action(|_: &RunTodayReview, _| {});
+    cx.on_action(|_: &RunDefaultGoal, _| {});
+    cx.on_action(|_: &StopCurrentTask, _| {});
+}
+
+/// 窗口进程的动作：操作自己进程里的唯一窗口与 AppShell。
+fn register_window_actions(cx: &mut App, with_menu: bool) {
+    // GPUI Kit deliberately leaves cmd-q / cmd-w / alt-f4 to the application.
     let mut bindings = vec![KeyBinding::new(
         "escape",
         CloseAgentPanel,
@@ -2657,55 +2893,36 @@ fn register_actions(cx: &mut App) {
     cx.bind_keys(bindings);
 
     // set_menus reads the keymap to draw the shortcut column, so it must come
-    // after the bindings above. On macOS the first menu is shown under the app
-    // name regardless of the name passed here.
+    // after the bindings above. Only the main window draws a menu bar; the
+    // butler window is a small chat surface.
     #[cfg(target_os = "macos")]
-    cx.set_menus(app_menus());
+    if with_menu {
+        cx.set_menus(app_menus());
+    }
 
-    cx.on_action(|_: &ShowMainWindow, cx| {
-        // 从管家通知点进来时，用户要的是会话窗口，不是主界面：跳过还原主窗口，
-        // 让 `spawn_notification_clicks` 那只手去开管家。
-        if !notify::take_click_pending() {
-            ensure_window(cx);
-            cx.activate(true);
-        }
-        refresh_tray(cx);
-    });
-    cx.on_action(|_: &CloseMainWindow, cx| {
-        // macOS convention for a menu-bar app: dismissing the window hides the
-        // app, the tray stays alive and "打开 MNS" brings it back. Elsewhere
-        // the window really closes; the tray is still the way back in.
-        if cfg!(target_os = "macos") {
-            cx.hide();
-            return;
-        }
-        if let Some(handle) = cx.global::<GuiState>().window.clone() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
-        }
-    });
+    cx.on_action(|_: &ShowMainWindow, cx| activate_any_window(cx));
+    cx.on_action(|_: &CloseMainWindow, cx| close_window(cx));
     cx.on_action(|_: &ShowAbout, cx| {
-        ensure_window(cx);
-        cx.activate(true);
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| {
                 shell.about_open = true;
                 cx.notify();
             });
         }
+        activate_any_window(cx);
     });
     cx.on_action(|_: &RefreshData, cx| {
-        ensure_window(cx);
-        cx.activate(true);
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| shell.refresh(cx));
         }
     });
-    cx.on_action(|_: &OpenPlanPage, cx| open_page(cx, Page::Plan));
-    cx.on_action(|_: &OpenAgentPage, cx| open_page(cx, Page::Agent));
-    cx.on_action(|_: &OpenButlerWindow, cx| open_butler_window(cx));
+    cx.on_action(|_: &OpenPlanPage, cx| navigate_window(cx, Page::Plan));
+    cx.on_action(|_: &OpenAgentPage, cx| navigate_window(cx, Page::Agent));
+    cx.on_action(|_: &OpenButlerWindow, _| {
+        // 管家窗口由宿主拉起；窗口进程只发请求，不自己开第二个。
+        let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::OpenButler);
+    });
     cx.on_action(|_: &RunTodayReview, cx| {
-        ensure_window(cx);
-        cx.activate(true);
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| {
                 shell.navigate(Page::Agent, cx);
@@ -2714,8 +2931,6 @@ fn register_actions(cx: &mut App) {
         }
     });
     cx.on_action(|_: &RunDefaultGoal, cx| {
-        ensure_window(cx);
-        cx.activate(true);
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| shell.start_agent(cx));
         }
@@ -2730,21 +2945,153 @@ fn register_actions(cx: &mut App) {
             eprintln!("启动 mns-help 失败：{error}");
         }
     });
-    cx.on_action(|_: &StopButlerDaemon, _| {
-        // 守护进程收到就退出；它的连接断开后 GUI 会收回通知与巡检。
-        if let Err(error) = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Shutdown) {
-            eprintln!("[mns-gui] 没有在运行的管家进程：{error}");
-        }
-    });
     cx.on_action(|_: &QuitApplication, cx| {
-        if let Some(view) = cx.global::<GuiState>().view.clone() {
-            view.update(cx, |shell, cx| shell.shutdown(cx));
-        }
-        if let Some(tray) = cx.global::<GuiState>().tray.clone() {
-            let _ = tray.close(cx);
-        }
-        cx.quit();
+        // 窗口进程里的 cmd-q / 菜单「退出」：整个程序由托盘宿主拥有，
+        // 先让宿主退出，自己再收尾（`close_window` 负责会话落盘）。
+        let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::Shutdown);
+        close_window(cx);
     });
+}
+
+/// 停止管家守护进程。先手动把状态拉红：断开事件可能晚一拍到达。
+fn stop_butler_daemon(cx: &mut App) {
+    if let Err(error) = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Shutdown) {
+        eprintln!("[mns-gui] 没有在运行的管家进程：{error}");
+    }
+    let state = cx.global_mut::<GuiState>();
+    state.butler_daemon = false;
+    state.butler_daemon_conn = None;
+    state.brief = None;
+    refresh_tray(cx);
+}
+
+fn start_butler_daemon(cx: &mut App) {
+    if crate::ipc::connect("mns-butlerd").is_ok() {
+        cx.global_mut::<GuiState>().butler_daemon = true;
+        request_brief(cx);
+        refresh_tray(cx);
+        return;
+    }
+    if !spawn_butler_daemon_process() {
+        refresh_tray(cx);
+        return;
+    }
+    // 拉起要等它开始监听，但托盘菜单不能再卡主线程：用后台定时器轮询。
+    cx.spawn(async move |cx| {
+        for _ in 0..20 {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if crate::ipc::connect("mns-butlerd").is_ok() {
+                let _ = cx.update(|cx| {
+                    cx.global_mut::<GuiState>().butler_daemon = true;
+                    request_brief(cx);
+                    refresh_tray(cx);
+                });
+                return;
+            }
+        }
+        let _ = cx.update(|cx| refresh_tray(cx));
+    })
+    .detach();
+}
+
+fn restart_butler_daemon(cx: &mut App) {
+    let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Shutdown);
+    {
+        let state = cx.global_mut::<GuiState>();
+        state.butler_daemon = false;
+        state.butler_daemon_conn = None;
+        state.brief = None;
+    }
+    refresh_tray(cx);
+    cx.spawn(async move |cx| {
+        // 等旧进程退出（连接失败）再拉起，避免新人撞上旧监听。
+        for _ in 0..20 {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if crate::ipc::connect("mns-butlerd").is_err() {
+                break;
+            }
+        }
+        if !spawn_butler_daemon_process() {
+            let _ = cx.update(|cx| refresh_tray(cx));
+            return;
+        }
+        for _ in 0..20 {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            if crate::ipc::connect("mns-butlerd").is_ok() {
+                let _ = cx.update(|cx| {
+                    cx.global_mut::<GuiState>().butler_daemon = true;
+                    request_brief(cx);
+                    refresh_tray(cx);
+                });
+                return;
+            }
+        }
+        let _ = cx.update(|cx| refresh_tray(cx));
+    })
+    .detach();
+}
+
+/// 退出整个程序前收拾子进程：窗口先收尾落盘，守护进程再停。
+///
+/// 每条退出路径都一样——菜单「退出 MNS」、Cmd+Q（窗口进程 poke 宿主）、
+/// Dock 右键退出与系统 terminate（宿主 `on_app_quit`）。重复 poke 无害：
+/// 对端已经不在时连接直接失败。
+fn shutdown_children() {
+    // 「退出 MNS」= 退出整个程序：守护进程由宿主拥有，一起收掉（只想停它的
+    // 时候用托盘里的「停止管家进程」）。
+    let _ = crate::ipc::poke("mns-gui-window", &crate::ipc::Signal::Shutdown);
+    let _ = crate::ipc::poke("mns-gui-butler", &crate::ipc::Signal::Shutdown);
+    let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Shutdown);
+}
+
+/// 宿主退出：先让短命窗口自己结束，避免留下没有宿主的孤儿窗口。
+fn quit_host(cx: &mut App) {
+    shutdown_children();
+    if let Some(tray) = cx.global::<GuiState>().tray.clone() {
+        let _ = tray.close(cx);
+    }
+    release_listener(cx);
+    cx.quit();
+}
+
+
+/// 宿主自己的菜单栏。
+///
+/// 窗口子进程是 `Accessory`，macOS 不显示它的菜单栏；宿主是 `Regular`，
+/// 窗口活着时菜单栏仍停在宿主这一份上（系统保留最后一个 Regular 应用的
+/// 菜单），所以这里放的是「不依赖 AppShell 也能做」的动作：打开/关闭窗口、
+/// 更新数据、翻页、管家、帮助、退出。窗口内的今日巡检/自主任务仍有按钮。
+#[cfg(target_os = "macos")]
+fn host_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("MNS").items([
+            MenuItem::action("关于 MNS", ShowAbout),
+            MenuItem::separator(),
+            MenuItem::os_submenu("服务", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("退出 MNS", QuitApplication),
+        ]),
+        Menu::new("文件").items([
+            MenuItem::action("打开主窗口", ShowMainWindow),
+            MenuItem::separator(),
+            MenuItem::action("关闭窗口", CloseMainWindow),
+        ]),
+        Menu::new("操作").items([
+            MenuItem::action("更新数据", RefreshData),
+            MenuItem::separator(),
+            MenuItem::action("本月计划", OpenPlanPage),
+            MenuItem::action("助手结论", OpenAgentPage),
+            MenuItem::action("管家", OpenButlerWindow),
+            MenuItem::separator(),
+            MenuItem::action("帮助中心", OpenHelpCenter),
+        ]),
+    ]
 }
 
 /// Native macOS menu bar. Every item maps to an action registered above;
@@ -2786,22 +3133,11 @@ fn ensure_butler_daemon() -> bool {
     if crate::ipc::connect("mns-butlerd").is_ok() {
         return true;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(dir) = exe.parent() else {
-        return false;
-    };
-    let daemon = dir.join(format!("mns-butlerd{}", std::env::consts::EXE_SUFFIX));
-    if !daemon.exists() {
-        // 单文件开发构建里可能没有这个二进制：退化成 GUI 内巡检，不报错。
-        return false;
-    }
-    if let Err(error) = command(&daemon).spawn() {
-        eprintln!("[mns-gui] 无法启动管家守护进程：{error}");
+    if !spawn_butler_daemon_process() {
         return false;
     }
     // 等它开始监听：判定权交早了会在两边各说一次，交晚了会漏一轮。
+    // 只在宿主启动阶段调用（此时还没有窗口），阻塞主线程可以接受。
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if crate::ipc::connect("mns-butlerd").is_ok() {
@@ -2811,49 +3147,34 @@ fn ensure_butler_daemon() -> bool {
     false
 }
 
-fn open_page(cx: &mut App, page: Page) {
-    ensure_window(cx);
-    cx.activate(true);
-    if let Some(view) = cx.global::<GuiState>().view.clone() {
-        view.update(cx, |shell, cx| shell.navigate(page, cx));
+/// 只负责把守护进程拉起来，不等它监听。菜单动作走这条路，避免卡 UI。
+fn spawn_butler_daemon_process() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let daemon = dir.join(format!("mns-butlerd{}", std::env::consts::EXE_SUFFIX));
+    if !daemon.exists() {
+        // 单文件开发构建里可能没有这个二进制：退化成无守护进程，不报错。
+        eprintln!("[mns-gui] 找不到管家守护进程：{}", daemon.display());
+        return false;
     }
-}
-
-fn ensure_window(cx: &mut App) {
-    if let Some(handle) = cx.global::<GuiState>().window.clone() {
-        if !cx.global::<GuiState>().window_hidden {
-            return;
-        }
-        // 登录自启动留下的隐藏窗口没有跨平台的“显示”接口：保留它的状态，
-        // 移除后按可见参数重建，用户点击「打开 MNS」即可看到窗口。
-        let snapshot = cx
-            .global::<GuiState>()
-            .view
-            .as_ref()
-            .map(|view| view.read(cx).agent_snapshot());
-        {
-            let state = cx.global_mut::<GuiState>();
-            state.snapshot = snapshot;
-            state.window = None;
-            state.window_id = None;
-            state.window_hidden = false;
-        }
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    if let Err(error) = command(&daemon).spawn() {
+        eprintln!("[mns-gui] 无法启动管家守护进程：{error}");
+        return false;
     }
-    let snapshot = cx.global::<GuiState>().snapshot.clone();
-    if let Err(error) = open_main_window(cx, snapshot, true) {
-        eprintln!("[mns-gui] failed to reopen window: {error}");
-    }
+    true
 }
 
 // ─────────────────────────── Tray brief ───────────────────────────
 
 /// What the tray can say without opening a window.
 ///
-/// The tray is a read surface, not a second dashboard and not a control panel
-/// for the agent runtime. Engine advice (derived from the rebalance band) and
-/// the external agent's conclusion are separate fields: a model's opinion must
-/// never read as a rule of the strategy, and neither is a timing signal.
+/// P2 起宿主没有 AppShell：数字由 `mns-butlerd` 算好送回（`brief::BriefData`），
+/// 这里只做排版与状态标记。引擎建议（再平衡带）与守护进程健康是独立字段：
+/// 模型意见不能读成策略规则，账本读取失败也不能读成「账户空了」。
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TrayBrief {
     /// Short label beside the icon in the menu bar.
@@ -2871,10 +3192,9 @@ struct TrayBrief {
     advice: String,
     /// Daily review state.
     review: String,
-    /// External agent conclusion, explicitly labelled.
-    agent_note: Option<String>,
-    /// Whether an agent run is active (controls the run/stop menu item).
-    running: bool,
+    /// 管家进程 + 账本健康的一行状态；`butler_ok == false` 时托盘亮红灯。
+    butler: String,
+    butler_ok: bool,
 }
 
 impl Default for TrayBrief {
@@ -2887,8 +3207,8 @@ impl Default for TrayBrief {
             facts: Vec::new(),
             advice: "打开 MNS 查看账户状态".to_owned(),
             review: "每日巡检：未设置".to_owned(),
-            agent_note: None,
-            running: false,
+            butler: "管家进程：检查中".to_owned(),
+            butler_ok: true,
         }
     }
 }
@@ -2919,7 +3239,7 @@ fn tray_advice_kind(has_signal: bool, has_plan: bool, has_orders: bool) -> Advic
 /// old data must never be upgraded into a fresh "no action" claim.
 fn tray_advice_copy(
     kind: AdviceKind,
-    plan: Option<&PlanView>,
+    plan: Option<&crate::brief::PlanBrief>,
     blocked: Option<&str>,
     stale: bool,
 ) -> (&'static str, String) {
@@ -2980,19 +3300,21 @@ fn tray_line(text: &str, max: usize) -> String {
 }
 
 fn tray_review_line(
-    agent: &AgentState,
+    agent: Option<&AgentState>,
     settings: &AgentSettings,
     last_daily: Option<&str>,
     today: &str,
 ) -> String {
-    if agent.is_running() {
-        return format!("巡检中：{}", tray_line(&agent.detail, 36));
-    }
-    if agent.state == RunState::Failed {
-        return format!(
-            "上次任务失败：{}",
-            tray_line(agent.error.as_deref().unwrap_or("未知错误"), 36)
-        );
+    if let Some(agent) = agent {
+        if agent.is_running() {
+            return format!("巡检中：{}", tray_line(&agent.detail, 36));
+        }
+        if agent.state == RunState::Failed {
+            return format!(
+                "上次任务失败：{}",
+                tray_line(agent.error.as_deref().unwrap_or("未知错误"), 36)
+            );
+        }
     }
     if !settings.daily_review {
         return "每日巡检：未开启".to_owned();
@@ -3005,41 +3327,25 @@ fn tray_review_line(
     }
 }
 
-fn tray_brief(
-    data: Option<&Snapshot>,
-    load_error: Option<&str>,
-    agent: &AgentState,
-    settings: &AgentSettings,
-    last_daily: Option<&str>,
-    day_label: &str,
-    today: &str,
-) -> TrayBrief {
+fn tray_brief_from(data: Option<&crate::brief::BriefData>, day_label: &str) -> TrayBrief {
     let mut brief = TrayBrief::default();
     brief.day_label = day_label.to_owned();
-    brief.running = agent.is_running();
-    brief.review = tray_review_line(agent, settings, last_daily, today);
-    brief.agent_note = agent
-        .decision
-        .as_ref()
-        .map(|report| format!("助手结论：{}", tray_line(&report.headline(), 42)));
 
-    if let Some(error) = load_error {
+    let Some(data) = data else {
+        return brief;
+    };
+    if let Some(error) = &data.load_error {
         brief.title = "MNS · 读取失败".to_owned();
         brief.as_of = "本地数据不可用".to_owned();
         brief.advice = format!("读取失败：{}", tray_line(error, 48));
         brief.tooltip = format!("Money Never Sleeps · {}", brief.advice);
         return brief;
     }
-
-    let Some(data) = data else {
+    if data.as_of.is_empty() {
         return brief;
-    };
-    brief.as_of = format!(
-        "数据截至 {} · {}",
-        data.as_of.format("%Y-%m-%d"),
-        data.freshness.summary()
-    );
+    }
 
+    brief.as_of = format!("数据截至 {} · {}", data.as_of, data.freshness);
     brief.facts.push(format!(
         "总资产 {} · XIRR {}",
         money(data.total_assets),
@@ -3055,7 +3361,7 @@ fn tray_brief(
     } else {
         brief
             .facts
-            .push(format!("风险仓位 {}", pct_points(data.risk_weight_pct())));
+            .push(format!("风险仓位 {}", pct_points(data.risk_weight_pct)));
     }
     if let Some(signal) = &data.signal {
         brief.facts.push(format!(
@@ -3067,7 +3373,7 @@ fn tray_brief(
             } else {
                 "区间未确认"
             },
-            data.config.decision_label,
+            data.decision_label,
         ));
     } else {
         brief
@@ -3077,16 +3383,15 @@ fn tray_brief(
 
     // Sunday prices are legitimately a day old, so staleness is a caveat on
     // the advice rather than a verdict that replaces it.
-    let stale = data.freshness.price_is_stale()
+    let stale = data.price_stale
         || data
-            .freshness
             .fgi_age_days
             .map(|days| days >= 1)
             .unwrap_or(true);
     let kind = tray_advice_kind(
         data.signal.is_some(),
         data.plan.is_some(),
-        data.plan.as_ref().is_some_and(|plan| plan.has_orders()),
+        data.plan.as_ref().is_some_and(|plan| plan.has_orders),
     );
     let (label, advice) = tray_advice_copy(
         kind,
@@ -3101,9 +3406,11 @@ fn tray_brief(
 }
 
 fn setup_tray(cx: &mut App) -> gpui_tray::Result<()> {
+    // 菜单栏里只放图标，文字放 tooltip：macOS 26 会把放不下的状态项整项藏进
+    // 溢出区（本机菜单栏够挤，加一个「MNS · 待调仓」就直接看不见图标了）。
+    // 22pt 的图标在任何菜单栏里都放得下，结论文字进 tooltip 与菜单首行。
     let tray = Tray::builder()
         .icon(tray_icon()?)
-        .title("MNS")
         .tooltip("Money Never Sleeps · 正在读取本地数据")
         .on_activate(ShowMainWindow)
         .menu(build_tray_menu)
@@ -3112,41 +3419,68 @@ fn setup_tray(cx: &mut App) -> gpui_tray::Result<()> {
     Ok(())
 }
 
-/// The window may be hidden or closed; `GuiState` keeps the view alive, so the
-/// tray still reads the same account state the dashboard would show.
+/// Host tray brief: numbers come from butlerd, status from GuiState.
 fn current_tray_brief(cx: &mut App) -> TrayBrief {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     const WEEKDAYS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
     let weekday = WEEKDAYS[now.weekday().num_days_from_monday() as usize];
     let day_label = format!("今日 {} 周{}", now.format("%m-%d"), weekday);
-    let Some(view) = cx.global::<GuiState>().view.clone() else {
-        return TrayBrief::default();
+
+    let state = cx.global::<GuiState>();
+    let daemon = state.butler_daemon;
+    // 健康文件只在守护进程每次 wake/brief 时刷新；超过 10 分钟没更新说明
+    // 它要么刚起来还没答话，要么卡住了——两种都别拿旧结论当现状。
+    let health = crate::butler::orchestrator::read_health().filter(|health| {
+        chrono::Local::now()
+            .signed_duration_since(health.at)
+            .num_minutes()
+            < 10
+    });
+    let (butler, butler_ok) = match (daemon, health) {
+        (false, _) => ("管家进程：未运行".to_owned(), false),
+        (true, Some(health)) if !health.ledger_ok => (
+            format!(
+                "管家进程：运行中 · 账本读取失败：{}",
+                tray_line(health.error.as_deref().unwrap_or("未知原因"), 48)
+            ),
+            false,
+        ),
+        (true, Some(_)) => ("管家进程：运行中 · 账本正常".to_owned(), true),
+        (true, None) => ("管家进程：运行中".to_owned(), true),
     };
-    let shell = view.read(cx);
-    tray_brief(
-        shell.data.as_ref(),
-        shell.load_error.as_deref(),
-        &shell.agent,
-        &shell.agent_settings,
-        shell.last_daily.as_deref(),
-        &day_label,
-        &today,
-    )
+
+    let review = tray_review_line(None, &load_settings(), read_last_daily().as_deref(), &today);
+    let mut brief = tray_brief_from(state.brief.as_ref(), &day_label);
+    brief.review = review;
+    brief.butler = butler;
+    brief.butler_ok = butler_ok;
+    brief
 }
 
 /// Rebuild every tray surface together. `refresh_menu` alone would leave the
-/// menu bar label and the tooltip showing yesterday's conclusion.
+/// old tooltip behind after a state change.
 fn refresh_tray(cx: &mut App) {
     let Some(tray) = cx.global::<GuiState>().tray.clone() else {
         return;
     };
     let brief = current_tray_brief(cx);
-    let _ = tray.set_title(Some(brief.title.clone()), cx);
-    let _ = tray.set_tooltip(Some(brief.tooltip.clone()), cx);
+    // 图标不带文字（见 `setup_tray`）：结论压在 tooltip 里，鼠标停一下就看见。
+    let _ = tray.set_tooltip(Some(format!("{} · {}", brief.title, brief.tooltip)), cx);
 
-    // The title/tooltip setters are cheap no-ops when unchanged; recompiling
-    // the native menu is not, so it only happens on a real state change.
+    // 红灯：管家进程不在或账本读不出来。图标只在翻转时更新。
+    let alert = !brief.butler_ok;
+    if cx.global::<GuiState>().tray_alert != alert {
+        cx.global_mut::<GuiState>().tray_alert = alert;
+        if let Ok(icon) = tray_icon_alert(alert) {
+            let _ = tray.set_icon(icon, cx);
+        }
+        // Dock 图标与托盘红灯同一判断，只是换一个不会被菜单栏溢出的落点。
+        set_dock_alert(alert);
+    }
+
+    // The tooltip setter is a cheap no-op when unchanged; recompiling the
+    // native menu is not, so it only happens on a real state change.
     let changed = cx.global::<GuiState>().last_tray_brief.as_ref() != Some(&brief);
     if changed {
         cx.global_mut::<GuiState>().last_tray_brief = Some(brief);
@@ -3164,6 +3498,7 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
 
     let mut items = vec![
         tray_info(brief.day_label.clone()),
+        tray_info(tray_line(&brief.butler, 64)),
         tray_info(tray_line(&brief.as_of, 64)),
     ];
     for fact in &brief.facts {
@@ -3177,16 +3512,8 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
 
     items.push(MenuItem::separator());
     items.push(tray_info(tray_line(&brief.review, 64)));
-    if let Some(note) = &brief.agent_note {
-        items.push(MenuItem::action(tray_line(note, 64), OpenAgentPage));
-    }
-    if brief.running {
-        items.push(MenuItem::action("停止当前任务", StopCurrentTask));
-    } else {
-        items.push(MenuItem::action("立即巡检", RunTodayReview));
-    }
 
-    items.push(MenuItem::separator());
+    // 管家入口：有未读就先显示最后一条，点进去看全部。
     let notice = cx.global::<GuiState>().butler_notice.clone();
     if let Some(notice) = notice {
         items.push(MenuItem::action(
@@ -3204,16 +3531,22 @@ fn build_tray_menu(cx: &mut App) -> Vec<MenuItem> {
         };
         items.push(MenuItem::action(label, OpenButlerWindow));
     }
+
+    // 守护进程状态与启停：托盘是唯一还能操作它的界面。
+    items.push(MenuItem::separator());
+    let daemon = cx.global::<GuiState>().butler_daemon;
+    if daemon {
+        items.push(MenuItem::action("停止管家进程", StopButlerDaemon));
+        items.push(MenuItem::action("重启管家进程", RestartButlerDaemon));
+    } else {
+        items.push(MenuItem::action("启动管家进程", StartButlerDaemon));
+    }
+
     items.push(MenuItem::separator());
     items.push(MenuItem::action("更新数据", RefreshData));
     items.push(MenuItem::action("打开 MNS", ShowMainWindow));
     items.push(MenuItem::action("帮助中心", OpenHelpCenter));
     items.push(MenuItem::action("关于 MNS", ShowAbout));
-    // 守护进程在跑时给它一个明确的出口：关掉 GUI 它仍然常驻，用户想彻底
-    // 停下来不该只能靠命令行 kill。
-    if cx.global::<GuiState>().butler_daemon {
-        items.push(MenuItem::action("停止管家进程", StopButlerDaemon));
-    }
     items.push(MenuItem::action("退出 MNS", QuitApplication));
     items
 }
@@ -3274,6 +3607,12 @@ fn help_command(dir: &std::path::Path, target: Option<&str>) -> std::process::Co
 }
 
 fn tray_icon() -> gpui_tray::Result<Icon> {
+    tray_icon_alert(false)
+}
+
+/// 托盘图标。`alert = true` 时把同一张位图染成红色（premultiplied α 的
+/// 红通道保留原 α），位置与尺寸都不变，用户不必先点开菜单才知道管家挂了。
+fn tray_icon_alert(alert: bool) -> gpui_tray::Result<Icon> {
     // Bitmaps are generated from `assets/app_icon.png` by `scripts/make-icons.swift`.
     // The menu bar renders ~22pt tall, so a larger bitmap would be scaled down by
     // the platform and lose the gauge entirely.
@@ -3287,8 +3626,61 @@ fn tray_icon() -> gpui_tray::Result<Icon> {
     #[cfg(not(target_os = "macos"))]
     let rgba: &[u8] = include_bytes!("../../assets/tray-32.rgba");
 
-    Icon::from_rgba(rgba.to_vec(), SIZE, SIZE).build()
+    let mut pixels = rgba.to_vec();
+    if alert {
+        for pixel in pixels.chunks_exact_mut(4) {
+            // 位图是 premultiplied α：直接用 α 当红色分量才不会被平台再乘一次。
+            pixel[0] = pixel[3];
+            pixel[1] = 0;
+            pixel[2] = 0;
+        }
+    }
+    Icon::from_rgba(pixels, SIZE, SIZE).build()
 }
+
+/// 把管家异常画到 Dock 图标上（`false` 恢复默认应用图标）。
+///
+/// 菜单栏状态项可能被系统整个藏进溢出区，Dock 是系统级稳定落点：红点不占
+/// 菜单栏宽度，也不依赖托盘是否可见。只有宿主是 `Regular` 时才有 Dock 图标，
+/// 所以必须由宿主调用；AppKit 只能在主线程碰，调用点都在 GPUI 的 update 里。
+///
+/// 这里换整枚图标而不是 `NSDockTile.badgeLabel`：文字角标走的是 per-bundle
+/// 的 Dock 通道，在跑过多份副本（DMG 挂载、临时构建）的机器上会一直不刷新；
+/// `applicationIconImage` 走图标通道，Dock 每次都会重绘。
+#[cfg(target_os = "macos")]
+fn set_dock_alert(alert: bool) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSData;
+
+    // SAFETY: `sharedApplication` 一定存在（GPUI 已经建好 App）；图标是编译期
+    // 常量，NSImage 自己持有解出来的位图；`alloc` 出来的对象最后 release。
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let image: *mut AnyObject = if alert {
+            let data = NSData::with_bytes(include_bytes!("../../assets/icon-dock-alert.png"));
+            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            msg_send![image, initWithData: &*data as *const NSData as *mut AnyObject]
+        } else {
+            // nil 让 AppKit 回到 bundle 里的默认图标。
+            std::ptr::null_mut()
+        };
+        let _: () = msg_send![app, setApplicationIconImage: image];
+        if !image.is_null() {
+            let _: () = msg_send![image, release];
+        }
+        eprintln!(
+            "[mns-gui] Dock 图标：{}",
+            if alert { "管家异常" } else { "恢复正常" }
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_alert(_alert: bool) {}
 
 /// The app mark, embedded so the window never depends on the working directory.
 pub(crate) fn brand_mark(size: f32) -> impl IntoElement {
@@ -3300,7 +3692,7 @@ pub(crate) fn brand_mark(size: f32) -> impl IntoElement {
     img(Arc::new(image)).w(px(size)).h(px(size)).flex_none()
 }
 
-fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>, visible: bool) -> Result<()> {
+fn open_main_window(cx: &mut App, page: Option<Page>, about: bool) -> Result<()> {
     let jobs = cx
         .global::<GuiState>()
         .jobs
@@ -3312,31 +3704,22 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>, visible: bool)
             ..Default::default()
         }),
         window_bounds: Some(WindowBounds::centered(size(px(1180.), px(720.)), cx)),
-        // 登录自启动时窗口只作为界面状态的载体，不显示、不抢焦点。
-        focus: visible,
-        show: visible,
+        focus: true,
+        show: true,
         ..Default::default()
     };
     let (window_handle, view) = gpui_kit::open_window(options, cx, move |window, cx| {
         window.on_window_should_close(cx, |_window, cx| {
-            if cfg!(target_os = "macos") {
-                cx.hide();
-                return false;
+            // 关窗即退：先把 ACP 会话收尾并落盘，再让 LastWindowClosed
+            // 结束整个窗口进程。
+            if let Some(view) = cx.global::<GuiState>().view.clone() {
+                view.update(cx, |shell, cx| shell.shutdown(cx));
             }
-            let snapshot = cx
-                .global::<GuiState>()
-                .view
-                .as_ref()
-                .map(|view| view.read(cx).agent_snapshot());
-            let state = cx.global_mut::<GuiState>();
-            state.snapshot = snapshot;
-            state.window = None;
-            state.window_id = None;
             true
         });
         let jobs_for_view = jobs.clone();
         cx.new(|cx| {
-            let mut shell = AppShell::new(window, cx, jobs_for_view, restore);
+            let mut shell = AppShell::new(window, cx, jobs_for_view, page, about);
             // Load the account immediately; the shell shows its skeleton until
             // the worker answers, never a fabricated zero balance. The archive
             // index is a separate, small directory read on the same worker.
@@ -3349,7 +3732,6 @@ fn open_main_window(cx: &mut App, restore: Option<ShellSnapshot>, visible: bool)
     })?;
     let state = cx.global_mut::<GuiState>();
     state.window = Some(window_handle.clone());
-    state.window_id = Some(window_handle.window_id());
     state.view = Some(view);
     Ok(())
 }
@@ -3655,8 +4037,8 @@ impl AppShell {
         )
     }
 
-    /// "关于 MNS" lives in the macOS app menu, which stays reachable while the
-    /// window is hidden; `ensure_window` opens it before this panel appears.
+    /// "关于 MNS" lives in the macOS app menu. The host raises the main
+    /// window process with `--about`, which sets `about_open` at construction.
     fn about_layer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.about_open {
             return None;
@@ -4461,22 +4843,19 @@ mod tray_tests {
     // Explicit imports, not `use super::*`: gpui_kit re-exports an attribute
     // macro also named `test`, which would shadow the built-in `#[test]`.
     use super::{
-        AdviceKind, AgentSettings, AgentState, PlanView, tray_advice_copy, tray_advice_kind,
-        tray_line, tray_review_line,
+        AdviceKind, AgentSettings, AgentState, tray_advice_copy, tray_advice_kind, tray_line,
+        tray_review_line,
     };
+    use crate::brief::PlanBrief;
 
-    fn plan(total_buy: f64, total_sell: f64, band_pp: f64) -> PlanView {
-        PlanView {
-            monthly: 3000.0,
-            score: 50.0,
-            target_risk_pct: 60.0,
+    fn plan(total_buy: f64, total_sell: f64, band_pp: f64) -> PlanBrief {
+        PlanBrief {
             current_risk_pct: 58.0,
+            target_risk_pct: 60.0,
             band_pp,
             total_buy,
             total_sell,
-            estimated_fees: 0.0,
-            cash_constrained: false,
-            legs: Vec::new(),
+            has_orders: total_buy.abs() >= 1.0 || total_sell.abs() >= 1.0,
         }
     }
 
@@ -4534,21 +4913,21 @@ mod tray_tests {
 
     #[test]
     fn review_state_reflects_the_schedule() {
-        let agent = AgentState::new(None);
+        let agent = AgentState::new();
         let mut settings = AgentSettings::default();
         settings.daily_review = true;
         settings.daily_review_time = "08:30".to_owned();
         assert_eq!(
-            tray_review_line(&agent, &settings, None, "2026-11-09"),
+            tray_review_line(Some(&agent), &settings, None, "2026-11-09"),
             "每日巡检 08:30 · 今日待触发"
         );
         assert_eq!(
-            tray_review_line(&agent, &settings, Some("2026-11-09"), "2026-11-09"),
+            tray_review_line(Some(&agent), &settings, Some("2026-11-09"), "2026-11-09"),
             "每日巡检 08:30 · 今日已触发"
         );
         settings.daily_review = false;
         assert_eq!(
-            tray_review_line(&agent, &settings, None, "2026-11-09"),
+            tray_review_line(Some(&agent), &settings, None, "2026-11-09"),
             "每日巡检：未开启"
         );
     }

@@ -1,10 +1,12 @@
 //! 管家独立窗口：人设化文本会话，与助手页互不共享存档。
 //!
-//! 这一层只做三件事：把管家已授权的结论摆出来，把用户的话接住，以及把
-//! agent 的回答**边生成边流出来**——正文逐段上屏，收尾才落成正式消息。它不
-//! 判断「该不该说」——那是 `butler::orchestrator` 的职责；也不改写数字——
-//! 模板文案来自同源账本。外接 ACP 表达层接入后，只替换这里的回复来源。
+//! P4 起这是一层**薄客户端**：会话的真相（存档、回合、事件流）全在
+//! `mns-butlerd` 的 `butler::chat` 服务里。窗口只做三件事：把快照摆出来、
+//! 把用户的话递过去、把流式增量逐段上屏。它不判断「该不该说」，不写
+//! `conversation.json`，也不持有 ACP runtime——关窗即 detach，正在回答的
+//! 一轮在守护进程里照常收完落盘，重开窗口拿一帧全量快照就能追上。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{Local, Timelike};
@@ -13,237 +15,96 @@ use gpui_kit::base::StyledExt;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants};
 use gpui_kit::component::input::{Enter, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::Disableable;
 use gpui_kit::*;
 
-use crate::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource};
-use crate::butler::events::{self, page_label};
+use crate::butler::chat::{self, ChatSnapshotData};
 use crate::butler::expression;
-use crate::butler::memory::{self, Fact, Forgot, Memory, Remembered};
+use crate::butler::orchestrator;
 use crate::butler::talk;
-use crate::butler::{AccountFacts, Message, Role, Session, SpeakCandidate};
+use crate::butler::{AccountFacts, Message, Role, Session};
+use crate::ipc::{self, Signal};
 
 use super::components::{dot, pill, watermark};
 use super::theme::*;
-use super::{AppShell, GuiState};
 
-/// 一轮问答的等待上限。
+/// 宿主是否在线（窗口拉起时 `announce_to_host` 的连接结果）。
 ///
-/// 实测一次完整查账（agent 自己去跑几条 `mns` 只读命令）约 60–70 秒，
-/// 所以留到 120 秒。到点必须收尾：界面停在「正在想」、而用户又不能再提问，
-/// 比给一个半截答案更糟。
-const CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 离线横幅的「重试」按钮依赖宿主拉起守护进程——窗口自己不 spawn 进程，
+/// 宿主也不在线时点它没有意义，置灰。
+static HOST_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// 记录宿主在线。窗口进程启动时连上宿主后调用一次。
+pub(crate) fn mark_host_alive() {
+    HOST_ALIVE.store(true, Ordering::Relaxed);
+}
+
+fn host_alive() -> bool {
+    HOST_ALIVE.load(Ordering::Relaxed)
+}
 
 /// 账本数字的重算节奏。管家窗口常开，用户不该为了「几点了、偏离多少」去
-/// 点一个按钮：每 60 秒跟主界面重算一次事实，没有变化就不重绘。
+/// 点一个按钮：每 60 秒重算一次事实，没有变化就不重绘。
 const FACTS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 从主窗口已有的快照提取管家事实。不读数据库：窗口打开时主界面已经加载
-/// 过一遍，管家不该再走第二条读路径。
-pub(crate) fn facts_for(shell: &AppShell, now: chrono::DateTime<Local>) -> AccountFacts {
-    let Some(snapshot) = shell.data.as_ref() else {
-        return AccountFacts::default();
-    };
-    let mut facts = AccountFacts::from_snapshot(snapshot, now);
-    if let Ok(memory) = Memory::load() {
-        facts = facts.with_promises(&memory, now.date_naive());
-    }
-    let since = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|naive| naive.and_local_timezone(Local).single())
-        .unwrap_or(now);
-    let window = events::summarize(&events::read_all().unwrap_or_default(), since);
-    if let Some((page, views)) = window.page_views.iter().max_by_key(|(_, views)| **views)
-        && window.is_heavy_checking(page)
-    {
-        facts.heavy_page = Some((page_label(page).to_owned(), *views));
-    }
-    facts
-}
-
-/// 一轮问答的等待状态。抽出来是因为它能脱离真实进程测：`begin` 挡住并发
-/// 提问，`take` 只让还在等的那一轮收下正文，`abandon` 让清空会话后的迟到
-/// 正文落不进来。
-#[derive(Default)]
-struct TurnState {
-    /// 本轮提问的序号。用户换话题就加一，迟到的回答按序号丢弃——
-    /// 旧答案插进新话题里比不回答更让人困惑。
-    turn: u64,
-    /// 等待 agent 回答中。
-    waiting: bool,
-    /// 当前这一轮累积的正文。只收 Message，不收思考、计划与工具调用。
-    /// 边收边进流式气泡；`take` 收尾时整体过一遍校验才落成正式消息。
-    buffer: String,
-    /// 这一问的本地模板：agent 失败、超时、越界，都回到它。
-    template: String,
-}
-
-impl TurnState {
-    /// 开始新的一轮。返回 false 说明上一条还没回完。
-    fn begin(&mut self, template: String) -> bool {
-        if self.waiting {
-            return false;
-        }
-        self.turn = self.turn.wrapping_add(1);
-        self.template = template;
-        self.buffer.clear();
-        self.waiting = true;
-        true
-    }
-
-    fn push(&mut self, text: &str) {
-        if self.waiting {
-            self.buffer.push_str(text);
-        }
-    }
-
-    /// 流式上屏的正文：等待中且已有一段，才值得画生长中的气泡。半截正文
-    /// 不算「回答」，`take` 收尾后才落成正式消息。
-    fn streaming_text(&self) -> Option<&str> {
-        (self.waiting && !self.buffer.is_empty()).then_some(self.buffer.as_str())
-    }
-
-    /// 收下这一轮的正文与模板。返回 `None` 表示这一轮已经作废。
-    fn take(&mut self) -> Option<(String, String)> {
-        if !self.waiting {
-            return None;
-        }
-        self.waiting = false;
-        Some((
-            std::mem::take(&mut self.buffer),
-            std::mem::take(&mut self.template),
-        ))
-    }
-
-    /// 丢弃这一轮：会话被清空时用。
-    fn abandon(&mut self) {
-        self.turn = self.turn.wrapping_add(1);
-        self.waiting = false;
-        self.buffer.clear();
-        self.template.clear();
-    }
-}
-
-/// 管家对话的 ACP 会话。
+/// 点系统通知进来时要落到的那一条。
 ///
-/// 每个管家窗口持有**独立**的 runtime：GUI 里已经有一个给每日复盘用的
-/// runtime，而 `AgentCommand::Start` 在当前任务未结束时直接拒绝，复用会让
-/// 管家和复盘互相抢会话。窗口关闭时发 `Shutdown`，线程随之结束。
-///
-/// MNS 不持有推理端点与密钥：provider、模型、凭据都在外部 agent 自己的
-/// 配置里，这里只递一段账本上下文和一句提问。
-struct Chat {
-    handle: AgentHandle,
-    /// 是否已经开过会话。第一问要带人设与账本事实，之后复用同一 session。
-    started: bool,
-}
-
-impl Chat {
-    fn spawn() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-        let (handle, events) = crate::agent::start_runtime();
-        (
-            Self {
-                handle,
-                started: false,
-            },
-            events,
-        )
-    }
-}
-
-/// 管家会话的 agent 设置。
-///
-/// 工作目录固定到管家自己的数据目录：opencode 会读取工作目录下的
-/// `AGENTS.md`，落在项目仓库里时它会把「每日复盘」那套项目约定带进来
-/// （实测会多吐一段 `mns-decision` 块，和正文重复）。管家不处理文件，
-/// 也不该继承那套契约。
-fn chat_settings() -> crate::agent::AgentSettings {
-    let mut settings = crate::agent::load_settings();
-    let dir = crate::config::app_data_dir().join("agent").join("butler");
-    let _ = std::fs::create_dir_all(&dir);
-    settings.working_dir = dir.to_string_lossy().into_owned();
-    settings
+/// `index` 是 `session.messages` 里的位置；通知已经不在会话里（被 200 条上限
+/// 裁掉、或宿主还没写入）时为 `None`，这时界面上仍保留一条上下文横幅，
+/// 但不假装能滚到某一行。
+struct NoticeFocus {
+    index: Option<usize>,
+    at: Option<chrono::DateTime<Local>>,
+    text: Option<String>,
 }
 
 pub(crate) struct ButlerView {
+    /// 会话的**展示副本**：真相在 butlerd，每帧快照整帧替换。
     session: Session,
-    memory: Memory,
-    /// 记忆文件读不出来时只读不写，避免用空记忆覆盖用户原有条目。
-    memory_readable: bool,
     facts: AccountFacts,
     input: Entity<TextareaState>,
     scroll: ScrollHandle,
     error: Option<String>,
     clear_armed: bool,
-    /// 关掉后所有写入只留在内存里。窗口正常打开时是 `true`；测试注入
-    /// 会话时是 `false`，避免为了验证一段文案去改真实账户目录。
-    persist: bool,
-    /// ACP 对话会话。`None` 只出现在测试注入的窗口里：验证不该真去起一个
-    /// 外部 agent 进程。
-    chat: Option<Chat>,
-    /// 当前这一轮的等待状态。放在视图层而不是 `Chat` 里：流式上屏后渲染
-    /// 每帧都要读它，测试也要能不启进程就驱动它。
-    turn: TurnState,
-    /// 事件接收端。由打开窗口的一方取走并挂到 GPUI 的异步任务上——
-    /// 构造期拿不到 `Entity`，所以先存在这里。
-    chat_events: Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>,
+    /// 会话连接的发送端。`None` = 离线（守护进程没在跑或刚断开）。
+    outbox: Option<tokio::sync::mpsc::UnboundedSender<Signal>>,
+    online: bool,
+    /// 「重试」进行中：横幅换成正在连接，按钮置灰防连点。
+    retrying: bool,
+    /// 快照里的等待态：一轮问答在守护进程里进行中。等待期间输入框禁用——
+    /// 并发提问会被守护进程明确拒绝，与其把话递过去再退回来，不如不收。
+    waiting: bool,
+    /// 流式中的半截正文：`ChatDelta` 逐段累进，快照整帧替换。
+    stream_buffer: String,
+    /// 被拒/断线时没递出去的话：render 时放回输入框（`set_value` 需要
+    /// `&mut Window`，只能在渲染阶段应用）。
+    pending_restore: Option<String>,
+    /// 点系统通知进来时要定位的那条。等快照解析：会话真相到了才能定位。
+    pending_notice: Option<String>,
+    /// `pending_notice` 已经等过的快照帧数，防无限等待。
+    pending_notice_frames: u32,
+    /// 最近一帧快照的服务实例。`None` = 还没收到过任何快照。
+    snapshot_instance: Option<u64>,
     /// 回答来源的一行说明。只在退回模板时出现，避免每句都挂个来源标签。
     hint: Option<String>,
+    /// 从系统通知点进来的那一条。窗口开着时再点一次会换到这里，不重开。
+    notice_focus: Option<NoticeFocus>,
 }
 
 impl ButlerView {
+    /// 真实窗口。会话真相在守护进程那边：这里从空副本起步，第一帧快照
+    /// 到了才有内容可画；守护进程不在就画一条离线横幅。
     pub(crate) fn new(facts: AccountFacts, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let now = Local::now();
-        // 存档损坏时**不**覆盖原文件：那可能是用户唯一的一份对话记录。
-        // 本次只留在内存里，并把原因摆到界面上。
-        let view = match Session::load() {
-            Ok(mut session) => {
-                // 打开即视为已读：未读数只用于托盘提示，不是红点游戏。
-                session.mark_read(now);
-                let _ = session.save();
-                let mut view = Self::with_session(session, facts, window, cx).with_agent();
-                view.persist = true;
-                match Memory::load() {
-                    Ok(memory) => view.memory = memory,
-                    Err(error) => {
-                        view.memory_readable = false;
-                        view.error = Some(format!("记忆文件读取失败，本次只读不写：{error:#}"));
-                    }
-                }
-                view
-            }
-            Err(error) => {
-                let mut session = Session::default();
-                session.mark_read(now);
-                let mut view = Self::with_session(session, facts, window, cx).with_agent();
-                view.error = Some(format!(
-                    "会话存档读取失败，本次对话不会覆盖原文件：{error:#}"
-                ));
-                view
-            }
-        };
+        let view = Self::with_session(Session::default(), facts, window, cx);
         // 数字自动跟随主界面：没有手动刷新按钮。
         view.start_facts_refresh(cx);
+        // 会话连接：挂上拿快照，断开即离线横幅。
+        view.start_link(cx);
         view
     }
 
-    /// 挂上 ACP 会话。只有真实窗口走这条：测试注入的会话不启进程。
-    fn with_agent(mut self) -> Self {
-        let (chat, events) = Chat::spawn();
-        self.chat = Some(chat);
-        self.chat_events = Some(events);
-        self
-    }
-
-    /// 打开窗口的一方取走事件流，挂到 GPUI 的异步任务上。
-    pub(crate) fn take_chat_events(
-        &mut self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>> {
-        self.chat_events.take()
-    }
-
-    /// 会话来源与磁盘解耦：测试要的是「发送后会话与输入框的状态」，
-    /// 不该顺带读写真实账户目录。
+    /// 会话来源与守护进程解耦：测试要的是「快照到了会话与输入框的状态」，
+    /// 不该连本地通道、也不该定时重算事实。
     fn with_session(
         session: Session,
         facts: AccountFacts,
@@ -260,87 +121,355 @@ impl ButlerView {
         });
         Self {
             session,
-            memory: Memory::default(),
-            memory_readable: true,
             facts,
             input,
             scroll: ScrollHandle::new(),
             error: None,
             clear_armed: false,
-            persist: false,
-            chat: None,
-            turn: TurnState::default(),
-            chat_events: None,
+            outbox: None,
+            online: false,
+            retrying: false,
+            waiting: false,
+            stream_buffer: String::new(),
+            pending_restore: None,
+            pending_notice: None,
+            pending_notice_frames: 0,
+            snapshot_instance: None,
             hint: None,
+            notice_focus: None,
         }
     }
 
-    /// 托盘/定时巡检判定开口后，把结论送进已经打开的窗口。
+    /// 落到某条通知上：滚动到对应消息并高亮，窗口顶部留一条上下文横幅。
     ///
-    /// `seen` 只在窗口真的是当前焦点时为 true：窗口存在但不活跃（在后面、
-    /// 最小化、⌘W 隐藏）时，消息要保留未读并继续走横幅，不能悄悄算已读。
-    pub(crate) fn receive(&mut self, candidate: &SpeakCandidate, seen: bool) {
-        let now = Local::now();
-        self.session.push(Message {
-            at: now,
-            role: Role::Butler,
-            text: candidate.draft.clone(),
-            reason: Some(candidate.reason),
-            trigger: Some(candidate.trigger.clone()),
+    /// 会话真相在 butlerd：这里先记下要定位的 id，用当前副本试着解析；
+    /// 副本里还没有（窗口刚开、快照未到）就等下一帧快照，到了再解析。
+    pub(crate) fn focus_notice(&mut self, notice_id: String, cx: &mut Context<Self>) {
+        self.pending_notice = Some(notice_id);
+        self.pending_notice_frames = 0;
+        self.resolve_pending_notice(cx);
+    }
+
+    /// 解析等定位的通知。定位不到就等下一帧快照——但最多等两帧：第一帧
+    /// 可能是挂载帧，待并积压还没并进会话；两帧之后仍没有，送达审计里的
+    /// 原文（或「已不在会话里」）就是最终答案，不能无限等下去。
+    fn resolve_pending_notice(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_notice.clone() else {
+            return;
+        };
+        let index = notice_index(&self.session.messages, &id);
+        if index.is_none() && self.pending_notice_frames < 2 {
+            return;
+        }
+        // 会话里找得到就用会话；找不到时送达审计（notices.jsonl）里可能
+        // 还留着原文——被 200 条上限裁掉的旧通知靠它给出横幅文案。
+        let delivered = index
+            .is_none()
+            .then(|| orchestrator::delivered_notice(&id))
+            .flatten();
+        let at = index
+            .and_then(|index| self.session.messages.get(index).map(|message| message.at))
+            .or_else(|| delivered.as_ref().and_then(|event| event.notice_at));
+        let text = index
+            .and_then(|index| {
+                self.session
+                    .messages
+                    .get(index)
+                    .map(|message| message.text.clone())
+            })
+            .or_else(|| delivered.as_ref().and_then(|event| event.draft.clone()));
+        if let Some(index) = index {
+            self.scroll.scroll_to_top_of_item(index);
+        }
+        self.pending_notice = None;
+        self.notice_focus = Some(NoticeFocus {
+            index,
+            at,
+            text,
         });
-        if seen {
-            self.session.mark_read(now);
-        }
-        let _ = self.persist();
-        self.scroll.scroll_to_bottom();
+        cx.notify();
     }
 
-    /// 接收守护进程判定过的开口。
-    ///
-    /// 守护进程只往 `pending.jsonl` 追加，会话始终由 GUI 写——两个进程同时
-    /// 写一份 JSON 迟早会互相覆盖。
-    ///
-    /// 返回是否落盘成功：调用方要据此决定能不能推进 pending 偏移，否则
-    /// 保存失败时消息已丢、偏移已过，不会重投。
-    pub(crate) fn receive_notice(
-        &mut self,
-        notice: &crate::butler::orchestrator::Notice,
-        seen: bool,
-    ) -> bool {
-        self.session.push(Message {
-            at: notice.at,
-            role: Role::Butler,
-            text: notice.draft.clone(),
-            reason: Some(notice.reason),
-            trigger: Some(notice.trigger.clone()),
-        });
-        if seen {
-            self.session.mark_read(Local::now());
-        }
-        let saved = self.persist();
-        self.scroll.scroll_to_bottom();
-        saved
+    fn dismiss_notice(&mut self, cx: &mut Context<Self>) {
+        self.notice_focus = None;
+        cx.notify();
     }
 
-    fn persist(&mut self) -> bool {
-        if !self.persist {
-            return true;
-        }
-        match self.session.save() {
-            Ok(()) => true,
-            Err(error) => {
-                self.error = Some(format!("会话保存失败：{error:#}"));
-                false
+    /// 窗口顶部的通知上下文条：让用户知道「这条是从哪来的」，并给出关闭入口。
+    fn notice_banner(&self, cx: &mut Context<Self>) -> Div {
+        let Some(focus) = self.notice_focus.as_ref() else {
+            return div();
+        };
+        let when = focus
+            .at
+            .map(|at| format!(" · {}", at.format("%m-%d %H:%M")))
+            .unwrap_or_default();
+        let body = match (focus.text.as_deref(), focus.index) {
+            (Some(text), _) => clip(text, 90),
+            (None, Some(_)) => "已在会话中定位到这条通知".to_owned(),
+            (None, None) => "这条通知的内容已不在会话里".to_owned(),
+        };
+        div()
+            .debug_selector(|| "butler-notice-banner".to_owned())
+            .mx(px(16.))
+            .mt(px(8.))
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(RADIUS_LG))
+            .bg(rgb(ACCENT_TINT))
+            .border_1()
+            .border_color(rgb(ACCENT_SOFT))
+            .h_flex()
+            .items_start()
+            .gap(px(10.))
+            .child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(ACCENT))
+                            .child(format!("点开的通知{when}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(18.))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(body),
+                    ),
+            )
+            .child(
+                Button::new("butler-notice-dismiss")
+                    .compact()
+                    .ghost()
+                    .label("知道了")
+                    .on_click(cx.listener(|view, _, _, cx| view.dismiss_notice(cx))),
+            )
+    }
+
+    /// 离线横幅：守护进程不在（没起过、被停掉、刚断开）。会话的真相在那边，
+    /// 这里只说明发生了什么、给一条出路——请宿主拉起守护进程再重连。
+    /// 宿主自己也不在线时（窗口不是从宿主拉起的）重连无从发起，按钮置灰，
+    /// 横幅文案本身就是答案。
+    fn offline_banner(&self, cx: &mut Context<Self>) -> Div {
+        let (title, body) = if self.retrying {
+            (
+                "正在连接守护进程…",
+                "最长等 8 秒，起来了会自动回到会话。",
+            )
+        } else {
+            (
+                "没连上守护进程",
+                "会话都存在那边，重连后照旧。点「重试」把守护进程拉起来。",
+            )
+        };
+        div()
+            .debug_selector(|| "butler-offline".to_owned())
+            .mx(px(16.))
+            .mt(px(8.))
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(RADIUS_LG))
+            .bg(rgb(WARNING_SOFT))
+            .border_1()
+            .border_color(rgb(WARNING))
+            .h_flex()
+            .items_start()
+            .gap(px(10.))
+            .child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(WARNING))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(18.))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(body),
+                    ),
+            )
+            .child(
+                Button::new("butler-retry")
+                    .compact()
+                    .ghost()
+                    .label("重试")
+                    .disabled(self.retrying || !host_alive())
+                    .on_click(cx.listener(|view, _, _, cx| view.retry_connect(cx))),
+            )
+    }
+
+    // ---- 会话连接（薄客户端的一半） -------------------------------------
+    //
+    // 窗口对 butlerd 一条双向长连接：上行 Chat* 请求，下行快照与增量。
+    // 上行交给一条专职写线程（阻塞写不占界面线程）；下行由一个 GPUI 异步
+    // 任务泵回视图。连接断了（守护进程没了、被拆线）就是离线，横幅说明、
+    // 重试请宿主拉起——窗口自己不 spawn 进程。
+
+    /// 初次连接：窗口刚开时守护进程通常已在跑（宿主负责拉起）；不在就画
+    /// 离线横幅，等用户点「重试」。
+    fn start_link(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |weak, async_cx| {
+            if let Ok((client, downlink)) = ipc::connect_duplex("mns-butlerd") {
+                let _ = weak.update(async_cx, |view, cx| view.link_up(client, downlink, cx));
             }
+        })
+        .detach();
+    }
+
+    /// 连接就绪：起上行写线程、记下发送端、挂上（回全量快照）并标记
+    /// 已读，然后泵下行帧。
+    fn link_up(
+        &mut self,
+        mut client: ipc::Client,
+        mut downlink: tokio::sync::mpsc::UnboundedReceiver<Signal>,
+        cx: &mut Context<Self>,
+    ) {
+        let (outbox, mut uplink) = tokio::sync::mpsc::unbounded_channel::<Signal>();
+        // 上行写线程：独占连接的写半边。视图 drop（关窗）或写失败（守护
+        // 进程没了）时线程退出，`Client` 随之 Drop——socket 双向关闭，守护
+        // 进程看到 detach，下行通道也随之关闭，视图转离线。
+        let writer = std::thread::Builder::new()
+            .name("mns-butler-uplink".to_owned())
+            .spawn(move || {
+                while let Some(signal) = uplink.blocking_recv() {
+                    if client.send(&signal).is_err() {
+                        break;
+                    }
+                }
+            });
+        if writer.is_err() {
+            // 写线程起不来就当没连上：丢弃连接保持离线，别造一个假在线。
+            return;
         }
+        self.outbox = Some(outbox);
+        self.online = true;
+        self.retrying = false;
+        // 挂载（butlerd 回全量快照）+ 打开即已读。
+        let _ = self.send_signal(Signal::ChatAttach);
+        let _ = self.send_signal(Signal::ChatSeen);
+        // 下行泵：快照与增量回视图；通道关了（守护进程没了/被拆线）即
+        // 离线。
+        cx.spawn(async move |weak, async_cx| {
+            while let Some(signal) = downlink.recv().await {
+                if weak
+                    .update(async_cx, |view, cx| view.handle_signal(signal, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = weak.update(async_cx, |view, cx| view.go_offline(cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 连接没了：撤横幅之外的全部会话状态——在飞的那一轮跟着连接走了，
+    /// 重连后快照会带回真相（可能比本地看到的更完整）。
+    fn go_offline(&mut self, cx: &mut Context<Self>) {
+        if !self.online && self.outbox.is_none() {
+            return;
+        }
+        self.online = false;
+        self.outbox = None;
+        self.waiting = false;
+        self.stream_buffer.clear();
+        cx.notify();
+    }
+
+    /// 离线横幅的「重试」：先请宿主拉起守护进程（它才管生命周期），
+    /// 然后每半秒试一次，最多 8 秒——拉起一个进程用不了更久。
+    fn retry_connect(&mut self, cx: &mut Context<Self>) {
+        if self.online || self.retrying {
+            return;
+        }
+        let _ = ipc::poke("mns-gui", &Signal::StartButler);
+        self.retrying = true;
+        cx.notify();
+        cx.spawn(async move |weak, async_cx| {
+            for _ in 0..16 {
+                async_cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                if let Ok((client, downlink)) = ipc::connect_duplex("mns-butlerd") {
+                    let _ = weak.update(async_cx, |view, cx| view.link_up(client, downlink, cx));
+                    return;
+                }
+            }
+            let _ = weak.update(async_cx, |view, cx| {
+                view.retrying = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 递一句话给守护进程。发送端没了或通道断了返回 false——调用方据此
+    /// 把话放回去并转离线。
+    fn send_signal(&self, signal: Signal) -> bool {
+        self.outbox
+            .as_ref()
+            .is_some_and(|outbox| outbox.send(signal).is_ok())
+    }
+
+    /// 守护进程送下来的帧：快照整帧替换；增量正文只在等待中累进流式气泡。
+    fn handle_signal(&mut self, signal: Signal, cx: &mut Context<Self>) {
+        match signal {
+            Signal::ChatSnapshot { json } => self.apply_snapshot(&json, cx),
+            Signal::ChatDelta { text } => {
+                if self.waiting {
+                    self.stream_buffer.push_str(&text);
+                    self.follow_stream();
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 快照整帧替换：会话、等待态、半截正文、提示与错误都以 butlerd 为准。
+    /// `restore` 是被拒的那句话，render 时放回输入框。
+    fn apply_snapshot(&mut self, json: &str, cx: &mut Context<Self>) {
+        let Ok(data) = serde_json::from_str::<ChatSnapshotData>(json) else {
+            return;
+        };
+        let had_snapshot = self.snapshot_instance.is_some();
+        let grew = had_snapshot && data.session.messages.len() > self.session.messages.len();
+        self.snapshot_instance = Some(data.instance);
+        self.session = data.session;
+        self.waiting = data.waiting;
+        self.stream_buffer = data.buffer;
+        self.hint = data.hint;
+        self.error = data.error;
+        if let Some(text) = data.restore {
+            self.pending_restore = Some(text);
+        }
+        if self.pending_notice.is_some() {
+            self.pending_notice_frames += 1;
+        }
+        // 新消息落地才跟随滚动；首帧不动，保持「按存档打开」的旧行为。
+        if grew {
+            self.scroll.scroll_to_bottom();
+        }
+        self.resolve_pending_notice(cx);
+        cx.notify();
     }
 
     fn refresh_facts(&mut self, cx: &mut Context<Self>) {
-        let now = Local::now();
-        let Some(view) = cx.global::<GuiState>().view.clone() else {
-            return;
-        };
-        let next = facts_for(&view.read(cx), now);
+        let next = chat::current_facts(Local::now());
         self.apply_facts(next, cx);
     }
 
@@ -372,166 +501,6 @@ impl ButlerView {
             }
         })
         .detach();
-    }
-
-    /// 「记住… / 忘掉…」走确定性记忆，不进普通问答。
-    ///
-    /// 返回 `Some(回复)` 表示这句话已被记忆层接住。识别不了就返回 `None`，
-    /// 交给模板问答——不能让「周五要不要补仓」被当成一条承诺记下来。
-    fn handle_memory(&mut self, text: &str, now: chrono::DateTime<Local>) -> Option<String> {
-        let intent = memory::parse_intent(text, now.date_naive())?;
-        if !self.memory_readable {
-            return Some("记忆文件这次读不出来，我没记，也没动原有记录。".to_owned());
-        }
-        match intent {
-            memory::Intent::Remember { kind, text, due } => {
-                let mut fact = Fact::new(kind, text.clone(), now);
-                if let Some(day) = due {
-                    fact = fact.expires_on(day);
-                }
-                match self.update_memory(|memory| memory.remember(fact)) {
-                    Ok(verdict) => {
-                        self.facts = self
-                            .facts
-                            .clone()
-                            .with_promises(&self.memory, now.date_naive());
-                        let due_note = match due {
-                            Some(day) => format!("（到期 {}）", day.format("%Y-%m-%d")),
-                            None => String::new(),
-                        };
-                        let reply = match verdict {
-                            Remembered::Merged => {
-                                format!(
-                                    "这条我记过了，又确认了一次：{}{}。",
-                                    clip(&text, 40),
-                                    due_note
-                                )
-                            }
-                            _ => format!(
-                                "记下了：{}{}。要改口径就说「忘掉…」。",
-                                clip(&text, 40),
-                                due_note
-                            ),
-                        };
-                        Some(valid_or(reply, "记下了。"))
-                    }
-                    Err(error) => {
-                        self.error = Some(error);
-                        Some("记忆没写进磁盘，这次只在内存里生效。".to_owned())
-                    }
-                }
-            }
-            memory::Intent::Forget { needle, due } => {
-                match self.update_memory(|memory| memory.forget(&needle, due)) {
-                    Ok(Forgot::NotFound) => {
-                        let reply = format!("没找到和「{}」对得上的记忆。", clip(&needle, 20));
-                        Some(valid_or(reply, "没找到对得上的记忆，我没动其他记录。"))
-                    }
-                    Ok(Forgot::Removed(hits)) => {
-                        self.facts = self
-                            .facts
-                            .clone()
-                            .with_promises(&self.memory, now.date_naive());
-                        let names: Vec<String> = hits.iter().take(3).map(fact_label).collect();
-                        let reply = format!(
-                            "从常驻记忆里拿掉了：{}。归档里还留一份，随时能查。",
-                            names.join("；")
-                        );
-                        Some(valid_or(
-                            reply,
-                            "从常驻记忆里拿掉了。归档里还留一份，随时能查。",
-                        ))
-                    }
-                    Ok(Forgot::Ambiguous(candidates)) => {
-                        // 宁可不删也不误删：候选带日期念出来，等用户指明那条。
-                        let names: Vec<String> =
-                            candidates.iter().take(3).map(fact_label).collect();
-                        let reply = format!(
-                            "「{}」对上了几条：{}。带上日期说要忘哪条，比如「忘掉下周五补美股」。",
-                            clip(&needle, 20),
-                            names.join("；")
-                        );
-                        Some(valid_or(
-                            reply,
-                            "这句对上了不止一条，我没动。带上日期说要忘哪条，比如「忘掉下周五补美股」。",
-                        ))
-                    }
-                    Err(error) => {
-                        self.error = Some(error);
-                        Some("记忆没写进磁盘，这次只在内存里生效。".to_owned())
-                    }
-                }
-            }
-        }
-    }
-
-    /// 在写锁内「重读记忆 → 应用这一笔变更 → 落盘」，返回应用的返回值。
-    ///
-    /// 窗口一开几个小时，期间 CLI（`mns-butler remember`）和守护进程都可能
-    /// 写过 `memory.json`：拿窗口打开时的快照整体覆盖会吞掉它们的条目，
-    /// 所以每次变更都从磁盘重读。测试注入的窗口（`persist = false`）只在
-    /// 内存里生效，不碰真实账户目录。
-    ///
-    /// 失败时这笔变更哪儿都没落（磁盘没动、内存副本保持旧值）：错误会摆到
-    /// 界面上，用户至少知道「这条没记上」，而不是以为记住了。
-    fn update_memory<R>(&mut self, apply: impl FnOnce(&mut Memory) -> R) -> Result<R, String> {
-        if !self.persist {
-            return Ok(apply(&mut self.memory));
-        }
-        let (memory, result) =
-            Memory::update(apply).map_err(|error| format!("记忆更新失败：{error:#}"))?;
-        self.memory = memory;
-        // 承诺变了：到期的「那一天」可能提前或推后，守护进程要重新排程。
-        crate::ipc::poke_daemon();
-        Ok(result)
-    }
-
-    /// 「你记得什么」：把常驻记忆念出来。这是对话的一部分，不该落到兜底句。
-    ///
-    /// 只念条目原文，不做总结——总结会把用户的措辞磨平成另一套说法，下一轮
-    /// 用户再问「我说的是哪句」就对不上了。
-    fn recall_memory(&self, text: &str) -> Option<String> {
-        let asks = ["记得", "记了", "记忆", "承诺"]
-            .iter()
-            .any(|word| text.contains(word));
-        if !asks {
-            return None;
-        }
-        if !self.memory_readable {
-            return Some("记忆文件这次读不出来，我念不了，也不会拿空记忆糊弄你。".to_owned());
-        }
-        let today = Local::now().date_naive();
-        let active = self.memory.active_facts(today);
-        if active.is_empty() {
-            return Some("常驻记忆里还是空的。说「记住：…」我就记一条。".to_owned());
-        }
-        let rows: Vec<String> = active
-            .iter()
-            .take(5)
-            .map(|fact| match fact.expires_at {
-                Some(day) => format!("{} · 到期 {}", clip(&fact.text, 24), day.format("%Y-%m-%d")),
-                None => clip(&fact.text, 24),
-            })
-            .collect();
-        Some(valid_or(
-            format!(
-                "我记着 {} 条：{}。要删就说「忘掉…」。",
-                active.len(),
-                rows.join("；")
-            ),
-            "记忆里有内容，但这次念不出来。",
-        ))
-    }
-
-    /// 上一句用户提问。当前这句已经进了会话，所以取倒数第二条。
-    fn previous_user_text(&self) -> Option<String> {
-        self.session
-            .messages
-            .iter()
-            .rev()
-            .filter(|message| message.role == Role::User)
-            .nth(1)
-            .map(|message| message.text.clone())
     }
 
     /// 把一个现成问题放进输入框并立刻发送。空态的 suggestion chip 用它：
@@ -606,129 +575,26 @@ impl ButlerView {
             .child(chips)
     }
 
+    /// 发送。薄客户端只递话：守护进程决定接不接（回合进行中会拒绝并把话
+    /// 原样退回来），会话、记忆、落盘全在那边。本地只守两条——离线时不吞
+    /// 字（话留在输入框里，等连上再发），等待中不递（守护进程必拒，与其
+    /// 递过去再退回来，不如不收）。
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.online || self.waiting {
+            return;
+        }
         let text = self.input.read(cx).value().trim().to_owned();
         if text.is_empty() {
             return;
         }
-        let now = Local::now();
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
-
-        // 记忆类命令在本地就能答：不必为一句「记住了」启一个外部 agent。
-        if let Some(reply) = self
-            .handle_memory(&text, now)
-            .or_else(|| self.recall_memory(&text))
-        {
-            self.session.push(Message::user(now, text));
-            self.session.push(Message::butler(now, reply));
-            self.session.mark_read(now);
-            self.persist();
-            self.scroll.scroll_to_bottom();
-            cx.notify();
-            return;
+        if !self.send_signal(Signal::ChatSend { text: text.clone() }) {
+            // 递送失败：连接刚断。话不能丢——放回输入框（render 时应用），
+            // 并转离线，横幅说明怎么重连。
+            self.pending_restore = Some(text);
+            self.go_offline(cx);
         }
-
-        // 普通对话记一句「聊过什么」，供下周自整理。只记用户的问题，
-        // 不记管家自己的措辞——复述自己的话会让记忆越走越偏。写之前重读
-        // 磁盘：窗口开着的时候 CLI / 守护进程可能也写过记忆。
-        let _ = self.update_memory(|memory| memory.summarize(now, vec![clip(&text, 60)]));
-        // 首轮注入的取数口径：记忆取**刚重读过的**磁盘快照——CLI / 守护
-        // 进程写进来的条目也要进上下文；最近对话取本句入档之前的——正在
-        // 问的这句已经在【用户的问题】里，不该在【最近的对话】里再念一遍。
-        let memory_for_goal = talk::memory_lines(&self.memory, now.date_naive());
-        let recent_for_goal = talk::recent_lines(&self.session);
-        self.session.push(Message::user(now, text.clone()));
-
-        let previous = self.previous_user_text();
-        let intent = expression::intent_for(&text, previous.as_deref());
-        // 模板是这一问的基线：agent 答不出来、超时、答得不像话，都回到它。
-        // 预测与观点类问题不再本地拦截——管家人格可以聊倾向，交给 agent；
-        // 模板兜底自己会如实说「说不准，只答有把握的部分」。
-        let template = expression::reply_with_intent(intent, &text, &self.facts);
-
-        if self.turn.waiting {
-            // 上一条还没回完。不发新请求，也不吞掉这一句：先用模板答，
-            // 并说明为什么——把用户的话丢掉比答得糙更糟。
-            self.finish_local(
-                now,
-                template,
-                Some("上一条还在回答，这一句先按本地模板答".to_owned()),
-                cx,
-            );
-            return;
-        }
-
-        let Some(chat) = self.chat.as_mut() else {
-            // 测试注入的窗口没有 agent：直接走模板。
-            self.finish_local(now, template, None, cx);
-            return;
-        };
-
-        // 上面已确认不在等待，`begin` 必定接住这一轮。
-        self.turn.begin(template);
-
-        let command = if chat.started {
-            AgentCommand::Ask { text }
-        } else {
-            chat.started = true;
-            AgentCommand::Start {
-                goal: talk::opening_goal(&text, &self.facts, &memory_for_goal, &recent_for_goal),
-                settings: chat_settings(),
-                source: GoalSource::Conversation,
-            }
-        };
-        if let Err(error) = chat.handle.send(command) {
-            // 通道断了就当场降级，别让界面一直停在「正在想」。
-            self.settle(Some(format!("agent 没接上（{error}）")), cx);
-            return;
-        }
-        // 超时兜底：agent 卡住时 `waiting` 会一直是 true，用户连下一句都
-        // 发不出去。定时器按这一轮的序号收尾，答完了序号就对不上，空转一次。
-        let turn = self.turn.turn;
-        cx.spawn(async move |weak, async_cx| {
-            async_cx.background_executor().timer(CHAT_TIMEOUT).await;
-            let _ = weak.update(async_cx, |view, cx| view.on_chat_timeout(turn, cx));
-        })
-        .detach();
-        self.session.mark_read(now);
-        self.persist();
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    /// 一轮超时：停掉这次生成，收下已经吐出的半截，没有就退回模板。
-    ///
-    /// 序号对不上说明已经答完、或者用户换了话题，直接返回。
-    fn on_chat_timeout(&mut self, turn: u64, cx: &mut Context<Self>) {
-        if !self.turn.waiting || self.turn.turn != turn {
-            return;
-        }
-        // 被 cancel 的会话不再复用：下一问重新开一个，免得接在半截上下文上。
-        if let Some(chat) = self.chat.as_mut() {
-            let _ = chat.handle.send(AgentCommand::Stop);
-            chat.started = false;
-        }
-        self.settle(
-            Some(format!("agent 超过 {} 秒没答完", CHAT_TIMEOUT.as_secs())),
-            cx,
-        );
-    }
-
-    /// 不经 agent 直接落一句回答（记忆命令、预测拒答、测试窗口）。
-    fn finish_local(
-        &mut self,
-        now: chrono::DateTime<Local>,
-        text: String,
-        hint: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.session.push(Message::butler(now, text));
-        self.session.mark_read(now);
-        self.hint = hint;
-        self.persist();
-        self.scroll.scroll_to_bottom();
-        cx.notify();
     }
 
     /// 流式期间的跟随滚动：正文在长，贴底就跟着走；用户往上翻了就不打扰。
@@ -740,163 +606,32 @@ impl ButlerView {
         }
     }
 
-    /// runtime 事件。只关心正文、结束与失败：思考、计划、工具调用不进会话，
-    /// 用户要的是答案，不是执行轨迹。
-    pub(crate) fn on_chat_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
-        match event {
-            // 正文只在 `Delta` 上出现（runner 对 Message 走流式），不重复收
-            // `Entry`，否则同一段话会被拼两遍。边收边上屏：气泡逐段生长，
-            // `settle` 收尾后才落成正式消息。
-            AgentEvent::Delta {
-                kind: EntryKind::Message,
-                text,
-            } => {
-                if self.turn.waiting {
-                    self.turn.push(&text);
-                    // 红线实时切断：谎称能替你下单的话不能在屏上挂到本轮自然
-                    // 结束。判定的对象与 `validate_talk` 同一份清洗文本，所以
-                    // 收尾校验会放行的回答（「没法帮你下单」、决策块内部出现
-                    // 的字样）在这里同样不会命中；命中即等于收尾必被拦，只是
-                    // 提前到几十秒之前。
-                    if crate::butler::schedule::claims_execution(&talk::display_text(
-                        &self.turn.buffer,
-                    ))
-                    .is_some()
-                    {
-                        if let Some(chat) = self.chat.as_mut() {
-                            // 被 cut 的会话不再复用：下一问重新开一个。
-                            let _ = chat.handle.send(AgentCommand::Stop);
-                            chat.started = false;
-                        }
-                        self.settle(Some("已实时切断".to_owned()), cx);
-                        return;
-                    }
-                    self.follow_stream();
-                    cx.notify();
-                }
-            }
-            AgentEvent::TurnFinished { .. } => self.settle(None, cx),
-            AgentEvent::Finished { .. } => {
-                // 会话本身结束了：下一问要重新开一个，不能对着已关闭的
-                // session 发 Ask。
-                if let Some(chat) = self.chat.as_mut() {
-                    chat.started = false;
-                }
-                // 这一轮还没收尾就按失败处理，不能让界面一直停在等待态。
-                if self.turn.waiting {
-                    self.settle(Some("agent 会话提前结束".to_owned()), cx);
-                }
-            }
-            AgentEvent::Failed { message } => {
-                if let Some(chat) = self.chat.as_mut() {
-                    chat.started = false;
-                }
-                self.settle(Some(format!("agent 报错：{message}")), cx);
-            }
-            AgentEvent::Permission(prompt) => {
-                // 管家窗口没有授权界面。拒绝并说清楚去哪儿处理，避免
-                // agent 卡在等待授权上不给回答。
-                if let Some(chat) = self.chat.as_ref() {
-                    let _ = chat.handle.send(AgentCommand::Deny { id: prompt.id });
-                }
-                self.hint = Some(format!(
-                    "agent 想调用「{}」，管家窗口不受理授权，已拒绝",
-                    prompt.title
-                ));
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-
-    /// 把这一轮收尾：通过校验就用 agent 的文本，否则退回本地模板。
-    fn settle(&mut self, note: Option<String>, cx: &mut Context<Self>) {
-        let Some((buffer, template)) = self.turn.take() else {
-            return;
-        };
-        let now = Local::now();
-        let (text, hint) = settle_text(&buffer, &template, note.as_deref());
-        self.session.push(Message::butler(now, text));
-        self.session.mark_read(now);
-        // 错误链可能很长，提示只留一行：用户只需要知道这条为什么不是
-        // agent 说的。
-        self.hint = hint.map(clip_note);
-        self.persist();
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
+    /// 清空会话：两次确认后把意图递给守护进程。磁盘上的真相（存档、
+    /// 在飞的回合、ACP 上下文）全由它清；本地副本等下一帧快照整帧替换，
+    /// 不抢先清——清一半的画面比等半秒更让人不安。
     fn clear_session(&mut self, cx: &mut Context<Self>) {
         if !self.clear_armed {
             self.clear_armed = true;
             cx.notify();
             return;
         }
-        if let Err(error) = self.wipe_session() {
-            self.error = Some(format!("清除失败：{error:#}"));
-        } else {
-            self.session = Session::default();
-            self.session.mark_read(Local::now());
-            // 清空会话也要把 ACP 那头的 session 一并作废：只删本地存档
-            // 的话，agent 仍持有清空前的上下文，下一句会以续问接在旧对话
-            // 上——用户以为清了，其实没清。`started` 归位后下一问重新走
-            // Start（带人设与记忆的首轮），而不是 Ask（续问）。
-            if let Some(chat) = self.chat.as_mut() {
-                let _ = chat.handle.send(AgentCommand::Stop);
-                chat.started = false;
-            }
-            // 清空会话也要清掉等待中的回答（连同屏幕上的半截气泡）：它接
-            // 的是已经被删掉的上下文。序号加一就够了，迟到的正文落不进
-            // 新会话。
-            self.turn.abandon();
-            self.hint = None;
-            if self.persist {
-                let _ = self.session.save();
-            }
-            self.clear_armed = false;
+        self.clear_armed = false;
+        if !self.send_signal(Signal::ChatClear) {
+            self.error =
+                Some("没连上守护进程，这次没清。连上后再试一次。".to_owned());
         }
         cx.notify();
-    }
-
-    fn wipe_session(&mut self) -> anyhow::Result<()> {
-        if self.persist {
-            Session::clear()?;
-        }
-        Ok(())
-    }
-}
-
-/// 窗口关掉就把 ACP 会话收掉。`start_runtime` 起的是真实 OS 线程 + Tokio
-/// runtime，不显式 `Shutdown` 会随窗口开关泄漏下去。
-impl Drop for ButlerView {
-    fn drop(&mut self) {
-        if let Some(chat) = &self.chat {
-            let _ = chat.handle.send(AgentCommand::Shutdown);
-        }
-    }
-}
-
-/// 收尾判定：通过校验就用 agent 的正文，否则退回模板并说明原因。
-///
-/// `note` 表示「这一轮为什么不算正常回答」（超时、报错）。内容即便合规也
-/// 要把它附上，否则用户看到一句正常的话，却不知道 agent 其实没答完。
-///
-/// 抽成纯函数是为了能测——真实路径需要起一个外部 agent 进程。
-fn settle_text(buffer: &str, template: &str, note: Option<&str>) -> (String, Option<String>) {
-    match talk::validate_talk(buffer) {
-        Ok(text) => (text, note.map(str::to_owned)),
-        Err(error) => (
-            template.to_owned(),
-            Some(match note {
-                Some(note) => format!("{note}：{error}"),
-                None => format!("agent 这条没通过校验（{error}），已改回本地模板"),
-            }),
-        ),
     }
 }
 
 impl Render for ButlerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 递送失败被退回的话在这里放回输入框：`set_value` 需要 `&mut Window`，
+        // 信号回调里拿不到，只能攒到渲染时应用。取走即清零，只放一次。
+        if let Some(text) = self.pending_restore.take() {
+            self.input
+                .update(cx, |input, cx| input.set_value(text.as_str(), window, cx));
+        }
         let headline = expression::headline(&self.facts);
         let decision = if self.facts.decision_day {
             "今天是决策日"
@@ -919,25 +654,27 @@ impl Render for ButlerView {
         if self.session.messages.is_empty() {
             stream = stream.child(self.empty_state(cx));
         } else {
+            let highlight = self.notice_focus.as_ref().and_then(|focus| focus.index);
             stream = stream.children(
                 self.session
                     .messages
                     .iter()
                     .enumerate()
-                    .map(|(index, message)| message_row(index, message))
+                    .map(|(index, message)| message_row(index, message, highlight == Some(index)))
                     .collect::<Vec<_>>(),
             );
         }
-        // 流式正文：第一段 Delta 到达后，气泡开始逐段生长，收尾（settle）
-        // 通过校验才落成正式消息。
-        let streaming = self.turn.streaming_text();
+        // 流式正文：守护进程逐段推来，气泡逐段生长；快照落地（等待解除）
+        // 后由正式气泡顶上。
+        let streaming = (self.waiting && !self.stream_buffer.is_empty())
+            .then(|| self.stream_buffer.as_str());
         if let Some(text) = streaming {
             stream = stream.child(streaming_row(text));
         }
         // 等 agent 时给一行状态，否则用户分不清「正在想」和「没反应」。
         // 只在第一段正文到达前显示：正文开始流动后，气泡本身就是进度
         // （正文停住的空档属于「工具活动」提案，不在 V1）。
-        if self.turn.waiting && streaming.is_none() {
+        if self.waiting && streaming.is_none() {
             stream = stream.child(
                 div()
                     .debug_selector(|| "butler-thinking".to_owned())
@@ -1075,6 +812,12 @@ impl Render for ButlerView {
                         )),
                     ),
             )
+            .children(
+                self.notice_focus
+                    .is_some()
+                    .then(|| self.notice_banner(cx)),
+            )
+            .children((!self.online).then(|| self.offline_banner(cx)))
             .child(
                 div()
                     .id("butler-card")
@@ -1131,7 +874,11 @@ impl Render for ButlerView {
                                                 Textarea::new(&self.input)
                                                     .appearance(false)
                                                     .min_h(px(36.))
-                                                    .max_h(px(112.)),
+                                                    .max_h(px(112.))
+                                                    // 离线递不出去、等待中递了也必被退回：
+                                                    // 两种状态都先不收，但字留在框里，
+                                                    // 等状态过了再发（见 `send`）。
+                                                    .disabled(!self.online || self.waiting),
                                             ),
                                     )
                                     .child(
@@ -1143,6 +890,7 @@ impl Render for ButlerView {
                                             .rounded(ButtonRounded::Size(px(17.)))
                                             .accessibility_label("发送")
                                             .tooltip("发送")
+                                            .disabled(!self.online || self.waiting)
                                             .on_click(cx.listener(|view, _, window, cx| {
                                                 view.send(window, cx);
                                             })),
@@ -1153,26 +901,6 @@ impl Render for ButlerView {
     }
 }
 
-/// 用户自己的原话可能带越界话术或过长：确认句过不了校验就退到不带引用的版本。
-fn valid_or(reply: String, fallback: &str) -> String {
-    if crate::butler::schedule::validate_dialogue(&reply).is_ok() {
-        reply
-    } else {
-        fallback.to_owned()
-    }
-}
-
-/// 降级提示只占一行。错误链可能很长，整段铺在界面上没人读得下去——
-/// 用户需要的只是「这条为什么不是模型说的」。
-fn clip_note(text: String) -> String {
-    let flat = text.replace('\n', " ");
-    if flat.chars().count() > 120 {
-        format!("{}…", flat.chars().take(120).collect::<String>())
-    } else {
-        flat
-    }
-}
-
 fn clip(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_owned();
@@ -1180,15 +908,6 @@ fn clip(text: &str, limit: usize) -> String {
     let mut clipped: String = text.chars().take(limit).collect();
     clipped.push('…');
     clipped
-}
-
-/// 一条事实在对话里的展示：到期日必须带上——同文不同日期的条目，日期是
-/// 唯一区分符，不带日期用户没法指认要忘哪条。
-fn fact_label(fact: &Fact) -> String {
-    match fact.expires_at {
-        Some(day) => format!("{} · 到期 {}", clip(&fact.text, 24), day.format("%Y-%m-%d")),
-        None => clip(&fact.text, 24),
-    }
 }
 
 /// 空态的三个一键提问。文案与 `expression::intent_for` 的主干意图对齐：
@@ -1339,8 +1058,8 @@ fn streaming_row(text: &str) -> Div {
         )
 }
 
-fn message_row(index: usize, message: &Message) -> Stateful<Div> {
-    match message.role {
+fn message_row(index: usize, message: &Message, highlighted: bool) -> Stateful<Div> {
+    let row = match message.role {
         Role::User => div().w_full().flex_none().h_flex().justify_end().child(
             div()
                 .v_flex()
@@ -1412,8 +1131,25 @@ fn message_row(index: usize, message: &Message) -> Stateful<Div> {
                             ),
                     ),
             ),
+    };
+    // 点通知进来的那一条：给整行一层浅蓝底，滚动定位后仍能一眼认出。
+    if highlighted {
+        return row
+            .rounded(px(RADIUS_LG))
+            .bg(rgb(ACCENT_TINT))
+            .px(px(8.))
+            .py(px(6.))
+            .id(ElementId::named_usize("butler-row", index));
     }
-    .id(ElementId::named_usize("butler-row", index))
+    row.id(ElementId::named_usize("butler-row", index))
+}
+
+/// 通知 id → 会话里的行号。同 id 理论上只出现一次，真重复了取最后一条
+/// （宿主重投时后写的那条才是用户刚看到的）。
+fn notice_index(messages: &[Message], notice_id: &str) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|message| message.notice_id.as_deref() == Some(notice_id))
 }
 
 fn butler_avatar() -> Div {
@@ -1433,12 +1169,16 @@ fn butler_avatar() -> Div {
 
 #[cfg(all(test, feature = "gui-test"))]
 mod tests {
-    //! 管家窗口的渲染与发送链路。会话注入走 `with_session`，全程不碰
-    //! 真实 `~/.mns/agent/butler/`——测试不该改用户的对话记录。
-    use super::{ButlerView, TurnState, bubble_text, greeting_for, settle_text};
-    use crate::agent::{AgentEvent, EntryKind};
+    //! 管家窗口的渲染与上行链路。会话注入走 `with_session`，守护进程一侧
+    //! 用**假连接**（`fake_link`：往 `outbox` 里塞一个通道）替代——上行
+    //! 断言收到的 `Signal`，下行用 `handle_signal` 直接喂帧。全程不碰真实
+    //! `~/.mns/agent/butler/`，也不连本地通道——测试不该改用户的对话记录，
+    //! 更不该把宿主/守护进程搅进来。
+    use super::{ButlerView, bubble_text, greeting_for, notice_index};
+    use crate::butler::chat::ChatSnapshotData;
     use crate::butler::orchestrator::{AccountFacts, DriftRow};
     use crate::butler::session::{Message, Role, Session};
+    use crate::ipc::Signal;
     use chrono::Local;
     use gpui_kit::{Entity, TestAppContext};
 
@@ -1464,10 +1204,48 @@ mod tests {
     ) -> (Entity<ButlerView>, &mut gpui_kit::VisualTestContext) {
         cx.update(gpui_kit::init);
         cx.add_window_view(|window, cx| {
-            // 测试注入的窗口不挂 ACP 会话：验证的是本地模板与状态机，
-            // 不该因为开发机上恰好装了 opencode 就真去起一个进程。
+            // 测试注入的窗口不连守护进程：验证的是快照/上行的状态机，
+            // 不该真去连本地通道。
             ButlerView::with_session(Session::default(), facts, window, cx)
         })
+    }
+
+    /// 假装连上了守护进程：注入 outbox 并标记在线。返回上行信号的接收端。
+    fn fake_link(view: &mut ButlerView) -> tokio::sync::mpsc::UnboundedReceiver<Signal> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        view.outbox = Some(tx);
+        view.online = true;
+        rx
+    }
+
+    /// 造一帧快照 JSON。实例号固定：单一测试里不存在「服务换人」。
+    fn snapshot_json(
+        session: &Session,
+        waiting: bool,
+        buffer: &str,
+        restore: Option<&str>,
+    ) -> String {
+        serde_json::to_string(&ChatSnapshotData {
+            instance: 7,
+            session: session.clone(),
+            waiting,
+            buffer: buffer.to_owned(),
+            hint: None,
+            error: None,
+            restore: restore.map(str::to_owned),
+        })
+        .expect("快照应能序列化")
+    }
+
+    /// 断言上行通道里是一条 `ChatSend`，且文本相符。
+    fn expect_chat_send(
+        uplink: &mut tokio::sync::mpsc::UnboundedReceiver<Signal>,
+        expected: &str,
+    ) {
+        match uplink.try_recv().expect("应递出 ChatSend") {
+            Signal::ChatSend { text } => assert_eq!(text, expected, "递出的话应与输入一致"),
+            other => panic!("应递 ChatSend，实际 {other:?}"),
+        }
     }
 
     #[gpui_kit::test]
@@ -1513,8 +1291,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn 空态chip点击直接发送一轮问答(cx: &mut TestAppContext) {
+    fn 空态chip点击直接把问题递给守护进程(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
         cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
@@ -1527,11 +1306,12 @@ mod tests {
             .center();
         cx.simulate_click(center, gpui_kit::Modifiers::none());
 
+        expect_chat_send(&mut uplink, "现在偏离多少？");
         let messages = cx.update(|_, cx| view.update(cx, |view, _| view.session.messages.clone()));
-        assert_eq!(messages.len(), 2, "chip 点击应立刻开始一轮问答");
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[0].text, "现在偏离多少？");
-        assert_eq!(messages[1].role, Role::Butler);
+        assert!(
+            messages.is_empty(),
+            "薄客户端不先落消息：用户的话由守护进程写进会话、快照带回来"
+        );
     }
 
     #[test]
@@ -1560,7 +1340,9 @@ mod tests {
 
     #[gpui_kit::test]
     fn 空态靠上而不是垂直居中(cx: &mut TestAppContext) {
-        let (_view, cx) = open(cx, facts());
+        let (view, cx) = open(cx, facts());
+        // 布局断言量的是正常（在线）状态：先连上，撤掉离线横幅再量。
+        let _uplink = view.update(cx, |view, _| fake_link(view));
         cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
@@ -1584,7 +1366,9 @@ mod tests {
 
     #[gpui_kit::test]
     fn 头像行到卡片的纹理空白不过宽(cx: &mut TestAppContext) {
-        let (_view, cx) = open(cx, facts());
+        let (view, cx) = open(cx, facts());
+        // 同上：量在线状态的布局，先撤掉离线横幅。
+        let _uplink = view.update(cx, |view, _| fake_link(view));
         cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
@@ -1607,110 +1391,75 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn 发送后清空输入框且回复不越界(cx: &mut TestAppContext) {
+    fn 发送后输入框清空且话递到守护进程(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
-        let mut input_after = String::new();
-        let mut messages = Vec::new();
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
 
-        cx.update(|window, cx| {
+        let input_after = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.input.update(cx, |input, cx| {
                     input.set_value("今天要不要加仓", window, cx)
                 });
                 view.send(window, cx);
-                input_after = view.input.read(cx).value().to_string();
-                messages = view.session.messages.clone();
-            });
+                view.input.read(cx).value().to_string()
+            })
         });
 
         assert_eq!(input_after, "", "发送后输入框应清空");
-        assert_eq!(messages.len(), 2, "一轮问答应是用户 + 管家两条");
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].role, Role::Butler);
-        assert!(
-            messages[1].text.contains("下单我帮不了"),
-            "回复应如实说明不代下单，实际 {}",
-            messages[1].text
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&messages[1].text).is_ok(),
-            "回复越过表达边界：{}",
-            messages[1].text
-        );
-        view.update(cx, |view, _| {
-            assert_eq!(view.memory.summaries.len(), 1, "普通对话应留一条摘要");
-            assert!(
-                view.memory.summaries[0].points.len() <= crate::butler::memory::MAX_POINTS,
-                "单次摘要不得超过三条要点"
+        expect_chat_send(&mut uplink, "今天要不要加仓");
+        // 会话与越界校验全在守护进程：本地不先插消息，等快照整帧带回。
+        let messages = cx.update(|_, cx| view.update(cx, |view, _| view.session.messages.clone()));
+        assert!(messages.is_empty(), "本地不先落消息");
+    }
+
+    #[gpui_kit::test]
+    fn 等待中发送不吞字也不递话(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, facts());
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
+        // 快照带回等待态：守护进程那边一轮还在进行。
+        view.update(cx, |view, cx| {
+            let mut session = Session::default();
+            session.push(Message::user(Local::now(), "上一问"));
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&session, true, "上一答的半截", None),
+                },
+                cx,
             );
         });
-    }
 
-    #[gpui_kit::test]
-    fn 没有agent时立刻用本地模板回答(cx: &mut TestAppContext) {
-        let (view, cx) = open(cx, facts());
-        cx.update(|window, cx| {
+        let value = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                view.input
-                    .update(cx, |input, cx| input.set_value("现在偏离多少", window, cx));
+                view.input.update(cx, |input, cx| {
+                    input.set_value("插队的一句", window, cx)
+                });
                 view.send(window, cx);
-                assert!(view.chat.is_none(), "测试窗口不该挂 ACP 会话");
-                assert_eq!(view.session.messages.len(), 2, "一轮问答应立即完整");
-                assert!(view.hint.is_none());
-            });
+                view.input.read(cx).value().to_string()
+            })
         });
-    }
 
-    /// 等待槽的并发语义：一次只挂一轮，迟到的正文进不了新话题。
-    #[test]
-    fn 等待槽只收当前这一轮的正文() {
-        let mut turn = TurnState::default();
-        assert!(turn.begin("模板一".to_owned()));
-        assert!(!turn.begin("模板二".to_owned()), "上一轮没回完不接新提问");
-
-        turn.push("美股偏离 6.2pp。");
-        assert_eq!(
-            turn.take(),
-            Some(("美股偏离 6.2pp。".to_owned(), "模板一".to_owned()))
+        assert_eq!(value, "插队的一句", "等待中不吞字：话留在输入框里等下一轮");
+        assert!(
+            uplink.try_recv().is_err(),
+            "等待中不该递 ChatSend：守护进程必拒，递过去只会被原样退回"
         );
-        assert_eq!(turn.take(), None, "一轮只能收一次");
-
-        // 清空会话后，迟到的正文没有等待槽可落。
-        assert!(turn.begin("模板三".to_owned()));
-        turn.abandon();
-        turn.push("迟到的回答");
-        assert_eq!(turn.take(), None);
     }
 
-    /// 流式上屏的取数口径：等待中且已有正文才画气泡，收尾或作废后立即撤下。
-    #[test]
-    fn 等待中的正文才进流式气泡() {
-        let mut turn = TurnState::default();
-        assert!(turn.begin("模板".to_owned()));
-        assert_eq!(turn.streaming_text(), None, "第一段正文没到，只有等待行");
-
-        turn.push("美股偏离 6.2pp。");
-        assert_eq!(turn.streaming_text(), Some("美股偏离 6.2pp。"));
-
-        let (buffer, _) = turn.take().expect("等待中的一轮可以收尾");
-        assert_eq!(buffer, "美股偏离 6.2pp。");
-        assert_eq!(turn.streaming_text(), None, "收尾后不再画流式气泡");
-
-        // 清空会话：半截正文随等待状态一起作废。
-        assert!(turn.begin("模板二".to_owned()));
-        turn.push("半截");
-        turn.abandon();
-        assert_eq!(turn.streaming_text(), None);
-    }
-
-    /// 端到端的渲染生命周期：正文逐段到达时气泡在场生长，收尾换成正式消息。
+    /// 端到端的渲染生命周期：快照带等待态、增量逐段生长气泡、收尾快照
+    /// 整帧替换成正式消息——薄客户端只按帧画。
     #[gpui_kit::test]
-    fn 正文边生成边上屏收尾后换成正式气泡(cx: &mut TestAppContext) {
+    fn 正文逐段上屏快照落地后换成正式气泡(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
-        view.update(cx, |view, _| {
-            view.session
-                .push(Message::user(Local::now(), "现在偏离多少"));
-            assert!(view.turn.begin("美股偏离 6.2pp（带宽 ±4.0pp）".to_owned()));
+        // 等待快照：会话里只有这一问，回答还没来。
+        view.update(cx, |view, cx| {
+            let mut session = Session::default();
+            session.push(Message::user(Local::now(), "现在偏离多少"));
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&session, true, "", None),
+                },
+                cx,
+            );
         });
         cx.update(|window, cx| {
             window.refresh();
@@ -1723,8 +1472,14 @@ mod tests {
             "还没正文不该有流式气泡"
         );
 
-        view.update(cx, |view, _| {
-            view.turn.push("美股偏离 6.2pp。");
+        // 增量到达：流式气泡在场生长，等待行让位。
+        view.update(cx, |view, cx| {
+            view.handle_signal(
+                Signal::ChatDelta {
+                    text: "美股偏离 6.2pp。".to_owned(),
+                },
+                cx,
+            )
         });
         cx.update(|window, cx| {
             window.refresh();
@@ -1739,9 +1494,17 @@ mod tests {
             "正文开始流动后等待行应隐藏，气泡本身就是进度"
         );
 
-        // 收尾：流式气泡撤下，正式消息落进会话。
+        // 收尾快照：等待解除，半截落成正式消息。
         view.update(cx, |view, cx| {
-            view.settle(None, cx);
+            let mut session = Session::default();
+            session.push(Message::user(Local::now(), "现在偏离多少"));
+            session.push(Message::butler(Local::now(), "美股偏离 6.2pp。"));
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&session, false, "", None),
+                },
+                cx,
+            );
         });
         cx.update(|window, cx| {
             window.refresh();
@@ -1755,104 +1518,69 @@ mod tests {
             let last = view.session.messages.last().expect("应有正式回答");
             assert_eq!(last.role, Role::Butler);
             assert_eq!(last.text, "美股偏离 6.2pp。");
-            assert!(!view.turn.waiting, "收尾后不再等待");
+            assert!(!view.waiting, "收尾后不再等待");
         });
     }
 
-    /// 红线实时切断：流式累积中谎称能替用户下单，话音未落就收尾这一轮并
-    /// 退回模板；诚实的否定（「没法帮你下单」）不触发切断。
+    /// 快照整帧替换：restore 是被拒的那句话，render 时放回输入框。
     #[gpui_kit::test]
-    fn 流式中谎称下单立即切断而诚实否定不切(cx: &mut TestAppContext) {
+    fn 被拒的话由快照带回并放回输入框(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
+        let _uplink = view.update(cx, |view, _| fake_link(view));
+
         view.update(cx, |view, cx| {
-            view.session.push(Message::user(Local::now(), "帮我买了"));
-            assert!(view.turn.begin("模板句".to_owned()));
-
-            view.on_chat_event(
-                AgentEvent::Delta {
-                    kind: EntryKind::Message,
-                    text: "这个我没法".to_owned(),
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&Session::default(), false, "", Some("被拒绝的一句")),
                 },
                 cx,
-            );
-            assert!(view.turn.waiting, "诚实否定不是红线，正文继续长");
-
-            view.on_chat_event(
-                AgentEvent::Delta {
-                    kind: EntryKind::Message,
-                    text: "帮你下单，得你自己来。".to_owned(),
-                },
-                cx,
-            );
-            assert!(view.turn.waiting, "「没法帮你下单」不该触发切断");
-            assert_eq!(
-                view.turn.streaming_text(),
-                Some("这个我没法帮你下单，得你自己来。")
-            );
+            )
         });
-
-        // 换一轮真正谎称执行的：命中即收尾、退模板、说清原因。
-        view.update(cx, |view, cx| {
-            let _ = view.turn.take();
-            assert!(view.turn.begin("模板句二".to_owned()));
-            view.on_chat_event(
-                AgentEvent::Delta {
-                    kind: EntryKind::Message,
-                    text: "好的，已经".to_owned(),
-                },
-                cx,
-            );
-            assert!(view.turn.waiting, "半句话还没到红线");
-            view.on_chat_event(
-                AgentEvent::Delta {
-                    kind: EntryKind::Message,
-                    text: "帮你下单了，明天到账。".to_owned(),
-                },
-                cx,
-            );
-            assert!(!view.turn.waiting, "命中禁语应立即收尾这一轮");
-            let last = view.session.messages.last().expect("应有兜底回复");
-            assert_eq!(last.role, Role::Butler);
-            assert_eq!(last.text, "模板句二", "谎称执行必须退回模板");
-            let hint = view.hint.clone().expect("要说明切断原因");
-            assert!(hint.contains("实时切断"), "实际 {hint}");
-            assert!(hint.contains("谎称能替用户执行下单"), "实际 {hint}");
+        // restore 只能在 render 里应用：set_value 需要 &mut Window。
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
         });
+        let value =
+            cx.update(|_, cx| view.update(cx, |view, cx| view.input.read(cx).value().to_string()));
+        assert_eq!(value, "被拒绝的一句", "被拒的话应放回输入框");
     }
 
-    #[test]
-    fn 观点类回答被采纳而超长退回模板() {
-        // 管家人格可以给倾向性观点：不再因「建议/目标价」这类词整条丢弃，
-        // 校验只守诚实性底线（非空、限长、不谎称能下单）。
-        let (text, hint) = settle_text(
-            "我的看法是可以加仓美股，目标价到 45% 也不奇怪。",
-            "美股偏离 6.2pp（带宽 ±4.0pp）",
-            None,
+    /// 离线横幅：断连在场、连上撤下、再断连回来。
+    #[gpui_kit::test]
+    fn 离线时横幅在场连上后撤下(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, facts());
+        // 初始离线：还没连上守护进程。
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-offline").is_some(),
+            "离线应显示横幅"
         );
-        assert_eq!(text, "我的看法是可以加仓美股，目标价到 45% 也不奇怪。");
-        assert!(hint.is_none(), "通过校验的回答不该带降级提示");
 
-        let long = "话".repeat(crate::butler::talk::MAX_TALK_CHARS + 1);
-        let (text, hint) = settle_text(&long, "美股偏离 6.2pp（带宽 ±4.0pp）", None);
-        assert_eq!(
-            text, "美股偏离 6.2pp（带宽 ±4.0pp）",
-            "超长回答必须退回模板"
+        // 连上：横幅撤下。
+        let _uplink = view.update(cx, |view, _| fake_link(view));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-offline").is_none(),
+            "连上后横幅应撤下"
         );
-        let hint = hint.expect("要说明退回原因");
-        assert!(hint.contains("超过"), "提示应说明越界类型：{hint}");
-    }
 
-    #[test]
-    fn markdown在会话里原样保留给渲染层() {
-        // 气泡用 TextView::markdown 渲染，校验层不能把结构洗掉，也不能把
-        // 「- 结论：…」这类列表行当成机器字段删掉。
-        let (text, _) = settle_text(
-            "**美股** 低配 6.2pp。\n\n- 结论：先别动\n- 等决策日再看",
-            "模板",
-            None,
+        // 断连：横幅回来。
+        view.update(cx, |view, cx| view.go_offline(cx));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-offline").is_some(),
+            "断连应重新显示横幅"
         );
-        assert!(text.contains("**美股**"), "实际 {text}");
-        assert!(text.contains("- 结论：先别动"), "实际 {text}");
     }
 
     #[test]
@@ -1872,40 +1600,10 @@ mod tests {
         assert_eq!(bubble_text(Role::User, legacy), legacy);
     }
 
-    #[test]
-    fn 谎称已经下单会退回模板() {
-        // 唯一保留的会话硬底线：没有券商通道却说能下单是撒谎。
-        let (text, hint) = settle_text("已经帮你下单了，明天到账。", "模板句", None);
-        assert_eq!(text, "模板句", "谎称执行必须退回模板");
-        let hint = hint.expect("要说明退回原因");
-        assert!(hint.contains("执行下单"), "提示应说明退回原因：{hint}");
-    }
-
-    #[test]
-    fn agent失败时说明原因且保留模板() {
-        let (text, hint) = settle_text("", "美股偏离 6.2pp（带宽 ±4.0pp）", Some("agent 超时"));
-        assert_eq!(text, "美股偏离 6.2pp（带宽 ±4.0pp）");
-        let hint = hint.expect("失败要说清原因");
-        assert!(hint.starts_with("agent 超时"), "实际 {hint}");
-    }
-
-    #[test]
-    fn 超时但已有半截时保留内容并标注() {
-        let (text, hint) = settle_text(
-            "美股偏离 6.2pp，A股低配",
-            "模板句",
-            Some("agent 超过 120 秒没答完"),
-        );
-        assert_eq!(text, "美股偏离 6.2pp，A股低配", "已经生成的别扔掉");
-        assert!(
-            hint.expect("要说明这条没答完").contains("没答完"),
-            "用户得知道内容是被截断的"
-        );
-    }
-
     #[gpui_kit::test]
-    fn 回车发送而shift回车只换行(cx: &mut TestAppContext) {
+    fn 回车把话递出去而shift回车只换行(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
 
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -1917,16 +1615,10 @@ mod tests {
         });
         cx.simulate_keystrokes("enter");
 
-        let (sent, value) = cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                (
-                    view.session.messages.len(),
-                    view.input.read(cx).value().to_string(),
-                )
-            })
-        });
-        assert_eq!(sent, 2, "Enter 应直接发送一轮问答");
+        let value =
+            cx.update(|_, cx| view.update(cx, |view, cx| view.input.read(cx).value().to_string()));
         assert_eq!(value, "", "发送后输入框应清空");
+        expect_chat_send(&mut uplink, "回车能发吗");
 
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -1938,196 +1630,158 @@ mod tests {
         });
         cx.simulate_keystrokes("shift-enter");
 
-        let (sent, value) = cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                (
-                    view.session.messages.len(),
-                    view.input.read(cx).value().to_string(),
-                )
-            })
-        });
-        assert_eq!(sent, 2, "Shift+Enter 不应发送");
+        let value =
+            cx.update(|_, cx| view.update(cx, |view, cx| view.input.read(cx).value().to_string()));
         assert!(value.contains('\n'), "Shift+Enter 应换行，实际 {value:?}");
-    }
-
-    #[gpui_kit::test]
-    fn 记住与忘掉走记忆层且不写真实目录(cx: &mut TestAppContext) {
-        let (view, cx) = open(cx, facts());
-        let mut remember_reply = String::new();
-        let mut forget_reply = String::new();
-
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.input.update(cx, |input, cx| {
-                    input.set_value("记住：周五补美股", window, cx)
-                });
-                view.send(window, cx);
-                remember_reply = view.session.messages.last().expect("应有回复").text.clone();
-                assert_eq!(view.memory.facts.len(), 1, "意图应落进记忆");
-                assert!(!view.persist, "测试不得写真实账户目录");
-
-                view.input
-                    .update(cx, |input, cx| input.set_value("忘掉补美股", window, cx));
-                view.send(window, cx);
-                forget_reply = view.session.messages.last().expect("应有回复").text.clone();
-                assert!(view.memory.facts.is_empty(), "忘掉后不再参与表达");
-                assert_eq!(view.memory.archived_facts.len(), 1, "归档可查");
-            });
-        });
-
-        assert!(remember_reply.contains("记下了"), "实际 {remember_reply}");
         assert!(
-            remember_reply.contains("（到期"),
-            "回执应回显到期日，误解析才看得见，实际 {remember_reply}"
-        );
-        assert!(forget_reply.contains("拿掉了"), "实际 {forget_reply}");
-        assert!(
-            forget_reply.contains("· 到期"),
-            "删除回执要带日期，实际 {forget_reply}"
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&remember_reply).is_ok(),
-            "回复越过表达边界：{remember_reply}"
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&forget_reply).is_ok(),
-            "回复越过表达边界：{forget_reply}"
+            uplink.try_recv().is_err(),
+            "Shift+Enter 不该把话递给守护进程"
         );
     }
 
     #[gpui_kit::test]
-    fn 同文不同到期日忘掉必须带日期消歧(cx: &mut TestAppContext) {
+    fn 清除会话二次确认后才递意图且不抢先清本地副本(cx: &mut TestAppContext) {
         let (view, cx) = open(cx, facts());
-        let mut ambiguous = String::new();
-        let mut removed = String::new();
-
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                // 用绝对日期，避免测试依赖运行当天的日历。
-                view.input.update(cx, |input, cx| {
-                    input.set_value("记住 2026-12-27 截止 补美股", window, cx)
-                });
-                view.send(window, cx);
-                view.input.update(cx, |input, cx| {
-                    input.set_value("记住 2026-12-30 截止 补美股", window, cx)
-                });
-                view.send(window, cx);
-                assert_eq!(view.memory.facts.len(), 2, "不同到期日应各存一条");
-
-                // 不带日期：同文两条 → 歧义，一条不动，候选带日期。
-                view.input
-                    .update(cx, |input, cx| input.set_value("忘掉补美股", window, cx));
-                view.send(window, cx);
-                ambiguous = view.session.messages.last().expect("应有回复").text.clone();
-                assert_eq!(view.memory.facts.len(), 2, "歧义时一条都不能动");
-
-                // 带日期：只删那一天的那条。
-                view.input.update(cx, |input, cx| {
-                    input.set_value("忘掉 2026-12-27 截止 补美股", window, cx)
-                });
-                view.send(window, cx);
-                removed = view.session.messages.last().expect("应有回复").text.clone();
-                assert_eq!(view.memory.facts.len(), 1, "带日期只删那一条");
-            });
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
+        view.update(cx, |view, cx| {
+            let mut session = Session::default();
+            session.push(Message::user(Local::now(), "你好"));
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&session, false, "", None),
+                },
+                cx,
+            );
         });
 
-        assert!(
-            ambiguous.contains("2026-12-27") && ambiguous.contains("2026-12-30"),
-            "候选要带日期，实际 {ambiguous}"
-        );
-        assert!(
-            ambiguous.contains("带上日期"),
-            "要引导用户带日期，实际 {ambiguous}"
-        );
-        assert!(
-            removed.contains("2026-12-27"),
-            "回执要带删掉那条的日期，实际 {removed}"
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&ambiguous).is_ok(),
-            "回复越过表达边界：{ambiguous}"
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&removed).is_ok(),
-            "回复越过表达边界：{removed}"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn 问记得什么时念出常驻记忆(cx: &mut TestAppContext) {
-        let (view, cx) = open(cx, facts());
-        let mut recall = String::new();
-
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.input.update(cx, |input, cx| {
-                    input.set_value("记住：周五补美股", window, cx)
-                });
-                view.send(window, cx);
-                view.input
-                    .update(cx, |input, cx| input.set_value("你记得什么", window, cx));
-                view.send(window, cx);
-                recall = view.session.messages.last().expect("应有回复").text.clone();
-            });
-        });
-
-        // 「周五」被识别成到期日摘出了正文：条目原文是「补美股」，
-        // recall 必须把到期日念出来——用户要能核对管家记的日子对不对。
-        assert!(recall.contains("补美股"), "应念出条目原文，实际 {recall}");
-        assert!(
-            recall.contains("· 到期"),
-            "recall 应回显到期日，误解析才看得见，实际 {recall}"
-        );
-        assert!(
-            crate::butler::schedule::validate_dialogue(&recall).is_ok(),
-            "回复越过表达边界：{recall}"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn 清除会话需要二次确认(cx: &mut TestAppContext) {
-        let (view, cx) = open(cx, facts());
-        view.update(cx, |view, _| {
-            view.session.push(Message::user(Local::now(), "你好"));
-        });
-
+        // 第一次：只进入待确认，不动会话、不递意图。
         view.update(cx, |view, cx| view.clear_session(cx));
         view.update(cx, |view, _| {
             assert!(view.clear_armed, "第一次点击只进入待确认");
             assert_eq!(view.session.messages.len(), 1, "第一次点击不删消息");
         });
+        assert!(
+            uplink.try_recv().is_err(),
+            "第一次点击不该递 ChatClear"
+        );
 
+        // 第二次：意图递给守护进程；本地副本等快照整帧替换，不抢先清。
         view.update(cx, |view, cx| view.clear_session(cx));
+        match uplink.try_recv().expect("第二次确认应递 ChatClear") {
+            Signal::ChatClear => {}
+            other => panic!("应递 ChatClear，实际 {other:?}"),
+        }
         view.update(cx, |view, _| {
-            assert!(!view.clear_armed);
-            assert!(view.session.messages.is_empty(), "第二次点击才清空");
+            assert!(!view.clear_armed, "递出后退出待确认");
+            assert_eq!(
+                view.session.messages.len(),
+                1,
+                "本地副本不抢先清：磁盘上的真相由守护进程清，快照带回后再换"
+            );
         });
     }
 
-    /// 清空会话必须把 ACP session 一并作废（`AgentCommand::Stop` +
-    /// `started` 归位）：只删本地存档的话，下一句会以续问接在被清掉的
-    /// 上下文上——用户以为清了，其实没清。
-    ///
-    /// 测试窗口照常只起 runtime 的命令环：`Start` 从未发出，外部 agent
-    /// 进程不会存在；`Stop` 落在无活动会话上只是记一条系统行。
+    #[test]
+    fn 通知id只匹配对应消息且重复取最后一条() {
+        let mut session = Session::default();
+        session.push(Message::butler(Local::now(), "第一条"));
+        let mut targeted = Message::butler(Local::now(), "要定位的");
+        targeted.notice_id = Some("n1-abc".to_owned());
+        session.push(targeted);
+        session.push(Message::butler(Local::now(), "最后一条"));
+
+        assert_eq!(notice_index(&session.messages, "n1-abc"), Some(1));
+        assert_eq!(notice_index(&session.messages, "missing"), None);
+    }
+
     #[gpui_kit::test]
-    fn 清空会话后ACP会话一并作废下一问重新走start(cx: &mut TestAppContext) {
+    fn 点通知定位到消息并显示可关闭的上下文横幅(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
+        let mut session = Session::default();
+        let mut targeted = Message::butler(Local::now(), "要定位的那条通知");
+        targeted.notice_id = Some("n1-abc".to_owned());
+        session.push(targeted);
+        session.push(Message::butler(Local::now(), "后来的一条"));
         let (view, cx) = cx.add_window_view(|window, cx| {
-            ButlerView::with_session(Session::default(), facts(), window, cx).with_agent()
-        });
-        view.update(cx, |view, _| {
-            let chat = view.chat.as_mut().expect("真实窗口挂 ACP 会话");
-            chat.started = true; // 之前聊过：清空前 session 是续问状态
+            ButlerView::with_session(session, facts(), window, cx)
         });
 
-        view.update(cx, |view, cx| view.clear_session(cx)); // 第一次：待确认
-        view.update(cx, |view, cx| view.clear_session(cx)); // 第二次：真清
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-notice-banner").is_none(),
+            "没有点击通知时不该出现上下文横幅"
+        );
 
+        view.update(cx, |view, cx| view.focus_notice("n1-abc".to_owned(), cx));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-notice-banner").is_some(),
+            "定位后应显示通知上下文"
+        );
         view.update(cx, |view, _| {
-            let chat = view.chat.as_ref().expect("ACP 会话仍在");
-            assert!(!chat.started, "清空后下一问必须重新走 Start 而不是续问");
-            assert!(!view.turn.waiting, "等待中的回答随会话一起作废");
+            let focus = view.notice_focus.as_ref().expect("应保留通知上下文");
+            assert_eq!(focus.index, Some(0), "应定位到带该 id 的消息");
+            assert_eq!(focus.text.as_deref(), Some("要定位的那条通知"));
+        });
+
+        view.update(cx, |view, cx| view.dismiss_notice(cx));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-notice-banner").is_none(),
+            "点「知道了」后横幅应消失"
+        );
+    }
+
+    /// 通知先到、快照后到：窗口刚开时本地副本还没有那条消息，定位要等
+    /// 快照到了再解析——这正是「点通知拉起窗口」路径上的真实时序。
+    #[gpui_kit::test]
+    fn 通知先到快照后到也能定位(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, facts());
+        // 窗口刚开、还没收到任何快照：副本里没有那条消息。
+        view.update(cx, |view, cx| view.focus_notice("n1-abc".to_owned(), cx));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-notice-banner").is_none(),
+            "快照没到不该画横幅：先等会话真相"
+        );
+
+        // 快照到了：横幅出现，定位完成。
+        view.update(cx, |view, cx| {
+            let mut session = Session::default();
+            let mut targeted = Message::butler(Local::now(), "要定位的那条");
+            targeted.notice_id = Some("n1-abc".to_owned());
+            session.push(targeted);
+            view.handle_signal(
+                Signal::ChatSnapshot {
+                    json: snapshot_json(&session, false, "", None),
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("butler-notice-banner").is_some(),
+            "快照到了应画出横幅"
+        );
+        view.update(cx, |view, _| {
+            let focus = view.notice_focus.as_ref().expect("应定位到消息");
+            assert_eq!(focus.index, Some(0), "应定位到带该 id 的消息");
+            assert_eq!(focus.text.as_deref(), Some("要定位的那条"));
         });
     }
 }

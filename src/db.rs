@@ -37,18 +37,64 @@ pub struct Database {
     conn: Connection,
 }
 
+/// 多进程共库的底层调优：WAL + busy_timeout。
+///
+/// butlerd 常驻读、GUI / CLI 随手写的形态下，默认 rollback journal 会在
+/// 读写相撞时直接抛 `SQLITE_BUSY`；WAL 允许一写多读并存，busy_timeout
+/// 再兜住短暂的迁移窗口。`journal_mode` 是库文件的持久属性：升级后第一个
+/// 可写连接一次性完成迁移，之后的设置是幂等 no-op，因此失败不阻断打开
+/// （退回 rollback journal 时 busy_timeout 仍然挡着 BUSY）。
+fn tune(conn: &Connection) {
+    if let Err(error) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+        eprintln!("数据库 busy_timeout 设置失败：{error}");
+    }
+    // journal_mode 的 PRAGMA 会回一行结果，`pragma_update` 不收带结果的
+    // 语句，直接按查询读回。
+    if let Err(error) = conn.query_row("PRAGMA journal_mode=WAL", [], |_row| Ok(())) {
+        eprintln!("数据库 WAL 模式设置失败（沿用现有 journal 模式）：{error}");
+    }
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
+        Self::open_at(&crate::config::AppConfig::db_path()?)
+    }
+
+    /// 只读连接：给「只判定、不记账」的调用方（管家守护进程的事实计算）。
+    ///
+    /// 访问边界钉在连接标志上，比约定可靠——守护进程想写也没有写路径。
+    /// WAL 库的只读访问在「库被干净关闭（WAL 已 checkpoint）」或「有别的
+    /// 连接开着」时成立；两样都不满足时打开失败，调用方按「暂无账本」
+    /// 处理，下一次可写打开即恢复。
+    pub fn open_read_only() -> Result<Self> {
         let path = crate::config::AppConfig::db_path()?;
+        Self::open_read_only_at(&path)
+    }
+
+    fn open_at(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)
+        let conn = Connection::open(path)
             .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+        tune(&conn);
         let db = Self { conn };
         db.init_tables()?;
         db.ensure_cash_flow_opening()?;
         Ok(db)
+    }
+
+    fn open_read_only_at(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("打开数据库失败（只读）: {}", path.display()))?;
+        // 只读连接同样可能撞上短暂锁（如另一进程正在迁移 journal 模式）：
+        // 等待而不是立刻报错。
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("设置 busy_timeout 失败")?;
+        Ok(Self { conn })
     }
 
     fn init_tables(&self) -> Result<()> {
@@ -729,5 +775,113 @@ mod tests {
             review.last_trade,
             NaiveDate::from_ymd_opt(2026, 11, 11)
         );
+    }
+
+    /// 文件库的测试脚手架：`open()` 绑定真实账户路径，测试必须落临时目录
+    /// （与 `butler::store` 的测试同一约定）。
+    fn scratch_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mns-db-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir.join("mns.db")
+    }
+
+    #[test]
+    fn 可写连接打开后库处于_wal模式() {
+        let path = scratch_db("wal");
+        let db = Database::open_at(&path).expect("打开临时库");
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("读 journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode 应为 WAL");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn 只读连接能读但不能写() {
+        let path = scratch_db("readonly");
+        let db = Database::open_at(&path).expect("先建库");
+        db.conn
+            .execute(
+                "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date)
+                 VALUES ('buy', '007605', 1.0, 1.0, 1.0, '2026-11-19')",
+                [],
+            )
+            .expect("可写连接插入");
+
+        // 干净关闭（drop 即 checkpoint + 删 -wal/-shm）之后只读打开仍可读。
+        drop(db);
+        let reader = Database::open_read_only_at(&path).expect("只读打开");
+        let count: i64 = reader
+            .conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
+            .expect("只读查询");
+        assert_eq!(count, 1);
+        let denied = reader.conn.execute(
+            "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date)
+             VALUES ('buy', '007605', 1.0, 1.0, 1.0, '2026-11-20')",
+            [],
+        );
+        assert!(denied.is_err(), "只读连接必须拒绝写入");
+        drop(reader);
+
+        // 库不存在时只读打开失败：调用方按「暂无账本」处理，而不是拿到空库。
+        let missing = scratch_db("missing");
+        assert!(Database::open_read_only_at(&missing).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// P1 前置的并发契约：WAL 下「butlerd 正在读、GUI/CLI 正在写」不互相
+    /// 报错。读方持续读，写方连续插入，双方都必须成功——这正是分期计划里
+    /// 「GUI/CLI 写入时 butlerd 正在算 facts」并发测试的库层等价（SQLite
+    /// 对同进程多连接与多进程采用同一套文件锁语义）。
+    #[test]
+    fn 写入进行中读取不报_busy() {
+        let path = scratch_db("concurrent");
+        let writer = Database::open_at(&path).expect("可写连接");
+        writer
+            .conn
+            .execute(
+                "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date)
+                 VALUES ('buy', '007605', 1.0, 1.0, 1.0, '2026-11-19')",
+                [],
+            )
+            .expect("写入第一批");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let start = barrier.clone();
+        let read_path = path.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let conn = Connection::open_with_flags(
+                &read_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .expect("读者连接");
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            start.wait();
+            for _ in 0..50 {
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
+                    .expect("读取不得因并发写入报错");
+                assert!(count >= 1);
+            }
+        });
+
+        barrier.wait();
+        for round in 0..50 {
+            writer
+                .conn
+                .execute(
+                    "INSERT INTO transactions (type, asset_code, shares, price, amount, tx_date)
+                     VALUES ('buy', '007605', 1.0, 1.0, 1.0, '2026-11-20')",
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("第 {round} 轮写入不得因并发读取报错：{error}"));
+        }
+        reader_handle.join().expect("读者线程退出");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

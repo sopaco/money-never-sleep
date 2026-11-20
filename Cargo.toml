@@ -1,6 +1,6 @@
 [package]
 name = "money-never-sleep"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 description = "AI-Powered Contrarian Investment Decision Assistant"
 license = "MIT"
@@ -33,8 +33,9 @@ name = "mns-butler"
 path = "src/bin/mns-butler.rs"
 
 # Butler daemon: keeps evaluating wake sources (schedule / ledger / tasks) and
-# delivering notifications after the GUI window is closed. Reads `facts.json`
-# written by the GUI; never opens the ledger database.
+# delivering notifications after the GUI window is closed. Reads the ledger
+# directly through a read-only connection (facts computed at wake time); never
+# writes the ledger.
 #
 # `agent` is required: when the deterministic kernel has nothing to say, the
 # daemon may ask the external ACP agent for one short line (`agent-init`).

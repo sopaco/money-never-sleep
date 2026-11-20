@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod backtest;
+pub mod brief;
 pub mod butler;
 pub mod cli;
 pub mod config;

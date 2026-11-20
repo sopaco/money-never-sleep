@@ -9,15 +9,22 @@
 //! 额外好处：**连接关闭本身就是存活信号**——守护进程崩溃时 GUI 立刻收到
 //! `Disconnected`，不需要「90 秒没心跳就当它死了」这种阈值判断。
 //!
-//! 协议是 NDJSON，一行一条，行长上限 64KB。传输层按平台换，语义不变：
+//! 协议是 NDJSON，一行一条，行长上限 1MB。正常消息不到 100 字节；管家会话
+//! 的全量快照（`ChatSnapshot`，最多 200 条消息）可以到几百 KB，所以上限按
+//! 快照最坏情况放宽，仍用来挡住坏客户端。传输层按平台换，语义不变：
 //! Unix 走 `SOCK_STREAM`（`<数据目录>/run/<app>.sock`），Windows 走命名管道
 //! （`\\.\pipe\mns-<app>-<用户名>`）。两边共用同一份 `encode` / `decode`，
 //! 所以「连接活着 = 对方活着」在哪个平台都成立。
+//!
+//! P4 起连接是**双向**的：管家窗口对 `mns-butlerd` 建一条长连接
+//! （`connect_duplex`），上行发 `Chat*` 请求，下行收 `ChatSnapshot` /
+//! `ChatDelta` 推送；服务端用 `Listener::send_to` 定向推。`poke` 仍是
+//! 「连上就走」的短连接，供只需要递一句话的调用方使用。
 
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-/// 一行协议能有多大。正常消息不到 100 字节，这个上限只用来挡住坏客户端。
-const MAX_LINE: usize = 64 * 1024;
+/// 一行协议能有多大。见模块注释：按快照最坏情况取 1MB。
+const MAX_LINE: usize = 1024 * 1024;
 
 /// 客户端发来的请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +41,50 @@ pub enum Signal {
     /// GUI 改了「主动开口」开关，让守护进程用自己的状态文件落盘——避免两个
     /// 进程同时写 `state.json`。
     SetProactive { enabled: bool },
-    /// 守护进程刚产生一条开口，GUI 该来读 `pending.jsonl` 了。
-    Pending,
+    /// 托盘宿主请守护进程算一份托盘简报（数字取自账本快照）。
+    ///
+    /// 宿主不再常驻 AppShell，托盘上的总资产/偏离/建议只能向唯一的数据
+    /// 服务方要：判定与数字同源，托盘就不可能出现「界面一套、通知一套」。
+    RequestBrief,
+    /// 守护进程回给宿主的简报，`json` 是 `brief::BriefData` 的序列化。
+    Brief { json: String },
+    /// 把窗口翻到指定页面。托盘菜单「本月计划」与二次启动都走这条：
+    /// 窗口进程不在时先由宿主拉起，窗口已在时直接置前并翻页。
+    OpenPage { page: String },
+    /// 打开主窗口的「关于」面板（托盘「关于 MNS」）。
+    OpenAbout,
+    /// 守护进程 → 宿主：一条开口已并进会话存档（butlerd 单写），宿主只负责
+    /// 决定要不要弹系统横幅。`json` 是 `butler::orchestrator::Notice` 的
+    /// 序列化；宿主按 `notices.jsonl` 的 delivered 记录去重，重复下发
+    /// 不会重复弹。投递成功后 butlerd 才推进 `pending.offset`。
+    DeliverNotice { json: String },
+    /// 用户点了某条系统通知：请已打开的管家窗口定位到该条开口。
+    /// 窗口不在时由宿主带 `--notice <id>` 拉起，不走这条。
+    NoticeFocus { notice_id: String },
+    /// 管家窗口打开/获得焦点：宿主据此清掉托盘提示（会话已读标记由
+    /// butlerd 在 `ChatSeen` 里写）。
+    ButlerSeen,
+    /// 管家窗口请宿主拉起守护进程（离线横幅的「重试」按钮）。
+    /// 守护进程的生命周期始终归宿主：窗口不自己 spawn。
+    StartButler,
+    /// 宿主请已打开的主窗口刷新数据（托盘菜单「更新数据」）。
+    RefreshData,
+    /// 管家窗口 → butlerd：挂载会话（双向长连接上的第一帧），挂上即回
+    /// 全量快照。连接断开就是 detach，没有显式的告别帧。
+    ChatAttach,
+    /// 管家窗口 → butlerd：用户发了一句话。回合进行中会被明确拒绝（快照带
+    /// `restore` 让窗口把话放回输入框），不排队。
+    ChatSend { text: String },
+    /// 管家窗口 → butlerd：用户确认清空会话。
+    ChatClear,
+    /// 管家窗口 → butlerd：窗口已打开，标记会话已读。
+    ChatSeen,
+    /// butlerd → 管家窗口：会话全量快照。`json` 是
+    /// `butler::chat::ChatSnapshotData` 的序列化——session、等待态、半截
+    /// 正文、提示与错误一帧带全，窗口不维护第二份增量状态。
+    ChatSnapshot { json: String },
+    /// butlerd → 管家窗口：流式增量正文（只推 Message 正文块）。
+    ChatDelta { text: String },
     /// 请守护进程退出（托盘里的「停止管家进程」）。
     Shutdown,
     /// 主动告别，不必等连接断开。
@@ -55,12 +104,111 @@ pub enum Event {
 
 /// 监听端。必须存活到进程退出；`Drop` 会删掉 socket 文件（Windows 的命名
 /// 管道随最后一个句柄关闭而消失，不需要清理）。
+///
+/// P4 起监听端还能**向某条连接推送**（`send_to`）：管家会话的快照与增量
+/// 都从 butlerd 主动发往窗口的长连接。每条连接有一条有界出站队列——窗口
+/// 读得慢不能阻塞 butlerd 的回合推进，队列满了就断开这条连接，窗口重连
+/// 拿快照，不丢数据。
 pub struct Listener {
     /// 只为了活着：`Drop` 里删 socket 文件。
     #[cfg(unix)]
     _inner: unix_impl::Listener,
     #[cfg(windows)]
     _inner: windows_impl::Listener,
+}
+
+impl Listener {
+    /// 主动释放实例锁：删掉自己的 socket 文件，后续 `Drop` 不再重复。
+    ///
+    /// 退出前调用一次就够了：GPUI 的 `App` 全局表在事件循环结束时未必析构
+    /// （任务与回调里还挂着引用），只靠 `Drop` 会把 `*.sock` 留在磁盘上。
+    pub fn release(&mut self) {
+        #[cfg(unix)]
+        self._inner.release();
+    }
+
+    /// 向某条已连接的对端推送一帧。返回 `false` 表示连接不在了，或它的
+    /// 出站队列已满——满即断开（见模块注释），调用方不需要善后：对端会
+    /// 重连拿快照。
+    pub fn send_to(&self, conn_id: u64, signal: &Signal) -> bool {
+        #[cfg(unix)]
+        {
+            self._inner.send_to(conn_id, signal)
+        }
+        #[cfg(windows)]
+        {
+            self._inner.send_to(conn_id, signal)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (conn_id, signal);
+            false
+        }
+    }
+}
+
+/// 连接注册表：`conn_id → 有界出站队列`。
+///
+/// accept 线程插入，写线程退出 / 读线程退出时移除；`send_to` 在队列满时
+/// 也会移除（丢弃 sender 让写线程的 `recv` 返回断开，连接随之关闭）。
+/// 两个平台共用同一份实现。
+mod registry {
+    use super::Signal;
+    use std::collections::HashMap;
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    use std::sync::Mutex;
+
+    /// 每条连接的出站队列深度。快照最大 1MB，64 帧的内存上限足够吸收
+    /// 一次慢读的突发；再堵说明对端已经不读，断开重连比无限积压好。
+    pub(super) const OUTBOUND_QUEUE: usize = 64;
+
+    #[derive(Default)]
+    pub(super) struct Registry {
+        senders: Mutex<HashMap<u64, SyncSender<Signal>>>,
+    }
+
+    impl Registry {
+        pub(super) fn insert(&self, id: u64, sender: SyncSender<Signal>) {
+            self.senders
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, sender);
+        }
+
+        pub(super) fn remove(&self, id: u64) {
+            self.senders
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id);
+        }
+
+        /// 队列满也返回 `false` 并把这条连接拆掉：慢读者拿到断线后重连、
+        /// 重收全量快照，服务端回合不等待任何客户端。
+        pub(super) fn send(&self, id: u64, signal: &Signal) -> bool {
+            let guard = self.senders.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.get(&id) {
+                Some(sender) => match sender.try_send(signal.clone()) {
+                    Ok(()) => true,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        drop(guard);
+                        self.remove(id);
+                        false
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        drop(guard);
+                        self.remove(id);
+                        false
+                    }
+                },
+                None => false,
+            }
+        }
+    }
+
+    /// 建一条连接的出站队列。
+    pub(super) fn channel() -> (SyncSender<Signal>, std::sync::mpsc::Receiver<Signal>) {
+        sync_channel(OUTBOUND_QUEUE)
+    }
 }
 
 /// 连接失败的原因，调用方只需要区分「有人占着」和「没人」。
@@ -179,6 +327,47 @@ pub fn connect(app: &str) -> Result<Client, ConnectError> {
     }
 }
 
+/// 连接服务端并保持**双向**连接：返回可写的 `Client` 和服务端推送的接收端。
+///
+/// 管家窗口对 `mns-butlerd` 用这一条连接收发会话：上行 `Chat*` 请求走
+/// `Client::send`，下行的快照与增量从返回的通道里读。连接断开（服务端
+/// 退出、队列溢出被拆线）时通道关闭——调用方据此进入离线态或重连。
+pub fn connect_duplex(
+    app: &str,
+) -> Result<(Client, UnboundedReceiver<Signal>), ConnectError> {
+    #[cfg(unix)]
+    {
+        match unix_impl::connect(app) {
+            Ok(inner) => {
+                let (tx, rx) = unbounded_channel();
+                if let Err(error) = inner.start_reader(tx) {
+                    return Err(ConnectError::Io(error));
+                }
+                Ok((Client { inner }, rx))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match windows_impl::connect(app) {
+            Ok(inner) => {
+                let (tx, rx) = unbounded_channel();
+                if let Err(error) = inner.start_reader(tx) {
+                    return Err(ConnectError::Io(error));
+                }
+                Ok((Client { inner }, rx))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = app;
+        Err(ConnectError::Unsupported)
+    }
+}
+
 fn encode(signal: &Signal) -> String {
     let value = match signal {
         Signal::Open => serde_json::json!({ "kind": "open" }),
@@ -188,7 +377,27 @@ fn encode(signal: &Signal) -> String {
         Signal::SetProactive { enabled } => {
             serde_json::json!({ "kind": "set-proactive", "enabled": enabled })
         }
-        Signal::Pending => serde_json::json!({ "kind": "pending" }),
+        Signal::RequestBrief => serde_json::json!({ "kind": "request-brief" }),
+        Signal::Brief { json } => serde_json::json!({ "kind": "brief", "json": json }),
+        Signal::OpenPage { page } => serde_json::json!({ "kind": "open-page", "page": page }),
+        Signal::OpenAbout => serde_json::json!({ "kind": "open-about" }),
+        Signal::DeliverNotice { json } => {
+            serde_json::json!({ "kind": "deliver-notice", "json": json })
+        }
+        Signal::NoticeFocus { notice_id } => {
+            serde_json::json!({ "kind": "notice-focus", "notice_id": notice_id })
+        }
+        Signal::ButlerSeen => serde_json::json!({ "kind": "butler-seen" }),
+        Signal::StartButler => serde_json::json!({ "kind": "start-butler" }),
+        Signal::RefreshData => serde_json::json!({ "kind": "refresh-data" }),
+        Signal::ChatAttach => serde_json::json!({ "kind": "chat-attach" }),
+        Signal::ChatSend { text } => serde_json::json!({ "kind": "chat-send", "text": text }),
+        Signal::ChatClear => serde_json::json!({ "kind": "chat-clear" }),
+        Signal::ChatSeen => serde_json::json!({ "kind": "chat-seen" }),
+        Signal::ChatSnapshot { json } => {
+            serde_json::json!({ "kind": "chat-snapshot", "json": json })
+        }
+        Signal::ChatDelta { text } => serde_json::json!({ "kind": "chat-delta", "text": text }),
         Signal::Shutdown => serde_json::json!({ "kind": "shutdown" }),
         Signal::Bye => serde_json::json!({ "kind": "bye" }),
     };
@@ -216,7 +425,38 @@ fn decode(line: &str) -> Option<Signal> {
         "set-proactive" => Some(Signal::SetProactive {
             enabled: value.get("enabled").and_then(|flag| flag.as_bool())?,
         }),
-        "pending" => Some(Signal::Pending),
+        "request-brief" => Some(Signal::RequestBrief),
+        "brief" => Some(Signal::Brief {
+            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
+        }),
+        "open-page" => Some(Signal::OpenPage {
+            page: value.get("page").and_then(|page| page.as_str())?.to_owned(),
+        }),
+        "open-about" => Some(Signal::OpenAbout),
+        "deliver-notice" => Some(Signal::DeliverNotice {
+            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
+        }),
+        "notice-focus" => Some(Signal::NoticeFocus {
+            notice_id: value
+                .get("notice_id")
+                .and_then(|id| id.as_str())?
+                .to_owned(),
+        }),
+        "butler-seen" => Some(Signal::ButlerSeen),
+        "start-butler" => Some(Signal::StartButler),
+        "refresh-data" => Some(Signal::RefreshData),
+        "chat-attach" => Some(Signal::ChatAttach),
+        "chat-send" => Some(Signal::ChatSend {
+            text: value.get("text").and_then(|text| text.as_str())?.to_owned(),
+        }),
+        "chat-clear" => Some(Signal::ChatClear),
+        "chat-seen" => Some(Signal::ChatSeen),
+        "chat-snapshot" => Some(Signal::ChatSnapshot {
+            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
+        }),
+        "chat-delta" => Some(Signal::ChatDelta {
+            text: value.get("text").and_then(|text| text.as_str())?.to_owned(),
+        }),
         "shutdown" => Some(Signal::Shutdown),
         "bye" => Some(Signal::Bye),
         _ => None,
@@ -225,12 +465,14 @@ fn decode(line: &str) -> Option<Signal> {
 
 #[cfg(unix)]
 mod unix_impl {
-    use super::{Event, MAX_LINE, Signal, decode, encode};
+    use super::{Event, MAX_LINE, Signal, decode, encode, registry};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedSender;
 
     pub(super) fn socket_path(app: &str) -> PathBuf {
@@ -244,12 +486,42 @@ mod unix_impl {
 
     pub(super) struct Listener {
         path: PathBuf,
+        /// bind 时拿到的 inode / dev。`Drop` 只删「还是我那一份」的 socket：
+        /// 进程快速关停时，后继进程可能已经清理残file并重新 bind，无条件
+        /// 删除会把新人刚建好的 socket 拽掉，窗口就再也 poke 不到了。
+        identity: Option<(u64, u64)>,
+        /// 连接注册表：`send_to` 定向推送用。
+        registry: Arc<registry::Registry>,
+    }
+
+    impl Listener {
+        fn identity_of(path: &Path) -> Option<(u64, u64)> {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(path)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+        }
+
+        pub(super) fn release(&mut self) {
+            if Self::identity_of(&self.path) == self.identity {
+                let _ = fs::remove_file(&self.path);
+            }
+            // 置空后 `Drop` 直接返回，不会误删后继进程刚 bind 的文件。
+            self.identity = None;
+        }
+
+        pub(super) fn send_to(&self, conn_id: u64, signal: &Signal) -> bool {
+            self.registry.send(conn_id, signal)
+        }
     }
 
     impl Drop for Listener {
         fn drop(&mut self) {
             // Best effort：进程正常退出时把 socket 文件清掉，避免下次启动
             // 先探活再删。异常退出留下的残file由 `listen` 的探活处理。
+            if Self::identity_of(&self.path) != self.identity {
+                return;
+            }
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -280,6 +552,10 @@ mod unix_impl {
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let identity = Listener::identity_of(&path);
+
+        let registry = Arc::new(registry::Registry::default());
+        let thread_registry = registry.clone();
 
         std::thread::Builder::new()
             .name("mns-ipc-accept".to_owned())
@@ -292,15 +568,35 @@ mod unix_impl {
                     if tx.send(Event::Connected(id)).is_err() {
                         return;
                     }
-                    // 每条连接一个线程：一个卡住的客户端不能堵住 accept。
+                    // 双向连接：读线程与写线程各持一份克隆的流。读线程解析
+                    // 上行帧；写线程从有界出站队列取帧推送，队列满即拆线。
+                    let Ok(write_half) = stream.try_clone() else {
+                        let _ = tx.send(Event::Disconnected(id));
+                        continue;
+                    };
+                    let (out_tx, out_rx) = registry::channel();
+                    thread_registry.insert(id, out_tx);
+                    let read_registry = thread_registry.clone();
+                    // 每条连接两个线程：一个卡住的客户端不能堵住 accept，
+                    // 一个读得慢的客户端也不能堵住服务端推送。
                     let tx = tx.clone();
                     let _ = std::thread::Builder::new()
                         .name(format!("mns-ipc-{id}"))
-                        .spawn(move || read_connection(id, stream, tx));
+                        .spawn(move || {
+                            read_connection(id, stream, tx);
+                            read_registry.remove(id);
+                        });
+                    let _ = std::thread::Builder::new()
+                        .name(format!("mns-ipc-{id}-w"))
+                        .spawn(move || write_connection(write_half, out_rx));
                 }
             })?;
 
-        Ok(Listener { path })
+        Ok(Listener {
+            path,
+            identity,
+            registry,
+        })
     }
 
     fn read_connection(id: u64, stream: UnixStream, tx: UnboundedSender<Event>) {
@@ -325,14 +621,72 @@ mod unix_impl {
         let _ = tx.send(Event::Disconnected(id));
     }
 
+    /// 服务端推送线程：从有界队列取帧写出。队列被拆（慢读者）或对端断开
+    /// 都直接退出——退出即关闭写半边，对端读侧看到 EOF 自行重连。
+    fn write_connection(stream: UnixStream, rx: std::sync::mpsc::Receiver<Signal>) {
+        let mut writer = stream;
+        while let Ok(signal) = rx.recv() {
+            let line = encode(&signal);
+            if writer.write_all(line.as_bytes()).is_err()
+                || writer.flush().is_err()
+            {
+                break;
+            }
+        }
+    }
+
     pub(super) struct Client {
         stream: UnixStream,
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            // 关闭即 detach：`shutdown` 作用于 socket 本身，而不是某个 fd。
+            // 只 drop 手里这份 fd 不够——`connect_duplex` 的读线程持有同一
+            // socket 的克隆，连接会保持半开：服务端看不到 EOF（永远收不到
+            // Disconnected），读线程也永远等不来数据。`Both` 让两个方向
+            // 同时收摊：服务端读侧立刻拿到 EOF，本进程读线程也随即退出并
+            // 关闭下行通道。短连接（poke）同样受益：发完即 FIN。
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
     }
 
     impl Client {
         pub(super) fn send(&mut self, signal: &Signal) -> std::io::Result<()> {
             self.stream.write_all(encode(signal).as_bytes())?;
             self.stream.flush()
+        }
+
+        /// 双向连接的读半边：独立线程持续读行，解码后送进通道。对端断开
+        /// （或被服务端拆线）时通道关闭，调用方感知为「连接没了」。
+        pub(super) fn start_reader(
+            &self,
+            tx: UnboundedSender<Signal>,
+        ) -> std::io::Result<()> {
+            let stream = self.stream.try_clone()?;
+            std::thread::Builder::new()
+                .name("mns-ipc-client-read".to_owned())
+                .spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if line.len() > MAX_LINE {
+                                    break;
+                                }
+                                if let Some(signal) = decode(&line)
+                                    && tx.send(signal).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .map(|_| ())
         }
     }
 
@@ -368,11 +722,12 @@ mod unix_impl {
 /// 天然按用户目录隔离。
 #[cfg(windows)]
 mod windows_impl {
-    use super::{Event, MAX_LINE, Signal, decode, encode};
+    use super::{Event, MAX_LINE, Signal, decode, encode, registry};
     use std::ffi::c_void;
     use std::fs::File;
     use std::io::{BufRead, BufReader, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedSender;
 
     /// Win32 句柄。管道句柄可以交给 `std::fs::File` 托管：有了 `Read` /
@@ -434,6 +789,9 @@ mod windows_impl {
             template: Handle,
         ) -> Handle;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+        /// 取消指定句柄上挂起的 I/O。dup 出去的读句柄指向同一管道文件对象，
+        /// 在任一克隆上调用都能打断另一克隆里阻塞中的 `ReadFile`。
+        fn CancelIoEx(handle: Handle, overlapped: *mut c_void) -> i32;
     }
 
     /// 管道名：`\\.\pipe\mns-<app>-<用户名>`。
@@ -454,7 +812,16 @@ mod windows_impl {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub(super) struct Listener;
+    pub(super) struct Listener {
+        /// 连接注册表：`send_to` 定向推送用。
+        registry: Arc<registry::Registry>,
+    }
+
+    impl Listener {
+        pub(super) fn send_to(&self, conn_id: u64, signal: &Signal) -> bool {
+            self.registry.send(conn_id, signal)
+        }
+    }
 
     pub(super) fn create_instance(name: &str, first: bool) -> std::io::Result<File> {
         let name = wide(name);
@@ -509,6 +876,9 @@ mod windows_impl {
         let name = pipe_name(app);
         let mut pending = create_instance(&name, true)?;
 
+        let registry = Arc::new(registry::Registry::default());
+        let thread_registry = registry.clone();
+
         std::thread::Builder::new()
             .name("mns-ipc-accept".to_owned())
             .spawn(move || {
@@ -543,15 +913,29 @@ mod windows_impl {
                     if tx.send(Event::Connected(id)).is_err() {
                         return;
                     }
-                    // 每条连接一个线程：一个卡住的客户端不能堵住 accept。
+                    // 双向连接：读线程与写线程各持一份克隆的句柄。读线程解析
+                    // 上行帧；写线程从有界出站队列取帧推送，队列满即拆线。
+                    let Ok(write_half) = connected.try_clone() else {
+                        let _ = tx.send(Event::Disconnected(id));
+                        continue;
+                    };
+                    let (out_tx, out_rx) = registry::channel();
+                    thread_registry.insert(id, out_tx);
+                    let read_registry = thread_registry.clone();
                     let tx = tx.clone();
                     let _ = std::thread::Builder::new()
                         .name(format!("mns-ipc-{id}"))
-                        .spawn(move || read_connection(id, connected, tx));
+                        .spawn(move || {
+                            read_connection(id, connected, tx);
+                            read_registry.remove(id);
+                        });
+                    let _ = std::thread::Builder::new()
+                        .name(format!("mns-ipc-{id}-w"))
+                        .spawn(move || write_connection(write_half, out_rx));
                 }
             })?;
 
-        Ok(Listener)
+        Ok(Listener { registry })
     }
 
     /// 建下一条管道实例：成功路径用它「先建好下一条再收当前连接」，
@@ -596,14 +980,74 @@ mod windows_impl {
         let _ = tx.send(Event::Disconnected(id));
     }
 
+    /// 服务端推送线程：从有界队列取帧写出。队列被拆（慢读者）或对端断开
+    /// （`WriteFile` 报 `ERROR_BROKEN_PIPE`）都直接退出——退出即放弃句柄，
+    /// 对端读侧看到 EOF 自行重连。
+    fn write_connection(pipe: File, rx: std::sync::mpsc::Receiver<Signal>) {
+        let mut writer = pipe;
+        while let Ok(signal) = rx.recv() {
+            let line = encode(&signal);
+            if writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+    }
+
     pub(super) struct Client {
         pipe: File,
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            // 关闭即 detach（与 Unix 的 `shutdown(Both)` 对应）：读线程持有
+            // 同一管道对象 dup 出来的句柄，单纯 drop 手里这份不会让阻塞中的
+            // `ReadFile` 返回。CancelIoEx 打断挂起的读，读线程随即退出并
+            // 关闭下行通道；两边句柄都放手后服务端下一次读看到断管。
+            // 没有挂起 I/O 时调用只会失败（ERROR_NOT_FOUND），无害。
+            unsafe {
+                CancelIoEx(self.pipe.as_raw_handle() as Handle, std::ptr::null_mut());
+            }
+        }
     }
 
     impl Client {
         pub(super) fn send(&mut self, signal: &Signal) -> std::io::Result<()> {
             self.pipe.write_all(encode(signal).as_bytes())?;
             self.pipe.flush()
+        }
+
+        /// 双向连接的读半边：独立线程持续读行，解码后送进通道。对端断开
+        /// （或被服务端拆线）时通道关闭，调用方感知为「连接没了」。
+        pub(super) fn start_reader(
+            &self,
+            tx: UnboundedSender<Signal>,
+        ) -> std::io::Result<()> {
+            let pipe = self.pipe.try_clone()?;
+            std::thread::Builder::new()
+                .name("mns-ipc-client-read".to_owned())
+                .spawn(move || {
+                    let mut reader = BufReader::new(pipe);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            // 客户端关掉连接时 `ReadFile` 报 `ERROR_BROKEN_PIPE`，
+                            // 和读到 EOF 一样：这条连接到此为止。
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if line.len() > MAX_LINE {
+                                    break;
+                                }
+                                if let Some(signal) = decode(&line)
+                                    && tx.send(signal).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .map(|_| ())
         }
     }
 
@@ -686,6 +1130,22 @@ mod tests {
         assert_eq!(decode(&line), Some(Signal::OpenButler));
     }
 
+    /// 关窗/重开同样的窗口模式时，旧进程的 `Drop` 与新人 bind 会撞在一起：
+    /// 旧人若无条件 `remove_file`，会把新人刚建好的 socket 一起删掉，宿主
+    /// 之后再也 poke 不到窗口，只能反复 spawn 新进程。
+    #[cfg(unix)]
+    #[test]
+    fn 旧监听退出不会删掉后继的_socket() {
+        let app = format!("mns-sock-replace-{}", std::process::id());
+        let path = super::unix_impl::socket_path(&app);
+        let (first, _events) = listen(&app).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let (_second, _events) = listen(&app).unwrap();
+        drop(first);
+        assert!(path.exists(), "旧监听的 Drop 不应删掉新监听的 socket");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn hello_带角色() {
         let line = encode(&Signal::Hello {
@@ -729,6 +1189,66 @@ mod tests {
         }
         // 缺字段的消息不能当成 false 处理，否则会误关用户的开关。
         assert_eq!(decode("{\"kind\":\"set-proactive\"}\n"), None);
+    }
+
+    #[test]
+    fn 宿主与守护进程的新信号可往返() {
+        assert_eq!(decode(&encode(&Signal::RequestBrief)), Some(Signal::RequestBrief));
+        assert_eq!(decode(&encode(&Signal::ButlerSeen)), Some(Signal::ButlerSeen));
+        assert_eq!(decode(&encode(&Signal::RefreshData)), Some(Signal::RefreshData));
+        assert_eq!(decode(&encode(&Signal::StartButler)), Some(Signal::StartButler));
+        assert_eq!(decode(&encode(&Signal::ChatAttach)), Some(Signal::ChatAttach));
+        assert_eq!(decode(&encode(&Signal::ChatClear)), Some(Signal::ChatClear));
+        assert_eq!(decode(&encode(&Signal::ChatSeen)), Some(Signal::ChatSeen));
+
+        let brief = Signal::Brief {
+            json: "{\"total_assets\":1.0}".to_owned(),
+        };
+        assert_eq!(decode(&encode(&brief)), Some(brief));
+
+        let page = Signal::OpenPage {
+            page: "plan".to_owned(),
+        };
+        assert_eq!(decode(&encode(&page)), Some(page));
+
+        let notice = Signal::DeliverNotice {
+            json: "{\"draft\":\"你好\"}".to_owned(),
+        };
+        assert_eq!(decode(&encode(&notice)), Some(notice));
+
+        let send = Signal::ChatSend {
+            text: "现在偏离多少".to_owned(),
+        };
+        assert_eq!(decode(&encode(&send)), Some(send));
+
+        let delta = Signal::ChatDelta {
+            text: "美股偏离".to_owned(),
+        };
+        assert_eq!(decode(&encode(&delta)), Some(delta));
+
+        let snapshot = Signal::ChatSnapshot {
+            json: "{\"session\":[]}".to_owned(),
+        };
+        assert_eq!(decode(&encode(&snapshot)), Some(snapshot));
+
+        let focus = Signal::NoticeFocus {
+            notice_id: "a1b2".to_owned(),
+        };
+        assert_eq!(decode(&encode(&focus)), Some(focus));
+
+        // 缺载荷的帧不是一个「空」信号：宁可不理解，也不要把它当成有效指令。
+        assert_eq!(decode("{\"kind\":\"brief\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"open-page\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"deliver-notice\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"chat-send\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"chat-delta\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"chat-snapshot\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"notice-focus\"}\n"), None);
+
+        // P4 删掉的旧 kind：已经没有消费者，解码必须拒绝，不能复活成
+        // 「未知但被忽略」之外的语义。
+        assert_eq!(decode("{\"kind\":\"pending\"}\n"), None);
+        assert_eq!(decode("{\"kind\":\"notice\"}\n"), None);
     }
 
     /// 命名管道能跑通「连上 → 发一帧 → 断开」，且断开会被当成存活信号。
@@ -830,6 +1350,71 @@ mod tests {
                 Event::Signal(_, other) => panic!("收到意外的信号：{other:?}"),
             }
         }
+    }
+
+    /// P4 的管家会话通道：窗口 `connect_duplex` 建双向连接，上行发请求、
+    /// 下行收 butlerd 的推送；断开就是 detach，服务端 `send_to` 对已断开的
+    /// 连接返回 `false` 而不是阻塞。
+    #[test]
+    fn 双向连接能收能发_断开即_detach() {
+        let app = format!("mns-ipc-duplex-{}", std::process::id());
+        let (listener, mut events) = listen(&app).expect("监听本地通道");
+        let (mut client, mut downstream) =
+            connect_duplex(&app).expect("双向连接");
+
+        client.send(&Signal::ChatAttach).expect("上行发 attach");
+
+        // 服务端视角：先 Connected，再收到 ChatAttach（Signal 帧自带连接 id）。
+        let conn_id = loop {
+            match events.blocking_recv().expect("事件通道关闭") {
+                Event::Connected(_) => {}
+                Event::Signal(id, signal) => {
+                    assert_eq!(signal, Signal::ChatAttach, "应收到 attach");
+                    break id;
+                }
+                Event::Disconnected(_) => panic!("连接提前断开"),
+            }
+        };
+
+        // 服务端推送一帧快照：走有界出站队列，不占事件通道。
+        let snapshot = Signal::ChatSnapshot {
+            json: "{\"session\":[]}".to_owned(),
+        };
+        assert!(
+            listener.send_to(conn_id, &snapshot),
+            "活跃连接的推送应成功"
+        );
+        // 重复推给不存在的连接：返回 false，不阻塞、不 panic。
+        assert!(!listener.send_to(conn_id + 999, &snapshot), "未知连接应返回 false");
+
+        match downstream.blocking_recv().expect("下行通道关闭") {
+            got @ Signal::ChatSnapshot { .. } => assert_eq!(got, snapshot),
+            other => panic!("下行应收到快照，实际 {other:?}"),
+        }
+
+        // 客户端断开：服务端收到 Disconnected；此后 send_to 报 false。
+        drop(client);
+        loop {
+            match events.blocking_recv().expect("事件通道关闭") {
+                Event::Disconnected(id) => {
+                    assert_eq!(id, conn_id);
+                    break;
+                }
+                Event::Connected(_) | Event::Signal(..) => continue,
+            }
+        }
+        // 断开后队列可能仍在（写线程还没消费），但最终会被清理；这里只要求
+        // 不阻塞。等写线程退出后再验证 remove 生效——用一个短暂的收尾窗口。
+        let mut gone = false;
+        for _ in 0..50 {
+            if !listener.send_to(conn_id, &snapshot) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "断开的连接最终应从注册表消失");
+        drop(listener);
     }
 
     /// `ERROR_NO_DATA` 之后必须换实例继续监听（确定性复现，Windows 专属）。

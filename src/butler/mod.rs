@@ -8,6 +8,7 @@
 //! 负责把结论说得像人话。
 
 pub mod agenda;
+pub mod chat;
 pub mod events;
 pub mod expression;
 pub mod memory;

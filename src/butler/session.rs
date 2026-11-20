@@ -36,6 +36,9 @@ pub struct Message {
     pub reason: Option<SpeakReason>,
     #[serde(default)]
     pub trigger: Option<String>,
+    /// 主动开口对应的通知 id：点系统通知进来时用它定位到这一条。
+    #[serde(default)]
+    pub notice_id: Option<String>,
 }
 
 impl Message {
@@ -46,6 +49,7 @@ impl Message {
             text: text.into(),
             reason: None,
             trigger: None,
+            notice_id: None,
         }
     }
 
@@ -56,6 +60,7 @@ impl Message {
             text: text.into(),
             reason: None,
             trigger: None,
+            notice_id: None,
         }
     }
 }
@@ -122,7 +127,13 @@ impl Session {
 
     /// 用户清除会话。只删这一份文件，不碰助手存档与账本。
     pub fn clear() -> Result<()> {
-        match std::fs::remove_file(Self::path()) {
+        Self::clear_at(&Self::path())
+    }
+
+    /// 路径可注入版本：测试与 `butler::chat` 服务用 scratch 目录，不碰
+    /// 真实账户目录。
+    pub fn clear_at(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
@@ -200,5 +211,23 @@ mod tests {
         session.push(Message::butler(at(4), "第二条"));
         session.push(Message::user(at(5), "又回复"));
         assert_eq!(session.unread(), 1);
+    }
+
+    #[test]
+    fn 旧消息缺通知字段仍可读() {
+        let path = scratch("legacy-notice");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"messages":[{"at":"2026-11-16T09:00:00+08:00","role":"butler","text":"旧格式"}],"last_read_at":null}"#,
+        )
+        .unwrap();
+        let loaded = Session::load_from(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(
+            loaded.messages[0].notice_id.is_none(),
+            "旧存档不带通知 id，读取时不能报错"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

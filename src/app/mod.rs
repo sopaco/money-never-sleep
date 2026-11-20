@@ -404,31 +404,33 @@ pub fn ensure_initialized() -> Result<bool> {
     Ok(true)
 }
 
-/// 记账之后刷新管家事实，并在守护进程在跑时叫醒它。
+/// 记账之后叫醒管家守护进程。
 ///
 /// GUI 有自己的热快照，走 `gui::run_butler_wake_from`；这个函数给 CLI 用：
 /// 用户关掉 GUI 后在终端里入金，管家也应该马上知道，而不是等下一次巡检。
 ///
-/// 只做两件事：把当前账户折算成 `AccountFacts` 落盘、通过本地通道发一条
-/// 账本事件。守护进程不在时第二件事静默失败，不改任何行为。
+/// 事实由守护进程自己从账本读取（`butler::orchestrator::ledger_facts`），
+/// 这里只剩「叫醒」一件事。守护进程不在时静默失败，不改任何行为。
 pub fn publish_butler_ledger(kind: &str) {
     let now = chrono::Local::now();
-    let facts = match load_snapshot() {
-        Ok(snapshot) => crate::butler::AccountFacts::from_snapshot(&snapshot, now),
-        // 读不到账户就别编事实：守护进程会用上一份，或干脆不开口。
-        Err(_) => return,
-    };
-    if let Err(error) = crate::butler::orchestrator::write_facts(now, &facts) {
-        eprintln!("管家事实落盘失败：{error:#}");
-        return;
-    }
     let id = format!("cli:{kind}:{}", now.timestamp_millis());
     let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger: Some(id) });
 }
 
 pub fn load_snapshot() -> Result<Snapshot> {
+    snapshot_from_database(Database::open()?)
+}
+
+/// 只读快照：给「只判定、不记账」的调用方（管家守护进程）。
+///
+/// 与 [`load_snapshot`] 同一份计算，只是连接不可写——守护进程对账本的
+/// 访问边界在连接标志层钉死，而不是靠约定。
+pub fn load_snapshot_read_only() -> Result<Snapshot> {
+    snapshot_from_database(Database::open_read_only()?)
+}
+
+fn snapshot_from_database(db: Database) -> Result<Snapshot> {
     let config = AppConfig::load()?;
-    let db = Database::open()?;
     let today = Local::now().date_naive();
 
     let positions = db.list_positions()?;

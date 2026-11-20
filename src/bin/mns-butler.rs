@@ -15,7 +15,7 @@ use money_never_sleep::butler::orchestrator::{self, agent_init_backoff};
 use money_never_sleep::butler::tasks::{
     ButlerTask, MAX_ACTIVE, MAX_NEW_PER_DAY, TaskKind, TaskOrigin, TaskVerdict,
 };
-use money_never_sleep::butler::{AccountFacts, Butler, memory, schedule};
+use money_never_sleep::butler::{Butler, memory, schedule};
 
 #[derive(Parser)]
 #[command(
@@ -278,42 +278,15 @@ fn wake(ledger: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    let mut facts = match money_never_sleep::app::load_snapshot() {
-        Ok(snapshot) => {
-            AccountFacts::from_snapshot(&snapshot, now).with_promises(
-                &Butler::load()?.memory,
-                now.date_naive(),
-            )
-        }
-        Err(error) => {
-            // 账户还没初始化也要能回答「为什么没说话」：只是没有账本事实。
-            eprintln!("提示：未读到账户快照（{error:#}），本轮按空账户判定。");
-            AccountFacts::default()
-        }
-    };
-
-    // 行为画像：同一天同一页面看 ≥5 次才算高频。它不再作为开口由头，
-    // 只进入事实文件，供管家在会话里回答「今天看了几次」。
-    let since = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("合法零点")
-        .and_local_timezone(Local)
-        .single()
-        .unwrap_or(now);
-    let window = events::summarize(&events::read_all().unwrap_or_default(), since);
-    if let Some((page, views)) = window
-        .page_views
-        .iter()
-        .max_by_key(|(_, views)| **views)
-        && window.is_heavy_checking(page)
-    {
-        facts.heavy_page = Some((page_label(page).to_owned(), *views));
-    }
+    // 与守护进程同一条事实路径（`orchestrator::ledger_facts`）：谁判定谁
+    // 计算，审计复算与常驻判定看到的是同一套事实，含价格新鲜度闸门。
+    let base = money_never_sleep::butler::orchestrator::ledger_facts(now);
 
     // 读-改-写全程持锁（守护进程没在跑才会走到这里）。
     let _guard = money_never_sleep::butler::writer_lock();
     let mut butler = Butler::load()?;
+    // 承诺来自记忆文件：与判定用的是同一份 butler 状态。
+    let facts = base.with_promises(&butler.memory, now.date_naive());
     let report = butler.wake(&source, now, &facts);
     butler.save()?;
 
@@ -686,10 +659,6 @@ fn set_proactive(enabled: bool) -> Result<()> {
     butler.save_state()?;
     println!("主动开口：{label}");
     Ok(())
-}
-
-fn page_label(key: &str) -> &str {
-    events::page_label(key)
 }
 
 fn parse_local(text: &str) -> Result<chrono::DateTime<Local>> {

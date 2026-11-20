@@ -364,7 +364,13 @@ impl Memory {
     }
 
     pub fn load() -> Result<Self> {
-        Ok(read_json(&Self::path())?.unwrap_or_default())
+        Self::load_at(&Self::path())
+    }
+
+    /// 路径可注入版本：测试与 `butler::chat` 服务用 scratch 目录，不碰
+    /// 真实账户目录。
+    pub fn load_at(path: &std::path::Path) -> Result<Self> {
+        Ok(read_json(path)?.unwrap_or_default())
     }
 
     pub fn save(&self) -> Result<()> {

@@ -5,23 +5,17 @@
 //! - macOS:   `~/Library/LaunchAgents/com.mns.app.plist`
 //! - Linux:   `~/.config/autostart/mns.desktop`
 //!
-//! 写入的命令都带 [`BACKGROUND_ARG`]，进程启动后只常驻托盘、不打开窗口；
-//! 用户自己双击图标启动时没有这个参数，仍会正常打开主窗口。
+//! 写入的命令都带 [`BACKGROUND_ARG`]。P2 起无参数启动 = 宿主常驻 Dock 并
+//! 开一次主窗；登录项带 `--tray`，只驻留 Dock/托盘，不替用户开窗。
 
 use std::path::PathBuf;
 
 #[cfg(windows)]
 use super::command;
 
-/// 静默启动参数。登录自启动项写入的就是它。
+/// 历史静默启动参数。`--tray` 现在只表示「不自动开主窗」，宿主仍常驻
+/// Dock（Dock 是系统级稳定入口，不会被菜单栏溢出藏掉）。
 pub const BACKGROUND_ARG: &str = "--tray";
-
-/// 本次进程是否由登录自启动拉起（只驻留托盘）。
-pub fn launched_in_background() -> bool {
-    std::env::args()
-        .skip(1)
-        .any(|arg| arg == BACKGROUND_ARG || arg == "--background")
-}
 
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|error| format!("无法定位程序路径：{error}"))

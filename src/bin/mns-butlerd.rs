@@ -17,21 +17,25 @@
 //! 1. 按唤醒源跑一次**确定性**判定；
 //! 2. 判定要开口时，往 `outbox.jsonl`（审计）与 `pending.jsonl`（投递）各写
 //!    一行；
-//! 3. 通过本地唤醒通道告诉 GUI「有新话」，让 GUI 把消息并进会话存档；
+//! 3. 把开口并进会话存档（P4 起本进程是唯一写者），再把投递推给宿主，
+//!    由宿主决定要不要弹系统横幅；
 //! 4. 确定性内核没有由头时，按需起一次外部 ACP agent，问它有没有一句值得
 //!    主动说的话（`agent-init`）。回答必须过通知口径（≤60 字、无买卖话术），
 //!    否则本轮沉默；runtime 每轮 `Shutdown`，不留下空闲进程。
 //!
 //! **它不发系统通知**。macOS 只认 app 的主可执行文件：同 bundle 的守护进程
 //! 调 `requestAuthorization` 会拿到 `UNErrorDomain 1`（notificationsNotAllowed）。
-//! 判定可以拆进程，送达不行——GUI 收到 `Pending` 后自己发。
+//! 判定可以拆进程，送达不行——宿主收到 `DeliverNotice` 后自己发。
 //!
-//! 它**不打开数据库**：账户事实由 GUI / CLI 写进 `facts.json`
-//! （`AccountFacts`），这里只读那一份。这是结构保证——本文件的 `use` 里没有
-//! `crate::app`、没有 `rusqlite`，想偷偷读账本得先改这段代码。
+//! 它**只读账本**：唤醒时自己用只读连接从数据库提取账户事实
+//! （`orchestrator::ledger_facts`），不再依赖 GUI 写出的 `facts.json`——
+//! GUI 多久没开都不影响判定。只读边界钉在连接标志上：本进程对账本没有
+//! 写路径。
 //!
-//! 会话存档（`conversation.json`）始终只有 GUI 一个写者；守护进程崩溃也不会
-//! 留下半截对话。
+//! 会话存档（`conversation.json`）P4 起只有本进程一个写者（`butler::chat`）：
+//! 管家窗口降级为投影，挂上拿快照、断开即 detach，窗口关掉不丢回合——
+//! 回答照常收完落盘，重连拿全量快照。ACP 会话的 runtime 也归本进程，
+//! 退出时随本进程一起收掉。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,25 +45,19 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use money_never_sleep::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource};
 use money_never_sleep::butler::agenda;
+use money_never_sleep::butler::chat::{self, ChatEffect};
 use money_never_sleep::butler::orchestrator::{
-    self, AccountFacts, AgentInitOutcome, AgentInitRecord, AGENT_INIT_MIN_IDLE_HOURS,
+    self, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice, AGENT_INIT_MIN_IDLE_HOURS,
     agent_init_backoff, append_init_record,
 };
 use money_never_sleep::butler::schedule;
 use money_never_sleep::butler::talk;
 use money_never_sleep::butler::{
-    butler_dir, writer_lock, Butler, Session, SilentBecause, SpeakCandidate, SpeakDecision,
-    SpeakReason, WakeSource, WakeVerdict,
+    writer_lock, Butler, Session, SilentBecause, SpeakCandidate, SpeakDecision, SpeakReason,
+    WakeSource, WakeVerdict,
 };
-use money_never_sleep::ipc::{self, Client, Signal};
-use tokio::sync::mpsc::UnboundedSender;
-
-/// 事实超过这个年龄就整份不信：仓位可能早就变了，拿旧数字开口等于编造。
-const FACTS_MAX_AGE_HOURS: i64 = 24 * 7;
-
-/// 超过这个年龄只保留「与价格无关」的由头（到点任务、承诺到期）。
-/// 一天的旧价格不足以支撑「偏离多少」，但足以支撑「今天该检查什么」。
-const FACTS_PRICE_AGE_HOURS: i64 = 24;
+use money_never_sleep::ipc::{self, Client, Listener, Signal};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// 单次睡眠的上限。
 ///
@@ -83,7 +81,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     // 监听在前：已有守护进程在跑时直接退出，不做第二个。
-    let (_listener, mut events) = match ipc::listen("mns-butlerd") {
+    let (listener, mut events) = match ipc::listen("mns-butlerd") {
         Ok(pair) => pair,
         Err(error) => {
             eprintln!("mns-butlerd: {error}（已有守护进程在运行）");
@@ -96,9 +94,25 @@ async fn run() -> Result<()> {
 
     // agent-init 跑在独立任务里：`start_runtime` 自己起线程，等待回答的
     // 120 秒不能占住这条 select 循环，否则托盘停止与账本唤醒都要排队。
-    // 任务完成后只回一条「去读 pending」，连接仍归主线程独有。
+    // 任务完成后只回一条「去排空 pending」，连接仍归主线程独有。
     let (init_tx, mut init_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let init_busy = Arc::new(AtomicBool::new(false));
+
+    // P4：管家会话归本进程。窗口只是投影——挂上拿快照、断开即 detach，
+    // 广播没人收就丢弃，回合照常收完落盘。
+    let mut chat = ChatState::new(listener);
+    // 会话用的 ACP runtime 与 agent-init 的各自独立：同一个 `start_runtime`
+    // 起的两套线程，互不共用会话。会话这套活到进程退出，由 `finish` 收掉。
+    let (agent_handle, mut agent_events) = money_never_sleep::agent::start_runtime();
+    let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let runtime = ChatRuntime {
+        agent: agent_handle,
+        timeouts: timeout_tx,
+    };
+
+    // 启动排空：宿主可能整晚没开，攒下的开口此刻并进会话并试着投递。
+    // 投不出去的进 backlog，等宿主上线或 30 秒一轮重试。
+    chat.drain_pending(&mut link, &runtime).await;
 
     loop {
         let now = Local::now();
@@ -125,20 +139,46 @@ async fn run() -> Result<()> {
                 // 退出：连接断开后 GUI 会收回巡检与通知。
                 let Some(event) = event else {
                     link.send(&Signal::Bye);
+                    finish(&mut chat, &runtime, agent_events).await;
                     return Ok(());
                 };
-                if handle_event(event, &mut link, &init_busy, &init_tx) {
+                if handle_event(event, &mut chat, &mut link, &runtime, &init_busy, &init_tx).await {
+                    finish(&mut chat, &runtime, agent_events).await;
                     return Ok(());
                 }
             }
-            // agent-init 已经写好 pending：主线程负责通知 GUI。
+            // 会话的超时回调：定时器到点回一个回合序号，对不上就是空转。
+            Some(turn) = timeout_rx.recv() => {
+                let effects = chat.service.on_timeout(turn);
+                chat.apply(effects, &runtime);
+            }
+            // 会话的 ACP 事件：正文增量、回合结束、失败、授权请求。
+            event = agent_events.recv() => {
+                let effects = match event {
+                    Some(event) => chat.service.on_agent_event(event),
+                    // runtime 线程意外退出（正常退出只会发生在 finish 之后）：
+                    // 把在飞的一轮按失败收尾，别让等待挂到天荒地老。
+                    None => chat.service.on_agent_event(AgentEvent::Failed {
+                        message: "agent runtime 已退出".to_owned(),
+                    }),
+                };
+                chat.apply(effects, &runtime);
+            }
+            // agent-init 已经写好 pending：并进会话并投递。
             Some(()) = init_rx.recv() => {
-                link.send(&Signal::Pending);
+                chat.drain_pending(&mut link, &runtime).await;
             }
             _ = shutdown_requested() => {
                 // 主动告别：GUI 立刻知道判定权回到自己手里，不用等连接 EOF。
                 link.send(&Signal::Bye);
+                finish(&mut chat, &runtime, agent_events).await;
                 return Ok(());
+            }
+            // 投递积压的重试节拍：没有这条分支，宿主一直不在线时 backlog
+            // 要等到下一次事件才有机会出去。sleep 在每次循环重建，事件频繁
+            // 时会被重置——没关系，那些路径各自都会顺手排一次积压。
+            _ = tokio::time::sleep(Duration::from_secs(30)), if !link.backlog.is_empty() => {
+                chat.drain_pending(&mut link, &runtime).await;
             }
             _ = tokio::time::sleep(wait) => {
                 // 睡眠被 MAX_SLEEP 截断时还没到点：只重算，不判定。否则一条
@@ -146,7 +186,7 @@ async fn run() -> Result<()> {
                 if let Some(due) = due
                     && Local::now() >= due.at
                 {
-                    wake(&mut link, due.source, &init_busy, &init_tx);
+                    wake(&mut chat, &mut link, &runtime, due.source, &init_busy, &init_tx).await;
                 }
             }
         }
@@ -164,9 +204,11 @@ fn until(now: DateTime<Local>, at: DateTime<Local>) -> Duration {
 }
 
 /// 处理一条事件。返回 `true` 表示该退出（仅 `Shutdown`）。
-fn handle_event(
+async fn handle_event(
     event: ipc::Event,
+    chat: &mut ChatState,
     link: &mut GuiLink,
+    runtime: &ChatRuntime,
     init_busy: &Arc<AtomicBool>,
     init_tx: &UnboundedSender<()>,
 ) -> bool {
@@ -176,25 +218,96 @@ fn handle_event(
                 Some(id) => WakeSource::Ledger { id },
                 None => WakeSource::Scheduled,
             };
-            wake(link, source, init_busy, init_tx);
+            wake(chat, link, runtime, source, init_busy, init_tx).await;
+        }
+        ipc::Event::Signal(_, Signal::RequestBrief) => {
+            // 宿主不在本进程里跑，托盘数字只能问这里要。读快照是阻塞调用，
+            // 与唤醒同一处理：放阻塞线程池，别占住 select 循环。
+            let brief = match tokio::task::spawn_blocking(|| {
+                match money_never_sleep::app::load_snapshot_read_only() {
+                    Ok(snapshot) => {
+                        orchestrator::record_health(true, None);
+                        money_never_sleep::brief::BriefData::from_snapshot(&snapshot)
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        orchestrator::record_health(false, Some(message.clone()));
+                        money_never_sleep::brief::BriefData::from_error(message)
+                    }
+                }
+            })
+            .await
+            {
+                Ok(brief) => brief,
+                Err(error) => money_never_sleep::brief::BriefData::from_error(format!(
+                    "简报计算任务失败：{error}"
+                )),
+            };
+            if let Ok(json) = serde_json::to_string(&brief) {
+                link.send(&Signal::Brief { json });
+            }
+            // 宿主刚跟我们说过话：顺手排一次投递积压。
+            chat.drain_pending(link, runtime).await;
         }
         ipc::Event::Signal(_, Signal::SetProactive { enabled }) => {
             if let Err(error) = set_proactive(enabled) {
                 eprintln!("mns-butlerd: 保存主动开口开关失败：{error:#}");
             }
         }
+        // 窗口挂载：记下连接，回一帧全量快照。挂载不代表回合清零——窗口
+        // 断开期间回答照常累积在会话里，快照一帧带全。
+        ipc::Event::Signal(conn, Signal::ChatAttach) => {
+            chat.conn = Some(conn);
+            let effects = chat.service.attach();
+            chat.apply(vec![effects], runtime);
+            chat.drain_pending(link, runtime).await;
+        }
+        // 用户发话：账户事实是整段阻塞调用（只读连接全库读取），放阻塞
+        // 线程池算完再进会话服务。
+        ipc::Event::Signal(_, Signal::ChatSend { text }) => {
+            let facts = match tokio::task::spawn_blocking(move || {
+                chat::current_facts(Local::now())
+            })
+            .await
+            {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("mns-butlerd: 会话事实计算任务失败：{error}");
+                    AccountFacts::default()
+                }
+            };
+            let effects = chat.service.send(text, &facts);
+            chat.apply(effects, runtime);
+        }
+        ipc::Event::Signal(_, Signal::ChatClear) => {
+            let effects = chat.service.clear();
+            chat.apply(effects, runtime);
+        }
+        ipc::Event::Signal(_, Signal::ChatSeen) => {
+            let effects = chat.service.seen();
+            chat.apply(effects, runtime);
+        }
         // GUI 重连时也会发 Hello：重新对上连接，别让 GUI 以为没人在。
         ipc::Event::Signal(_, Signal::Hello { .. }) => link.ensure(),
         // 托盘「停止管家进程」。GUI 之后会收到断开并收回巡检与通知。
         ipc::Event::Signal(_, Signal::Shutdown) => return true,
         ipc::Event::Signal(_, Signal::Bye) => {}
-        ipc::Event::Signal(_, _) | ipc::Event::Connected(_) | ipc::Event::Disconnected(_) => {}
+        // 窗口断开就是 detach：没有告别帧。等待中的一轮继续跑，广播
+        // 从此丢弃，落盘不受影响。
+        ipc::Event::Disconnected(id) => {
+            if chat.conn == Some(id) {
+                chat.conn = None;
+            }
+        }
+        ipc::Event::Signal(_, _) | ipc::Event::Connected(_) => {}
     }
     false
 }
 
-fn wake(
+async fn wake(
+    chat: &mut ChatState,
     link: &mut GuiLink,
+    runtime: &ChatRuntime,
     source: WakeSource,
     init_busy: &Arc<AtomicBool>,
     init_tx: &UnboundedSender<()>,
@@ -202,6 +315,20 @@ fn wake(
     // GUI 可能在我们上次发送之后重启过：先确认连接，既是重连也是 Hello。
     link.ensure();
     let now = Local::now();
+
+    // 账本快照是整段阻塞调用（只读连接全库读取 + 指标计算）。本进程跑在
+    // current_thread runtime 上：直接调用会占住 select 循环，巡检期间到达
+    // 的停止与账本唤醒都得排队。放阻塞线程池读，读完回主线判定。
+    let (ledger, ledger_error) =
+        match tokio::task::spawn_blocking(move || orchestrator::ledger_facts_report(now)).await {
+            Ok((facts, error)) => (facts, error),
+            Err(error) => {
+                eprintln!("mns-butlerd: 账户事实计算任务失败：{error}");
+                (AccountFacts::default(), Some(format!("账户事实计算任务失败：{error}")))
+            }
+        };
+    // 成败都落一次：失败让托盘亮红灯，成功把旧错误清掉。
+    orchestrator::record_health(ledger_error.is_none(), ledger_error);
 
     // 读-改-写全程持锁：GUI 巡检与 CLI 可能同时各跑一份判定，后保存的
     // 会把先保存的去重键覆盖回旧值。
@@ -213,9 +340,9 @@ fn wake(
             return;
         }
     };
-    // 承诺来自记忆文件（不是账本），所以由守护进程自己算「今天到期的承诺」：
-    // GUI 可能整天没打开，它的快照里不会有别人这一天该提的事。
-    let facts = account_facts(&butler, now);
+    // 承诺来自记忆文件（不是账本），在锁内与判定合并：同一份 butler 状态，
+    // 「明天到期的承诺」不需要 GUI 那天恰好打开过。
+    let facts = ledger.with_promises(&butler.memory, now.date_naive());
 
     let report = butler.wake(&source, now, &facts);
     if report.wake != WakeVerdict::Wake {
@@ -227,7 +354,7 @@ fn wake(
 
     match report.speak {
         Some(SpeakDecision::Speak(candidate)) => {
-            // 审计队列与投递队列各一行：前者只追加，后者由 GUI 按偏移消费。
+            // 审计队列与投递队列各一行：前者只追加，后者由本进程按偏移消费。
             if let Err(error) = orchestrator::enqueue_notice(now, &candidate) {
                 eprintln!("mns-butlerd: 出站队列写入失败：{error:#}");
             }
@@ -235,8 +362,8 @@ fn wake(
                 eprintln!("mns-butlerd: 待投递队列写入失败：{error:#}");
             }
 
-            // GUI 没在跑也没关系：它下次连上来时会在 `Hello` 之后补齐积压。
-            link.send(&Signal::Pending);
+            // 并进会话（本进程是唯一写者）再投给宿主；宿主不在就进积压。
+            chat.drain_pending(link, runtime).await;
         }
         // 确定性内核没有由头时，才让 agent 自己找话头。只认定时巡检与
         // 失败重试：「刚记完一笔账」是账本事件，不该变成一次闲聊。
@@ -308,10 +435,24 @@ async fn run_agent_init() -> Result<bool> {
         (butler, session)
     };
 
-    let facts = account_facts(&butler, now);
+    // 账户事实与判定同源：只读连接算出来（阻塞调用放阻塞线程池，理由同
+    // `wake`），承诺在锁外合并——`butler` 是刚从锁内读出的那份。
+    let ledger = match tokio::task::spawn_blocking(move || orchestrator::ledger_facts_report(now)).await
+    {
+        Ok((facts, error)) => {
+            orchestrator::record_health(error.is_none(), error);
+            facts
+        }
+        Err(error) => {
+            eprintln!("mns-butlerd: 账户事实计算任务失败：{error}");
+            orchestrator::record_health(false, Some(format!("账户事实计算任务失败：{error}")));
+            AccountFacts::default()
+        }
+    };
+    let facts = ledger.with_promises(&butler.memory, now.date_naive());
     let memory = talk::memory_lines(&butler.memory, now.date_naive());
     let recent = talk::recent_lines(&session);
-    let settings = chat_settings();
+    let settings = chat::chat_settings();
     let goal = init_goal(&settings, &facts, &memory, &recent);
 
     let (handle, mut events) = money_never_sleep::agent::start_runtime();
@@ -502,16 +643,6 @@ fn agent_init_trigger(ledger: &schedule::SpeakLedger, now: DateTime<Local>) -> S
     format!("{prefix}{seq}")
 }
 
-/// 主动开口用的 agent 设置。工作目录固定到管家数据目录，理由同
-/// `gui::butler`：避免继承项目仓库里的 AGENTS.md 约定。
-fn chat_settings() -> money_never_sleep::agent::AgentSettings {
-    let mut settings = money_never_sleep::agent::load_settings();
-    let dir = butler_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    settings.working_dir = dir.to_string_lossy().into_owned();
-    settings
-}
-
 /// 主动开口的首轮 goal。
 ///
 /// `settings.agent_cli` 是运行这次会话的 ACP 程序（opencode），不是数据入口。
@@ -527,44 +658,6 @@ fn init_goal(
 ) -> String {
     let _ = settings;
     talk::agent_init_goal(facts, memory, recent)
-}
-
-/// 账户事实，按年龄决定能信多少。
-///
-/// 没有事实不等于「账户是空的」——那会让偏离、决策日这些判断凭空成立。所以
-/// 缺事实时退化成 `AccountFacts::default()`：只会产出「到点任务」「承诺到期」
-/// 这类不依赖数字的由头，不会编造一条偏离。
-fn account_facts(butler: &Butler, now: DateTime<Local>) -> AccountFacts {
-    let facts = match orchestrator::read_facts() {
-        Ok(Some((at, facts))) => {
-            let age = now.signed_duration_since(at);
-            if age > chrono::Duration::hours(FACTS_MAX_AGE_HOURS) {
-                // 一周没更新过：账户可能早已不是这个样子，宁可不说话。
-                AccountFacts::default()
-            } else if age > chrono::Duration::hours(FACTS_PRICE_AGE_HOURS)
-                || at.date_naive() != now.date_naive()
-            {
-                // 跨天的事实：偏离、当日入金、决策日都是「那一天」的判断，不能挪用。
-                let mut facts = facts;
-                facts.drift.clear();
-                facts.new_cash_today = 0.0;
-                facts.plan_ready = false;
-                facts.decision_day = false;
-                facts.heavy_page = None;
-                facts
-            } else {
-                facts
-            }
-        }
-        Ok(None) => AccountFacts::default(),
-        Err(error) => {
-            eprintln!("mns-butlerd: 账户事实读取失败：{error:#}");
-            AccountFacts::default()
-        }
-    };
-    // 承诺与数字无关，始终以记忆文件为准：这样「明天到期的承诺」不需要
-    // GUI 那天恰好打开过。
-    facts.with_promises(&butler.memory, now.date_naive())
 }
 
 fn set_proactive(enabled: bool) -> Result<()> {
@@ -603,6 +696,134 @@ async fn shutdown_requested() {
     }
 }
 
+/// 会话 ACP runtime 的把手：命令通道 + 超时回调。
+///
+/// 拆成结构体只是让 `ChatState::apply` 的签名放得下；两个把手同生同灭——
+/// daemon 启动时起线程，退出时 `finish` 发 `Shutdown`。
+struct ChatRuntime {
+    agent: AgentHandle,
+    timeouts: UnboundedSender<u64>,
+}
+
+/// P4 的管家会话通道：会话服务 + 窗口挂载点。
+///
+/// 窗口来去只改 `conn`；服务与 runtime 不动——detach 期间回合照常推进、
+/// 照常落盘，窗口重连拿全量快照就能追上。
+struct ChatState {
+    service: chat::ChatService,
+    /// 已挂载窗口的连接 id；`None` = 没人看着，广播丢弃，会话照走。
+    conn: Option<u64>,
+    /// 会话通道的监听端：`send_to` 定向推给挂载的窗口。
+    listener: Listener,
+}
+
+impl ChatState {
+    fn new(listener: Listener) -> Self {
+        Self {
+            service: chat::ChatService::new(),
+            conn: None,
+            listener,
+        }
+    }
+
+    /// 落地一串会话效果：推给挂着的窗口、起超时定时器、命令 runtime。
+    /// 没有窗口时 `Broadcast` 丢弃——订阅者数量不参与回合推进。
+    fn apply(&mut self, effects: Vec<ChatEffect>, runtime: &ChatRuntime) {
+        for effect in effects {
+            match effect {
+                ChatEffect::Broadcast(signal) => {
+                    if let Some(conn) = self.conn {
+                        // 出站队列满（慢读者）即拆线：窗口自己重连拿快照，
+                        // 不能让一个卡住的窗口拖住会话服务。
+                        self.listener.send_to(conn, &signal);
+                    }
+                }
+                ChatEffect::Timeout { turn } => {
+                    let timeouts = runtime.timeouts.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(chat::CHAT_TIMEOUT).await;
+                        let _ = timeouts.send(turn);
+                    });
+                }
+                ChatEffect::Runtime(command) => {
+                    if runtime.agent.send(command).is_err() {
+                        // runtime 线程没了：按失败收尾这一轮，别把「正在想」
+                        // 挂到天荒地老。收尾只会再产生广播，不会递归。
+                        let effects = self.service.on_agent_event(AgentEvent::Failed {
+                            message: "agent runtime 已退出".to_owned(),
+                        });
+                        self.apply(effects, runtime);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 排空待投递队列：并进会话（按 `notice_id` 幂等），逐条投给宿主，
+    /// **全部成功才推进偏移**；投不出去的留在 backlog 等下一轮。
+    ///
+    /// 顺序不能反：先并进会话再投递的话，宿主崩溃重启也不会丢消息——
+    /// 偏移没动，重启后重读重投，会话层有幂等，宿主侧有 delivered 去重。
+    async fn drain_pending(&mut self, link: &mut GuiLink, runtime: &ChatRuntime) {
+        if link.backlog.is_empty() {
+            let offset = orchestrator::read_pending_offset();
+            let Ok((new_offset, notices)) = orchestrator::take_pending(offset) else {
+                return;
+            };
+            if notices.is_empty() {
+                return;
+            }
+            link.backlog = notices;
+            link.backlog_offset = Some(new_offset);
+        }
+        let notices = std::mem::take(&mut link.backlog);
+        let effects = self.service.merge_notices(&notices, self.conn.is_some());
+        self.apply(effects, runtime);
+
+        // 逐条投给宿主：宿主按 notices.jsonl 的 delivered 记录去重，所以
+        // 重投是安全的；这里按发送成败决定要不要留着重试。
+        let mut undelivered = Vec::new();
+        for notice in notices {
+            // 序列化失败（实际上不可能：全是字符串与时间戳）只能跳过，
+            // 不能让一条坏数据堵住后面的。
+            let Ok(json) = serde_json::to_string(&notice) else {
+                continue;
+            };
+            if link.send(&Signal::DeliverNotice { json }) {
+                continue;
+            }
+            undelivered.push(notice);
+        }
+        link.backlog = undelivered;
+        if link.backlog.is_empty() {
+            if let Some(offset) = link.backlog_offset.take() {
+                orchestrator::write_pending_offset(offset);
+            }
+        }
+    }
+}
+
+/// 退出收尾：放弃在飞的一轮（不落半截回答），请会话 runtime 自行结束，
+/// 限时等它收摊。
+///
+/// `Shutdown` → runner 命令循环 break → 事件通道关闭（`recv` 得 `None`）→
+/// ACP 连接 Drop → 子进程组被 SIGKILL。限时 3 秒：收不掉也不能陪葬，
+/// 宿主会在连接断开后收回巡检与通知。
+async fn finish(
+    chat: &mut ChatState,
+    runtime: &ChatRuntime,
+    mut agent_events: UnboundedReceiver<AgentEvent>,
+) {
+    let effects = chat.service.shutdown();
+    for effect in effects {
+        if let ChatEffect::Runtime(command) = effect {
+            let _ = runtime.agent.send(command);
+        }
+        // Broadcast：都要退了，没有要照顾的订阅者。
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(3), agent_events.recv()).await;
+}
+
 /// 到 GUI 的长连接。
 ///
 /// 「连接活着」本身就是心跳：GUI 关掉时写失败，下一次 `ensure` 重连；守护
@@ -610,6 +831,11 @@ async fn shutdown_requested() {
 #[derive(Default)]
 struct GuiLink {
     client: Option<Client>,
+    /// 没投出去的 pending 条目：宿主不在线时攒着，30 秒一轮或宿主/窗口
+    /// 下次说话时重试。空 = 没有积压。
+    backlog: Vec<Notice>,
+    /// backlog 对应的 `pending.jsonl` 目标偏移：全部投出去才推进。
+    backlog_offset: Option<u64>,
 }
 
 impl GuiLink {

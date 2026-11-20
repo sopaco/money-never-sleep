@@ -12,7 +12,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// 点击事件走通道而不是轮询：回调在哪个线程都能 `send`，GUI 侧用
 /// `recv().await` 挂起等待，空闲时零唤醒。
-static OPEN_TX: OnceLock<UnboundedSender<()>> = OnceLock::new();
+///
+/// 载荷是通知 id（旧版通知没有 userInfo 时为 `None`）。宿主拿它把点击落到
+/// 具体那一条开口上，而不是只开一个空窗。
+static OPEN_TX: OnceLock<UnboundedSender<Option<String>>> = OnceLock::new();
 
 /// 点击通知会让系统激活整个 app，`.on_activate` 会把隐藏的主窗口顶到前面。
 /// 这个标记告诉 `ShowMainWindow`：这次激活来自管家通知，别抢焦点。
@@ -20,6 +23,11 @@ static OPEN_TX: OnceLock<UnboundedSender<()>> = OnceLock::new();
 /// 用时间戳而不是布尔：如果 app 本来就是激活状态，`on_activate` 不会触发，
 /// 标记不能被下一次「用户点 Dock 图标」误消费。
 static CLICK_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// 这次点击对应哪条通知。与 `CLICK_AT` 分开存：`on_reopen` 只知道「是通知
+/// 点进来的」，真正把 id 注入窗口的是通道消费端；两边都能读到同一个 id。
+static CLICK_NOTICE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+    std::sync::Mutex::new(None);
 
 /// 建立点击通道并安装通知回调，返回点击事件的接收端。
 ///
@@ -29,7 +37,7 @@ static CLICK_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex
 /// `mns-gui`；守护进程产生的开口通过 `pending.jsonl` 交给 GUI 发。
 ///
 /// 测试态与 `cargo run`（无 bundle）下空操作，但通道仍然可用。
-pub fn init() -> UnboundedReceiver<()> {
+pub fn init() -> UnboundedReceiver<Option<String>> {
     let (tx, rx) = unbounded_channel();
     let _ = OPEN_TX.set(tx);
     #[cfg(target_os = "macos")]
@@ -38,11 +46,22 @@ pub fn init() -> UnboundedReceiver<()> {
 }
 
 /// 送达一条通知。正文已经过开口判定的长度与话术校验。
-pub fn send(text: &str) {
+///
+/// `notice_id` 写进 `userInfo`：系统把整条 `UNNotificationResponse` 交回来
+/// 时，宿主能知道用户点的是哪一条（只靠正文匹配会在两条同文案时串号）。
+///
+/// 返回 `true` 表示已交给系统投递（不是「用户已看到」）；未打包的开发
+/// 二进制、非 macOS 平台返回 `false`，调用方据此不要把审计写成「已送达」。
+pub fn send(text: &str, notice_id: &str) -> bool {
     #[cfg(target_os = "macos")]
-    macos::send(text);
+    {
+        macos::send(text, notice_id)
+    }
     #[cfg(not(target_os = "macos"))]
-    let _ = text;
+    {
+        let _ = (text, notice_id);
+        false
+    }
 }
 
 /// 消费「这次激活是点通知来的」标记。只有一次；没点过通知就返回 false。
@@ -57,18 +76,33 @@ pub fn take_click_pending() -> bool {
     }
 }
 
+/// 最近一次通知点击的 id（非消费）。`on_reopen` 与通道消费端都会读它，
+/// 谁先到都能拿到同一份；10 秒之外的旧记录视为无关，不再返回。
+pub fn recent_click_notice() -> Option<Option<String>> {
+    let slot = CLICK_NOTICE.lock().ok()?;
+    let (at, id) = slot.as_ref()?;
+    if at.elapsed() < std::time::Duration::from_secs(10) {
+        Some(id.clone())
+    } else {
+        None
+    }
+}
+
 /// 由 `UNUserNotificationCenterDelegate` 调用，可能在任意线程。
 ///
 /// 只有 macOS 有通知回调；其他平台没有调用方，别留下一个永不被使用的函数
 /// 让 Windows 构建报警告。
 #[cfg(target_os = "macos")]
-fn on_click() {
+fn on_click(notice_id: Option<String>) {
     if let Ok(mut slot) = CLICK_AT.lock() {
         *slot = Some(std::time::Instant::now());
     }
+    if let Ok(mut slot) = CLICK_NOTICE.lock() {
+        *slot = Some((std::time::Instant::now(), notice_id.clone()));
+    }
     if let Some(tx) = OPEN_TX.get() {
         // 接收端只在进程退出时消失；发送失败说明 GUI 已在关闭，忽略即可。
-        let _ = tx.send(());
+        let _ = tx.send(notice_id);
     }
 }
 
@@ -79,8 +113,8 @@ mod macos {
     use objc2::define_class;
     use objc2::msg_send;
     use objc2::rc::Retained;
-    use objc2::runtime::{Bool, ProtocolObject};
-    use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
+    use objc2::runtime::{AnyObject, Bool, ProtocolObject};
+    use objc2_foundation::{NSBundle, NSDictionary, NSError, NSObject, NSObjectProtocol, NSString};
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
         UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
@@ -116,11 +150,33 @@ mod macos {
             fn did_receive(
                 &self,
                 _center: &UNUserNotificationCenter,
-                _response: &UNNotificationResponse,
+                response: &UNNotificationResponse,
                 completion_handler: &DynBlock<dyn Fn()>,
             ) {
-                super::on_click();
-                eprintln!("[mns-gui] 收到通知点击，准备打开管家");
+                // `userInfo` 里的 notice_id 由发送端写入。旧版通知没有这个键，
+                // 读不到就退回「只开管家窗」的旧行为，不能让点击变成空操作。
+                let content = response.notification().request().content();
+                let info = content.userInfo();
+                let key = NSString::from_str("notice_id");
+                let notice_id = unsafe {
+                    let raw: *mut AnyObject = msg_send![&*info, objectForKey: &*key];
+                    if raw.is_null() {
+                        None
+                    } else {
+                        let utf8: *const std::ffi::c_char = msg_send![raw, UTF8String];
+                        if utf8.is_null() {
+                            None
+                        } else {
+                            Some(
+                                std::ffi::CStr::from_ptr(utf8)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            )
+                        }
+                    }
+                };
+                eprintln!("[mns-gui] 收到通知点击（id={notice_id:?}），准备打开管家");
+                super::on_click(notice_id);
                 completion_handler.call(());
             }
         }
@@ -178,15 +234,16 @@ mod macos {
             .getNotificationSettingsWithCompletionHandler(&handler);
     }
 
-    pub(super) fn send(text: &str) {
+    pub(super) fn send(text: &str, notice_id: &str) -> bool {
         if !bundled() {
-            return;
+            return false;
         }
         let body = text.to_owned();
+        let notice_id = notice_id.to_owned();
         // 未询问时才弹系统授权框；已允许直接送达，已拒绝不要反复打扰。
         let handler = RcBlock::new(move |granted: Bool, error: *mut NSError| {
             if granted.as_bool() {
-                deliver(&body);
+                deliver(&body, &notice_id);
             } else if !error.is_null() {
                 // 把系统给的原因打出来：没有这一行，「没弹横幅」只能靠猜。
                 let message = unsafe { (*error).localizedDescription() };
@@ -200,18 +257,28 @@ mod macos {
                 UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
                 &handler,
             );
+        // 授权回调是异步的；这里只能承诺「已提交投递」。被系统拒绝时会打日志，
+        // 审计不把那种情况写成 delivered 由宿主侧另行判断（见 `consume_pending`）。
+        true
     }
 
-    fn deliver(text: &str) {
+    fn deliver(text: &str, notice_id: &str) {
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str("MNS · 管家"));
         content.setBody(&NSString::from_str(text));
         content.setSound(Some(&UNNotificationSound::defaultSound()));
-        let identifier = NSString::from_str(&format!(
-            "mns-butler-{}",
-            chrono::Local::now().timestamp_millis()
-        ));
+        // 点击回调只拿得到 request 的内容，正文可能重复（同一事件重发），
+        // 所以身份必须走 userInfo。
+        let key = NSString::from_str("notice_id");
+        let value = NSString::from_str(notice_id);
+        let info: Retained<NSDictionary<NSString, NSString>> =
+            NSDictionary::from_slices(&[&*key], &[&*value]);
+        unsafe {
+            content.setUserInfo(info.cast_unchecked::<AnyObject, AnyObject>());
+        }
+        // 用 notice_id 做系统侧标识：同一事件重发会替换旧横幅而不是叠两条。
+        let identifier = NSString::from_str(&format!("mns-butler-{notice_id}"));
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &identifier,
             &content,

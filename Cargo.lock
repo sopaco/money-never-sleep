@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "money-never-sleep"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

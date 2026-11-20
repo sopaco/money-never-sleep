@@ -46,9 +46,9 @@ impl DriftRow {
 /// 决定层需要的账户事实。刻意做成扁平结构：给定这一份，`candidates` 的
 /// 输出完全可复算，不读数据库、不联网、不调模型。
 ///
-/// 这份结构同时是 GUI 与守护进程之间的契约文件（`agent/butler/facts.json`）：
-/// 守护进程不碰 `mns.db`，只读 GUI 算好的事实，所以「管家只读账本」是结构
-/// 保证而不是策略约定。
+/// 这份结构由判定方就地计算（[`ledger_facts`]）：守护进程与审计 CLI 直接
+/// 从只读快照提取，不再经文件交接。「管家只读账本」仍然成立——边界从
+/// 「不读库」改成「连接不可写」。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountFacts {
     pub decision_day: bool,
@@ -183,6 +183,118 @@ impl AccountFacts {
             .iter()
             .max_by(|a, b| a.drift_pp.abs().total_cmp(&b.drift_pp.abs()))
     }
+}
+
+/// 就地读取账本，提取管家事实（不含承诺——承诺在记忆文件里，由持有
+/// butler 状态的判定方合并）。
+///
+/// 这是「谁判定谁计算」的入口：守护进程与审计 CLI 共用同一条路径，事实
+/// 不再经 `facts.json` 交接，也就不存在「GUI 没开就没事实」的空窗。账本
+/// 用只读连接读取，调用方没有写路径。
+///
+/// 阻塞调用（全库读取 + 指标计算）：异步上下文里调用须放阻塞线程池
+/// （butlerd 走 `spawn_blocking`），同步 CLI 直接调用即可。
+pub fn ledger_facts(now: DateTime<Local>) -> AccountFacts {
+    ledger_facts_report(now).0
+}
+
+/// 同 [`ledger_facts`]，但把账本读取失败的原因带出来。
+///
+/// 守护进程是唯一写健康状态的地方：失败不能只落在无人看的 stdout 上
+/// （GUI 关着时没人盯着终端），托盘要能从 `health.json` 看到红灯。
+pub fn ledger_facts_report(now: DateTime<Local>) -> (AccountFacts, Option<String>) {
+    let mut error = None;
+    let mut facts = match crate::app::load_snapshot_read_only() {
+        Ok(snapshot) => {
+            let mut facts = AccountFacts::from_snapshot(&snapshot, now);
+            apply_price_gate(&mut facts, snapshot.freshness.price_age_hours);
+            facts
+        }
+        Err(cause) => {
+            // 账户未初始化 / 暂不可读不等于「账户是空的」：退化为默认事实，
+            // 只保留与数字无关的由头（到点任务、承诺）。失败原因交给调用方
+            // 落状态，别只打一行日志。
+            let message = format!("{cause:#}");
+            eprintln!("管家事实：账本快照读取失败（{message}），本轮按空账户判定");
+            error = Some(message);
+            AccountFacts::default()
+        }
+    };
+
+    // 行为画像：同一天同一页面看 ≥5 次才算高频。它不是开口由头，只进事实，
+    // 供管家在会话里回答「今天看了几次」。
+    let since = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|naive| naive.and_local_timezone(Local).single())
+        .unwrap_or(now);
+    let window = super::events::summarize(&super::events::read_all().unwrap_or_default(), since);
+    if let Some((page, views)) = window
+        .page_views
+        .iter()
+        .max_by_key(|(_, views)| **views)
+        && window.is_heavy_checking(page)
+    {
+        facts.heavy_page = Some((super::events::page_label(page).to_owned(), *views));
+    }
+    (facts, error)
+}
+
+/// 守护进程写下的账本健康状态。托盘与 `mns-butler status` 只读它：
+/// 只读连接在极端场景（崩溃留下未 checkpoint 的 `-wal`、又没有别的连接）
+/// 会打不开库——那时事实退化为空账户，用户必须能在托盘看到「账本读取失败」，
+/// 而不是以为账户真的空了。
+///
+/// 唯一写者是 `mns-butlerd`；其他进程只读。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Health {
+    pub at: DateTime<Local>,
+    pub ledger_ok: bool,
+    pub error: Option<String>,
+}
+
+pub fn health_path() -> std::path::PathBuf {
+    super::butler_dir().join("health.json")
+}
+
+pub fn record_health(ledger_ok: bool, error: Option<String>) {
+    let health = Health {
+        at: Local::now(),
+        ledger_ok,
+        error,
+    };
+    // 简报请求与巡检可能在不同阻塞线程上同时落盘：默认锁按进程/机器互斥，
+    // 避免两个写者争同一个临时文件。
+    let _guard = super::writer_lock();
+    if let Err(cause) = super::store::write_json(&health_path(), &health) {
+        eprintln!("管家健康状态写入失败：{cause:#}");
+    }
+}
+
+pub fn read_health() -> Option<Health> {
+    let text = std::fs::read_to_string(health_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 价格过旧时砍掉依赖估值的判断（偏离、计划可执行）：旧价格不足以支撑
+/// 「偏离多少」。
+///
+/// 当日入金、决策日与行为画像不依赖价格，且 [`ledger_facts`] 总是按当前
+/// 时刻计算，无需降级。抽象出来是为了把「旧价格不说偏离」钉成可测行为。
+fn apply_price_gate(facts: &mut AccountFacts, price_age_hours: Option<i64>) {
+    if price_too_old(price_age_hours) {
+        facts.drift.clear();
+        facts.plan_ready = false;
+    }
+}
+
+/// 价格是否旧到不能支撑「偏离多少」的判断（≥24 小时）。
+///
+/// 与 [`crate::app::Freshness::price_is_stale`] 的差别在空账户：没有持仓就
+/// 没有「价格年龄」可言，不该因此砍掉计划可执行——纯现金账户的定投计划
+/// 不依赖任何价格。
+fn price_too_old(price_age_hours: Option<i64>) -> bool {
+    price_age_hours.is_some_and(|hours| hours >= 24)
 }
 
 /// 产出一轮开口候选。顺序由 `SpeakReason` 的排序保证，这里只负责收集。
@@ -437,6 +549,35 @@ pub struct Notice {
     pub reason: SpeakReason,
     pub trigger: String,
     pub draft: String,
+    /// 稳定通知 id：落盘时生成一次，之后不可变。旧版 pending 行没有这个
+    /// 字段，读取时用 `notice_id_for` 补出来——同样的 `at + trigger` 得到
+    /// 同样的 id，重读不会漂移。
+    #[serde(default)]
+    pub notice_id: String,
+}
+
+impl Notice {
+    /// 旧行补 id；已经是新格式的行原样保留。
+    pub fn ensure_id(&mut self) {
+        if self.notice_id.is_empty() {
+            self.notice_id = notice_id_for(self.at, &self.trigger);
+        }
+    }
+}
+
+/// 由 `at + trigger` 派生稳定 id。
+///
+/// 同一事件（同一毫秒 + 同一 trigger）得到同一个 id；一天最多三条开口，
+/// 毫秒时间戳足够区分。这里用 FNV-1a 而不是 `std::hash`：后者不保证跨
+/// 进程/跨版本稳定，而旧 pending 行补出的 id 必须每次一致。
+pub fn notice_id_for(at: DateTime<Local>, trigger: &str) -> String {
+    let seed = format!("{}|{trigger}", at.timestamp_millis());
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("n{}-{:08x}", at.timestamp_millis(), hash as u32)
 }
 
 /// 把一条已授权的通知放进出站队列。写失败只影响送达，不影响判定。
@@ -446,38 +587,10 @@ pub fn enqueue_notice(at: DateTime<Local>, candidate: &SpeakCandidate) -> Result
         reason: candidate.reason,
         trigger: candidate.trigger.clone(),
         draft: candidate.draft.clone(),
+        notice_id: notice_id_for(at, &candidate.trigger),
     };
     let line = serde_json::to_string(&notice)?;
     super::store::append_line(&outbox_path(), &line)
-}
-
-/// 管家的判断事实。GUI 每次巡检算完就落一份，守护进程只读这一份——
-/// 它不打开 `mns.db`，所以「只读账本」是结构保证。
-pub fn facts_path() -> std::path::PathBuf {
-    butler_dir().join("facts.json")
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FactsFile {
-    at: DateTime<Local>,
-    facts: AccountFacts,
-}
-
-/// 写入当前事实。失败只影响守护进程本轮能不能判断，不影响 GUI。
-pub fn write_facts(at: DateTime<Local>, facts: &AccountFacts) -> Result<()> {
-    write_json(
-        &facts_path(),
-        &FactsFile {
-            at,
-            facts: facts.clone(),
-        },
-    )
-}
-
-/// 读回事实与它的生成时间。调用方必须检查新鲜度：拿十分钟前的数字开口，
-/// 等于用一个已经不存在的仓位提醒用户。
-pub fn read_facts() -> Result<Option<(DateTime<Local>, AccountFacts)>> {
-    Ok(read_json::<FactsFile>(&facts_path())?.map(|file| (file.at, file.facts)))
 }
 
 /// 守护进程判定的开口。GUI 读走之后合并进会话存档（`conversation.json`
@@ -494,6 +607,7 @@ pub fn enqueue_pending(at: DateTime<Local>, candidate: &SpeakCandidate) -> Resul
         reason: candidate.reason,
         trigger: candidate.trigger.clone(),
         draft: candidate.draft.clone(),
+        notice_id: notice_id_for(at, &candidate.trigger),
     };
     let line = serde_json::to_string(&notice)?;
     super::store::append_line(&pending_path(), &line)
@@ -504,9 +618,13 @@ pub fn enqueue_pending(at: DateTime<Local>, candidate: &SpeakCandidate) -> Resul
 /// 用偏移而不是「读完就清空」：守护进程可能在 GUI 读与清之间追加，清空会
 /// 丢掉那一条。文件每天最多长三行，不值得为它做压缩。
 pub fn take_pending(offset: u64) -> Result<(u64, Vec<Notice>)> {
+    take_pending_at(&pending_path(), offset)
+}
+
+/// 路径可注入版本：测试用 scratch 文件，不碰真实账户目录。
+pub fn take_pending_at(path: &std::path::Path, offset: u64) -> Result<(u64, Vec<Notice>)> {
     use std::io::{Read, Seek, SeekFrom};
-    let path = pending_path();
-    let Ok(mut file) = std::fs::File::open(&path) else {
+    let Ok(mut file) = std::fs::File::open(path) else {
         // 还没有人开口过：offset 归零，不是错误。
         return Ok((0, Vec::new()));
     };
@@ -522,14 +640,141 @@ pub fn take_pending(offset: u64) -> Result<(u64, Vec<Notice>)> {
     let notices = buf
         .lines()
         .filter(|line| !line.trim().is_empty())
+        // 坏行跳过（不报错）；旧行缺 id 时在这里补，交付链路只认非空 id。
         .filter_map(|line| serde_json::from_str::<Notice>(line).ok())
+        .map(|mut notice| {
+            notice.ensure_id();
+            notice
+        })
         .collect();
     Ok((consumed, notices))
 }
 
-/// 已消费到的偏移。GUI 独占这个文件。
+/// 已消费到的偏移。P4 起消费者是 `mns-butlerd`：它把条目并进会话、投给
+/// 宿主，全部成功才推进这里。
 pub fn pending_offset_path() -> std::path::PathBuf {
     butler_dir().join("pending.offset")
+}
+
+/// 已消费到的 `pending.jsonl` 偏移。丢了就当 0，重读会去重。
+pub fn read_pending_offset() -> u64 {
+    std::fs::read_to_string(pending_offset_path())
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// 推进偏移。调用方负责保证「先落会话、投递成功，再推进」的顺序——
+/// 反过来写的话，投递失败等于永久丢失：偏移已经越过它了。
+pub fn write_pending_offset(offset: u64) {
+    let _ = super::store::write_json(&pending_offset_path(), &offset);
+}
+
+/// 通知送达/点击的审计记录。只追加，不改写；`notice_id` 是关联键。
+///
+/// 与 `outbox.jsonl` 分开：outbox 记「管家说了什么」，这里记「系统通知真的
+/// 送到/被点了吗」。两个问题不能互相冒充。
+pub fn notices_path() -> std::path::PathBuf {
+    butler_dir().join("notices.jsonl")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeEventKind {
+    Delivered,
+    Clicked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeEvent {
+    pub event: NoticeEventKind,
+    pub notice_id: String,
+    /// 通知本身的产生时间（不是送达/点击时间）。
+    #[serde(default)]
+    pub notice_at: Option<DateTime<Local>>,
+    pub recorded_at: DateTime<Local>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub draft: Option<String>,
+}
+
+pub fn read_notice_events() -> Vec<NoticeEvent> {
+    read_notice_events_at(&notices_path())
+}
+
+pub fn read_notice_events_at(path: &std::path::Path) -> Vec<NoticeEvent> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// 记一条「已送达」。同一 id 只记一次：宿主重启后重读旧 pending 时不重复
+/// 弹横幅，也不重复落审计。
+pub fn record_notice_delivered(notice: &Notice) -> Result<bool> {
+    record_notice_delivered_at(&notices_path(), notice)
+}
+
+pub fn record_notice_delivered_at(path: &std::path::Path, notice: &Notice) -> Result<bool> {
+    let already = read_notice_events_at(path)
+        .iter()
+        .any(|event| event.event == NoticeEventKind::Delivered && event.notice_id == notice.notice_id);
+    if already {
+        return Ok(false);
+    }
+    let event = NoticeEvent {
+        event: NoticeEventKind::Delivered,
+        notice_id: notice.notice_id.clone(),
+        notice_at: Some(notice.at),
+        recorded_at: Local::now(),
+        trigger: Some(notice.trigger.clone()),
+        draft: Some(notice.draft.clone()),
+    };
+    let line = serde_json::to_string(&event)?;
+    super::store::append_line(path, &line)?;
+    Ok(true)
+}
+
+/// 记一条「被点击」。同一 id 第二次点击返回 `false`，调用方据此跳过重复
+/// 注入；审计里也只留第一次。
+pub fn record_notice_clicked(notice_id: &str) -> Result<bool> {
+    record_notice_clicked_at(&notices_path(), notice_id)
+}
+
+pub fn record_notice_clicked_at(path: &std::path::Path, notice_id: &str) -> Result<bool> {
+    let already = read_notice_events_at(path)
+        .iter()
+        .any(|event| event.event == NoticeEventKind::Clicked && event.notice_id == notice_id);
+    if already {
+        return Ok(false);
+    }
+    let event = NoticeEvent {
+        event: NoticeEventKind::Clicked,
+        notice_id: notice_id.to_owned(),
+        notice_at: None,
+        recorded_at: Local::now(),
+        trigger: None,
+        draft: None,
+    };
+    let line = serde_json::to_string(&event)?;
+    super::store::append_line(path, &line)?;
+    Ok(true)
+}
+
+/// 按 id 取送达记录。点击时窗口用它带回通知原文与产生时间——`--notice`
+/// 只传一个 id，界面不能只显示「你点了一条通知」。
+pub fn delivered_notice(notice_id: &str) -> Option<NoticeEvent> {
+    delivered_notice_at(&notices_path(), notice_id)
+}
+
+pub fn delivered_notice_at(path: &std::path::Path, notice_id: &str) -> Option<NoticeEvent> {
+    read_notice_events_at(path)
+        .into_iter()
+        .rfind(|event| event.event == NoticeEventKind::Delivered && event.notice_id == notice_id)
 }
 
 /// 一次唤醒的完整结果。
@@ -731,6 +976,36 @@ mod tests {
     fn 负零不会念成负号() {
         assert_eq!(format!("{:.1}", clean_zero(-0.0)), "0.0");
         assert_eq!(clean_zero(-0.04), -0.04);
+    }
+
+    /// 旧价格不说偏离：价格 ≥24h 没更新时，依赖估值的判断全部砍掉。
+    #[test]
+    fn 价格过旧时砍掉偏离与计划可执行() {
+        let mut stale = facts();
+        stale.plan_ready = true;
+        stale.new_cash_today = 5000.0;
+        apply_price_gate(&mut stale, Some(24));
+        assert!(stale.drift.is_empty(), "旧价格不能支撑「偏离多少」");
+        assert!(!stale.plan_ready, "旧估值下的计划不该当成可执行");
+        // 不依赖价格的判断原样保留：当日入金是台账事实，决策日按当日计算。
+        assert!(stale.decision_day);
+        assert_eq!(stale.new_cash_today, 5000.0);
+
+        let mut fresh = facts();
+        fresh.plan_ready = true;
+        apply_price_gate(&mut fresh, Some(23));
+        assert_eq!(fresh.drift.len(), 2, "新鲜价格保留偏离");
+        assert!(fresh.plan_ready);
+    }
+
+    /// 空账户没有「价格年龄」：纯现金账户的定投计划不依赖任何价格。
+    #[test]
+    fn 空账户不因缺价格砍掉计划() {
+        let mut cash_only = facts();
+        cash_only.plan_ready = true;
+        apply_price_gate(&mut cash_only, None);
+        assert_eq!(cash_only.drift.len(), 2);
+        assert!(cash_only.plan_ready, "无持仓时 price_age 为 None，不该降级");
     }
 
     #[test]
@@ -994,6 +1269,79 @@ mod tests {
             6,
             "limit 大于总数时全读"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 通知id由时间与触发派生且稳定() {
+        let first = notice_id_for(at(20, 9), "task:abc");
+        assert_eq!(first, notice_id_for(at(20, 9), "task:abc"), "同源必须同 id");
+        assert_ne!(first, notice_id_for(at(20, 10), "task:abc"), "时间不同则不同");
+        assert_ne!(first, notice_id_for(at(20, 9), "task:def"), "触发不同则不同");
+        assert!(first.starts_with('n') && first.contains('-'), "实际 {first}");
+    }
+
+    #[test]
+    fn 旧pending行读取时补id且坏行跳过() {
+        let dir = std::env::temp_dir().join(format!("mns-butler-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending.jsonl");
+        let old = serde_json::json!({
+            "at": at(20, 9),
+            "reason": "TaskDue",
+            "trigger": "task:old",
+            "draft": "旧格式通知"
+        });
+        std::fs::write(
+            &path,
+            format!("{}\nnot-json\n", serde_json::to_string(&old).unwrap()),
+        )
+        .unwrap();
+
+        let (consumed, notices) = take_pending_at(&path, 0).unwrap();
+        assert_eq!(notices.len(), 1, "坏行应跳过而不是报错");
+        assert_eq!(consumed, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(notices[0].notice_id, notice_id_for(at(20, 9), "task:old"));
+        assert_eq!(
+            take_pending_at(&path, consumed).unwrap().1.len(),
+            0,
+            "偏移之后没有新行"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 送达与点击按id各只记一次且能读回原文() {
+        let dir = std::env::temp_dir().join(format!("mns-butler-notices-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("notices.jsonl");
+        let notice = Notice {
+            at: at(20, 9),
+            reason: SpeakReason::TaskDue,
+            trigger: "task:x".to_owned(),
+            draft: "该看计划了".to_owned(),
+            notice_id: notice_id_for(at(20, 9), "task:x"),
+        };
+
+        assert!(record_notice_delivered_at(&path, &notice).unwrap());
+        assert!(
+            !record_notice_delivered_at(&path, &notice).unwrap(),
+            "同一 id 的送达只记一次"
+        );
+        assert!(record_notice_clicked_at(&path, &notice.notice_id).unwrap());
+        assert!(
+            !record_notice_clicked_at(&path, &notice.notice_id).unwrap(),
+            "同一 id 的点击只记一次"
+        );
+
+        let events = read_notice_events_at(&path);
+        assert_eq!(events.len(), 2, "一次送达 + 一次点击");
+        let delivered = delivered_notice_at(&path, &notice.notice_id).expect("应能读回送达记录");
+        assert_eq!(delivered.draft.as_deref(), Some("该看计划了"));
+        assert_eq!(delivered.notice_at, Some(at(20, 9)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

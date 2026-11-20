@@ -9,9 +9,37 @@
 - **Type**: Personal CLI investment tool (Rust)
 - **Binary**: `target/release/mns.exe` (Windows) / `target/release/mns` (Linux/macOS)
 - **Installed CLI**: `/Applications/MNS.app/Contents/MacOS/mns` — the DMG ships the CLI inside the app bundle at the same version as the GUI.
+- **GUI process model**（P2 起）: `mns-gui` 本身是**常驻宿主**（无 AppShell 窗口，
+  `QuitMode::Explicit`）。macOS 上宿主是 `Regular`，**独占唯一的 MNS Dock 图标**，
+  并负责菜单栏、托盘界面、系统通知投递、管家守护进程启停，以及拉起短命窗口子进程：
+  - `mns-gui --window [--page <slug>] [--about] [--refresh]` —— 主窗口；
+  - `mns-gui --window --butler`（或 `--window butler`）—— 管家窗口。
+  两个窗口都跑 `QuitMode::LastWindowClosed`，关窗即进程退出（内存随进程回收），
+  并以 `Accessory` 策略运行（不产生第二个 Dock 图标）。Accessory 应用没有自己的
+  菜单栏，窗口前台时 macOS 显示的是上一个 Regular 应用的菜单栏；宿主那份
+  `MNS / 文件 / 操作` 只是辅助入口，主入口是托盘菜单、Dock 图标与窗口内按钮。
+  无参数启动 = 打开一次主窗；登录项带 `--tray` = 只驻留 Dock/托盘；点 Dock 图标
+  = 打开/置前主窗（`on_reopen`）。每个模式用独立的 `ipc::listen` 通道做单实例锁：
+  宿主 `mns-gui`、主窗 `mns-gui-window`、管家窗 `mns-gui-butler`；二次启动只会
+  poke 已有进程。
+  托盘简报走 `Signal::RequestBrief` → `mns-butlerd` → `Signal::Brief{json}`，宿主只排版。
+  通知身份走 `notice_id`（`notice_id_for(at, trigger)`，FNV-1a，落盘时定一次）：
+  `outbox.jsonl` / `pending.jsonl` 每条开口都带 id，旧行缺 id 时在
+  `take_pending_at` 读取时补；投递把 id 写进 macOS `userInfo`，点击回调带 id
+  返回宿主，宿主记一次 `~/.mns/agent/butler/notices.jsonl`（`delivered` /
+  `clicked` 同 id 各一条）后拉起 `mns-gui --window butler --notice <id>`，
+  窗口顶部显示通知上下文并滚动/高亮到对应消息；窗口已开则只 poke
+  `Signal::NoticeFocus` 定位并置前，不重开、不重弹。
+  管家健康落在 `~/.mns/agent/butler/health.json`（`orchestrator::record_health`），
+  托盘读它亮红灯（菜单栏只放 22pt 图标，结论在 tooltip 与菜单首行——macOS 26
+  菜单栏拥挤时会把带标题的状态项整项藏进溢出区）；同一判断还会把 Dock 图标整枚
+  换成带红点的版本（`assets/icon-dock-alert.png`，`set_dock_alert`），保证菜单栏
+  图标被藏时仍有一条可见告警。`--tray` / `--background` 现在只表示「不自动开主窗」，
+  宿主仍常驻 Dock。
 - **Butler daemon**: `MNS.app/Contents/MacOS/mns-butlerd` is spawned by the GUI and keeps
-  evaluating butler wake sources after the window closes. It never opens the ledger DB
-  (it reads `agent/butler/facts.json` written by the GUI) and it never posts system
+  evaluating butler wake sources after the window closes. It reads the ledger directly
+  through a read-only connection (facts are computed at wake time via
+  `butler::orchestrator::ledger_facts`, no `facts.json` handoff) and it never posts system
   notifications (macOS rejects them from a helper executable — the GUI delivers).
   Stop it with the tray item 「停止管家进程」 or `pkill -f mns-butlerd` before testing
   butler state by hand, or your `mns-butler wake` will race with it. It is
