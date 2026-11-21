@@ -57,7 +57,9 @@ pub fn render(advice: Option<Advice>, effective_score: f64, hot_threshold: f64) 
     if a.show_stats {
         s.push_str("  历史描述性统计（三资产 2016-2026，FGI≥75 后 60 交易日）：\n");
         s.push_str("    下跌概率 33.7% vs 全样本 25.9%，5% 左尾 -7.70%\n");
-        s.push_str("    ⚠ 该差异未通过显著性检验（年块 bootstrap 95% CI 跨 0），不构成择时依据。\n");
+        s.push_str(
+            "    ⚠ 该差异未通过显著性检验（年块 bootstrap 95% CI 跨 0），不构成择时依据。\n",
+        );
         s.push_str("    ⚠ 自动否决买入在长期上行资产池上期望为负，故本功能只提示、不拦截。\n");
     }
     s.push_str("─────────────────────────────────────────────────────────────\n");
@@ -136,6 +138,9 @@ mod tests {
         let mut c = cfg();
         c.set_value("guardrail.hot_threshold", "80").unwrap();
         assert_eq!(c.guardrail.hot_threshold, 80.0);
-        assert_eq!(c.get_value("guardrail.hot_threshold").as_deref(), Some("80"));
+        assert_eq!(
+            c.get_value("guardrail.hot_threshold").as_deref(),
+            Some("80")
+        );
     }
 }

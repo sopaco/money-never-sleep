@@ -229,10 +229,7 @@ pub fn ledger_facts_report(now: DateTime<Local>) -> (AccountFacts, Option<String
         .and_then(|naive| naive.and_local_timezone(Local).single())
         .unwrap_or(now);
     let window = super::events::summarize(&super::events::read_all().unwrap_or_default(), since);
-    if let Some((page, views)) = window
-        .page_views
-        .iter()
-        .max_by_key(|(_, views)| **views)
+    if let Some((page, views)) = window.page_views.iter().max_by_key(|(_, views)| **views)
         && window.is_heavy_checking(page)
     {
         facts.heavy_page = Some((super::events::page_label(page).to_owned(), *views));
@@ -246,7 +243,7 @@ pub fn ledger_facts_report(now: DateTime<Local>) -> (AccountFacts, Option<String
 /// 而不是以为账户真的空了。
 ///
 /// 唯一写者是 `mns-butlerd`；其他进程只读。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Health {
     pub at: DateTime<Local>,
     pub ledger_ok: bool,
@@ -257,7 +254,7 @@ pub fn health_path() -> std::path::PathBuf {
     super::butler_dir().join("health.json")
 }
 
-pub fn record_health(ledger_ok: bool, error: Option<String>) {
+pub fn record_health(ledger_ok: bool, error: Option<String>) -> Health {
     let health = Health {
         at: Local::now(),
         ledger_ok,
@@ -269,6 +266,7 @@ pub fn record_health(ledger_ok: bool, error: Option<String>) {
     if let Err(cause) = super::store::write_json(&health_path(), &health) {
         eprintln!("管家健康状态写入失败：{cause:#}");
     }
+    health
 }
 
 pub fn read_health() -> Option<Health> {
@@ -321,10 +319,7 @@ pub fn candidates(
                 format!("到点了：{}", task.intent),
                 "到点了，按你自己定的那件事检查一下。",
             ),
-            TaskKind::Talk => (
-                "到点了，我在。想聊两句吗？".to_owned(),
-                "到点了，我在。",
-            ),
+            TaskKind::Talk => ("到点了，我在。想聊两句吗？".to_owned(), "到点了，我在。"),
         };
         rows.push(candidate(
             SpeakReason::TaskDue,
@@ -720,9 +715,9 @@ pub fn record_notice_delivered(notice: &Notice) -> Result<bool> {
 }
 
 pub fn record_notice_delivered_at(path: &std::path::Path, notice: &Notice) -> Result<bool> {
-    let already = read_notice_events_at(path)
-        .iter()
-        .any(|event| event.event == NoticeEventKind::Delivered && event.notice_id == notice.notice_id);
+    let already = read_notice_events_at(path).iter().any(|event| {
+        event.event == NoticeEventKind::Delivered && event.notice_id == notice.notice_id
+    });
     if already {
         return Ok(false);
     }
@@ -1093,7 +1088,10 @@ mod tests {
             "说出去的任务不能继续挂在待办里"
         );
         assert_eq!(butler.tasks.archived.len(), 1);
-        assert_eq!(butler.tasks.archived[0].state, crate::butler::TaskState::Done);
+        assert_eq!(
+            butler.tasks.archived[0].state,
+            crate::butler::TaskState::Done
+        );
     }
 
     #[test]
@@ -1277,9 +1275,20 @@ mod tests {
     fn 通知id由时间与触发派生且稳定() {
         let first = notice_id_for(at(20, 9), "task:abc");
         assert_eq!(first, notice_id_for(at(20, 9), "task:abc"), "同源必须同 id");
-        assert_ne!(first, notice_id_for(at(20, 10), "task:abc"), "时间不同则不同");
-        assert_ne!(first, notice_id_for(at(20, 9), "task:def"), "触发不同则不同");
-        assert!(first.starts_with('n') && first.contains('-'), "实际 {first}");
+        assert_ne!(
+            first,
+            notice_id_for(at(20, 10), "task:abc"),
+            "时间不同则不同"
+        );
+        assert_ne!(
+            first,
+            notice_id_for(at(20, 9), "task:def"),
+            "触发不同则不同"
+        );
+        assert!(
+            first.starts_with('n') && first.contains('-'),
+            "实际 {first}"
+        );
     }
 
     #[test]

@@ -64,7 +64,10 @@ fn main() {
     // generic icon, which is what `mns` / `mns-butler` want.
     println!("cargo:rustc-link-arg-bin=mns-gui={}", app_obj.display());
     println!("cargo:rustc-link-arg-bin=mns-help={}", help_obj.display());
-    println!("cargo:rustc-link-arg-bin=mns-butlerd={}", butler_obj.display());
+    println!(
+        "cargo:rustc-link-arg-bin=mns-butlerd={}",
+        butler_obj.display()
+    );
 }
 
 /// Compile a .rc that declares `1 ICON "<path>"` into a linker input, returning

@@ -16,9 +16,9 @@
 //! 两个数据集（实盘四基金 / 2016-今三腿代理）都先转成 `BarSeries` 再进本引擎，
 //! 保证信号、成本、回撤口径在长周期验证与账户镜像中完全一致。
 
-use crate::config::{AppConfig, ChannelSpec};
 #[cfg(test)]
 use crate::config::DecisionInterval;
+use crate::config::{AppConfig, ChannelSpec};
 use crate::live_data::{Bar, BarSeries, DatasetKind, is_decision_day};
 use crate::signal::{self, ScoreHistory};
 use anyhow::{Context, Result, bail};
@@ -127,7 +127,12 @@ pub fn build_signal_series_with_raw(
         lo = 0.0;
         hi = 100.0;
     }
-    SignalSeries { effective, decision, raw_min: lo, raw_max: hi }
+    SignalSeries {
+        effective,
+        decision,
+        raw_min: lo,
+        raw_max: hi,
+    }
 }
 
 // ───────────────────────── 结果 ─────────────────────────
@@ -259,7 +264,11 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
     }
     fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1_u64 << 53) as f64
@@ -303,10 +312,18 @@ pub fn run_audit(
 ) -> Result<AuditResult> {
     let bars = &series.bars;
     if opt.start_idx >= bars.len() || opt.end_idx >= bars.len() || opt.start_idx > opt.end_idx {
-        bail!("审计区间越界: {}..{} / 共 {} 根", opt.start_idx, opt.end_idx, bars.len());
+        bail!(
+            "审计区间越界: {}..{} / 共 {} 根",
+            opt.start_idx,
+            opt.end_idx,
+            bars.len()
+        );
     }
     let n = opt.end_idx - opt.start_idx + 1;
-    let lag_days = opt.execution_lag_days.unwrap_or(config.backtest.execution_lag_days).max(1);
+    let lag_days = opt
+        .execution_lag_days
+        .unwrap_or(config.backtest.execution_lag_days)
+        .max(1);
     let band_pp = opt.band_pp.unwrap_or(config.rebalance.band_pp);
     let min_trade = config.rebalance.min_trade_amount;
     let min_hold = config.rebalance.min_holding_days_for_sell;
@@ -389,20 +406,28 @@ pub fn run_audit(
             for leg in 0..3 {
                 let spec = channel(config, series.kind, leg);
                 let mut amount = budget * sleeve_arr[leg];
-                if spec.daily_subscription_cap > 0.0
-                    && amount > spec.daily_subscription_cap
-                {
+                if spec.daily_subscription_cap > 0.0 && amount > spec.daily_subscription_cap {
                     st.blocked_cap += 1;
                     amount = spec.daily_subscription_cap;
                 }
-                if amount < min_trade { continue; }
+                if amount < min_trade {
+                    continue;
+                }
                 let fee = amount * (spec.buy_rate() + spec.slippage_pct / 100.0);
                 let net = amount - fee;
                 st.cash = (st.cash - amount).max(0.0);
                 st.fees += fee;
-                st.lots[leg].push(Lot { shares: net / bar.prices[leg], date: bar.date });
+                st.lots[leg].push(Lot {
+                    shares: net / bar.prices[leg],
+                    date: bar.date,
+                });
                 st.trades.push(AuditTrade {
-                    date: bar.date, action: "买入", leg, amount, fee, blocked: None,
+                    date: bar.date,
+                    action: "买入",
+                    leg,
+                    amount,
+                    fee,
+                    blocked: None,
                 });
             }
         }
@@ -412,7 +437,9 @@ pub fn run_audit(
             let prices = bar.prices;
             let shares = leg_shares(&st.lots);
             let current = [
-                shares[0] * prices[0], shares[1] * prices[1], shares[2] * prices[2],
+                shares[0] * prices[0],
+                shares[1] * prices[1],
+                shares[2] * prices[2],
             ];
             let in_transit: f64 = st.pending.iter().map(|(_, a)| a).sum();
             let total = st.cash + in_transit + current.iter().sum::<f64>();
@@ -450,7 +477,10 @@ pub fn run_audit(
                         fee_total += fee;
                         want -= take;
                         if lot.shares - take > 1e-12 {
-                            keep.push(Lot { shares: lot.shares - take, ..lot });
+                            keep.push(Lot {
+                                shares: lot.shares - take,
+                                ..lot
+                            });
                         }
                     }
                     st.lots[leg] = keep;
@@ -459,8 +489,12 @@ pub fn run_audit(
                         let due = bar.date + Duration::days(spec.settlement_days as i64);
                         st.pending.push((due, gross_total - fee_total));
                         st.trades.push(AuditTrade {
-                            date: bar.date, action: "卖出", leg,
-                            amount: gross_total, fee: fee_total, blocked: None,
+                            date: bar.date,
+                            action: "卖出",
+                            leg,
+                            amount: gross_total,
+                            fee: fee_total,
+                            blocked: None,
                         });
                     }
                 }
@@ -482,31 +516,44 @@ pub fn run_audit(
                 }
                 if budget >= min_trade {
                     for leg in 0..3 {
-                        if needs[leg] <= 0.0 { continue; }
+                        if needs[leg] <= 0.0 {
+                            continue;
+                        }
                         let mut amount = budget * (needs[leg] / need_sum);
                         let spec = channel(config, series.kind, leg);
-                        if spec.daily_subscription_cap > 0.0
-                            && amount > spec.daily_subscription_cap
+                        if spec.daily_subscription_cap > 0.0 && amount > spec.daily_subscription_cap
                         {
                             st.blocked_cap += 1;
                             st.trades.push(AuditTrade {
-                                date: bar.date, action: "买入(限额)", leg,
+                                date: bar.date,
+                                action: "买入(限额)",
+                                leg,
                                 amount: amount - spec.daily_subscription_cap,
-                                fee: 0.0, blocked: Some("QDII 限购"),
+                                fee: 0.0,
+                                blocked: Some("QDII 限购"),
                             });
                             amount = spec.daily_subscription_cap;
                         }
-                        if amount < min_trade { continue; }
+                        if amount < min_trade {
+                            continue;
+                        }
                         let fee = amount * (spec.buy_rate() + spec.slippage_pct / 100.0);
                         let net = amount - fee;
                         // 现金按含费金额扣减；只扣净额会把手续费凭空留在账户里
                         st.cash = (st.cash - amount).max(0.0);
                         budget -= amount;
                         st.fees += fee;
-                        st.lots[leg].push(Lot { shares: net / prices[leg], date: bar.date });
+                        st.lots[leg].push(Lot {
+                            shares: net / prices[leg],
+                            date: bar.date,
+                        });
                         st.trades.push(AuditTrade {
-                            date: bar.date, action: "买入", leg,
-                            amount, fee, blocked: None,
+                            date: bar.date,
+                            action: "买入",
+                            leg,
+                            amount,
+                            fee,
+                            blocked: None,
                         });
                     }
                 }
@@ -520,7 +567,10 @@ pub fn run_audit(
         let total = st.cash + in_transit + holding;
         risk_sum += if total > 0.0 { holding / total } else { 0.0 };
         if i > opt.start_idx {
-            let prev = account_curve.last().map(|(_, v)| *v).unwrap_or(opt.initial_cash);
+            let prev = account_curve
+                .last()
+                .map(|(_, v)| *v)
+                .unwrap_or(opt.initial_cash);
             if prev > 0.0 {
                 flow_equity *= total / prev;
             }
@@ -528,12 +578,19 @@ pub fn run_audit(
         equity.push((bar.date, flow_equity));
         account_curve.push((bar.date, total));
         market_curve.push(
-            (0..3).map(|k| sleeve_arr[k] * bar.prices[k] / base_prices[k]).sum::<f64>(),
+            (0..3)
+                .map(|k| sleeve_arr[k] * bar.prices[k] / base_prices[k])
+                .sum::<f64>(),
         );
     }
 
-    let final_value = account_curve.last().map(|(_, v)| *v).unwrap_or(opt.initial_cash);
-    let days = (bars[opt.end_idx].date - bars[opt.start_idx].date).num_days().max(1) as f64;
+    let final_value = account_curve
+        .last()
+        .map(|(_, v)| *v)
+        .unwrap_or(opt.initial_cash);
+    let days = (bars[opt.end_idx].date - bars[opt.start_idx].date)
+        .num_days()
+        .max(1) as f64;
     let years = days / 365.0;
     let annualized = if final_value > 0.0 && opt.initial_cash > 0.0 {
         (final_value / opt.initial_cash).powf(1.0 / years) - 1.0
@@ -556,7 +613,11 @@ pub fn run_audit(
         max_dd_flow,
         max_dd_account,
         max_dd_market,
-        calmar: if max_dd_flow > 0.0 { annualized / max_dd_flow } else { 0.0 },
+        calmar: if max_dd_flow > 0.0 {
+            annualized / max_dd_flow
+        } else {
+            0.0
+        },
         fees: st.fees,
         trades: st.trades,
         avg_risk_weight: risk_sum / n as f64,
@@ -604,8 +665,12 @@ pub fn run_actual(
     let mut by_day: HashMap<NaiveDate, Flow> = HashMap::new();
     let txs = db.list_transactions(i64::MAX)?;
     for t in txs {
-        let Ok(date) = NaiveDate::parse_from_str(&t.tx_date, "%Y-%m-%d") else { continue };
-        let Some(idx) = CODES.iter().position(|c| *c == t.asset_code) else { continue };
+        let Ok(date) = NaiveDate::parse_from_str(&t.tx_date, "%Y-%m-%d") else {
+            continue;
+        };
+        let Some(idx) = CODES.iter().position(|c| *c == t.asset_code) else {
+            continue;
+        };
         let e = by_day.entry(date).or_default();
         let sign = if t.tx_type == "buy" { 1.0 } else { -1.0 };
         e.shares[idx] += sign * t.shares;
@@ -635,7 +700,11 @@ pub fn run_actual(
                 if f.shares[k].abs() > 1e-9 {
                     trades.push(AuditTrade {
                         date: bar.date,
-                        action: if f.shares[k] > 0.0 { "买入" } else { "卖出" },
+                        action: if f.shares[k] > 0.0 {
+                            "买入"
+                        } else {
+                            "卖出"
+                        },
                         leg: crate::live_data::LEG_OF[k],
                         amount: f.shares[k].abs() * bar.unit_nav.unwrap_or([0.0; 4])[k],
                         fee: 0.0,
@@ -648,7 +717,10 @@ pub fn run_actual(
         let holding: f64 = (0..4).map(|k| shares[k] * unit[k]).sum();
         let total = cash + holding;
         if i > start_idx {
-            let prev = account_curve.last().map(|(_, v)| *v).unwrap_or(initial_cash);
+            let prev = account_curve
+                .last()
+                .map(|(_, v)| *v)
+                .unwrap_or(initial_cash);
             if prev > 0.0 {
                 flow_equity *= total / prev;
             }
@@ -656,12 +728,19 @@ pub fn run_actual(
         equity.push((bar.date, flow_equity));
         account_curve.push((bar.date, total));
         market_curve.push(
-            (0..3).map(|k| sleeve_arr[k] * bar.prices[k] / base_prices[k]).sum::<f64>(),
+            (0..3)
+                .map(|k| sleeve_arr[k] * bar.prices[k] / base_prices[k])
+                .sum::<f64>(),
         );
     }
 
-    let final_value = account_curve.last().map(|(_, v)| *v).unwrap_or(initial_cash);
-    let days = (bars[end_idx].date - bars[start_idx].date).num_days().max(1) as f64;
+    let final_value = account_curve
+        .last()
+        .map(|(_, v)| *v)
+        .unwrap_or(initial_cash);
+    let days = (bars[end_idx].date - bars[start_idx].date)
+        .num_days()
+        .max(1) as f64;
     let years = days / 365.0;
     let annualized = (final_value / initial_cash).powf(1.0 / years) - 1.0;
     let max_dd_flow = max_drawdown(&equity.iter().map(|(_, v)| *v).collect::<Vec<_>>());
@@ -679,7 +758,11 @@ pub fn run_actual(
         max_dd_flow,
         max_dd_account,
         max_dd_market,
-        calmar: if max_dd_flow > 0.0 { annualized / max_dd_flow } else { 0.0 },
+        calmar: if max_dd_flow > 0.0 {
+            annualized / max_dd_flow
+        } else {
+            0.0
+        },
         fees: 0.0,
         trades,
         avg_risk_weight: 0.0,
@@ -736,20 +819,35 @@ pub fn run_validation_suite(
     let avg = real.avg_risk_weight;
 
     let mut opt = with_variant(base, "延迟 1 期执行", SignalVariant::Delayed(1));
-    opt.execution_lag_days = Some(base.execution_lag_days.unwrap_or(config.backtest.execution_lag_days) + 1);
+    opt.execution_lag_days = Some(
+        base.execution_lag_days
+            .unwrap_or(config.backtest.execution_lag_days)
+            + 1,
+    );
     let delayed = run_audit(config, series, sig, &opt)?;
     let random = run_audit(
-        config, series, sig,
+        config,
+        series,
+        sig,
         &with_variant(base, "随机信号", SignalVariant::Random(20261108)),
     )?;
     let constant_avg = run_audit(
-        config, series, sig, &with_variant(base, "常数仓位(策略均值)", SignalVariant::Constant(avg)),
+        config,
+        series,
+        sig,
+        &with_variant(base, "常数仓位(策略均值)", SignalVariant::Constant(avg)),
     )?;
     let constant_70 = run_audit(
-        config, series, sig, &with_variant(base, "常数仓位 70%", SignalVariant::Constant(0.70)),
+        config,
+        series,
+        sig,
+        &with_variant(base, "常数仓位 70%", SignalVariant::Constant(0.70)),
     )?;
     let constant_100 = run_audit(
-        config, series, sig, &with_variant(base, "常数仓位 100%", SignalVariant::Constant(1.0)),
+        config,
+        series,
+        sig,
+        &with_variant(base, "常数仓位 100%", SignalVariant::Constant(1.0)),
     )?;
     let mut bh_opt = with_variant(base, "买入持有", SignalVariant::Constant(1.0));
     bh_opt.buy_and_hold = true;
@@ -758,7 +856,11 @@ pub fn run_validation_suite(
     let iterations = config.backtest.permutation_iterations;
     let mut values = Vec::with_capacity(iterations);
     for seed in 0..iterations {
-        let o = with_variant(base, "置换", SignalVariant::Shuffled(0x9E37_79B9 ^ seed as u64));
+        let o = with_variant(
+            base,
+            "置换",
+            SignalVariant::Shuffled(0x9E37_79B9 ^ seed as u64),
+        );
         values.push(run_audit(config, series, sig, &o)?.annualized);
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -816,19 +918,27 @@ pub fn run_regimes(
         let (Ok(from), Ok(to)) = (
             NaiveDate::parse_from_str(&r.from, "%Y-%m-%d"),
             NaiveDate::parse_from_str(&r.to, "%Y-%m-%d"),
-        ) else { continue };
+        ) else {
+            continue;
+        };
         let s = bars.partition_point(|b| b.date < from);
         let e = bars.partition_point(|b| b.date <= to).saturating_sub(1);
-        if s >= bars.len() || e <= s { continue; }
+        if s >= bars.len() || e <= s {
+            continue;
+        }
         let mut o = base.clone();
         o.start_idx = s;
         o.end_idx = e;
         o.name = r.name.clone();
-        let Ok(strategy) = run_audit(config, series, sig, &o) else { continue };
+        let Ok(strategy) = run_audit(config, series, sig, &o) else {
+            continue;
+        };
         let mut bh = o.clone();
         bh.variant = SignalVariant::Constant(1.0);
         bh.buy_and_hold = true;
-        let Ok(bh_res) = run_audit(config, series, sig, &bh) else { continue };
+        let Ok(bh_res) = run_audit(config, series, sig, &bh) else {
+            continue;
+        };
         out.push(RegimeRow {
             name: r.name.clone(),
             from: bars[s].date,
@@ -870,11 +980,17 @@ pub fn run_walk_forward(
     loop {
         let train_from = bars[train_start].date;
         let train_until = train_from + Duration::days(730);
-        let train_end = bars.partition_point(|b| b.date <= train_until).saturating_sub(1);
+        let train_end = bars
+            .partition_point(|b| b.date <= train_until)
+            .saturating_sub(1);
         let test_until = train_until + Duration::days(365);
-        let test_end = bars.partition_point(|b| b.date <= test_until).saturating_sub(1);
+        let test_end = bars
+            .partition_point(|b| b.date <= test_until)
+            .saturating_sub(1);
         if test_end <= train_end || test_end >= bars.len() - 1 {
-            if test_end <= train_end { break; }
+            if test_end <= train_end {
+                break;
+            }
             // 最后一折允许延伸到数据末尾
         }
         let mut best_band = config.rebalance.band_pp;
@@ -899,20 +1015,30 @@ pub fn run_walk_forward(
         let (Ok(dr), Ok(tr)) = (
             run_audit(config, series, sig, &d),
             run_audit(config, series, sig, &t),
-        ) else { break };
+        ) else {
+            break;
+        };
         fold += 1;
         out.push(FoldRow {
             label: format!("折{fold}"),
             train: format!("{}~{}", bars[train_start].date, bars[train_end].date),
-            test: format!("{}~{}", bars[(train_end + 1).min(bars.len() - 1)].date, bars[test_end].date),
+            test: format!(
+                "{}~{}",
+                bars[(train_end + 1).min(bars.len() - 1)].date,
+                bars[test_end].date
+            ),
             tuned_band: best_band,
             default_oos: dr.annualized,
             tuned_oos: tr.annualized,
             tuned_better: tr.annualized > dr.annualized,
         });
-        if test_end >= bars.len() - 1 { break; }
+        if test_end >= bars.len() - 1 {
+            break;
+        }
         train_start = train_end + 1;
-        if train_start >= bars.len() - 1 { break; }
+        if train_start >= bars.len() - 1 {
+            break;
+        }
     }
     out
 }
@@ -957,60 +1083,134 @@ pub fn print_data_banner(
 ) {
     let sla = config.backtest.freshness_sla_days;
     println!("\n═══ 数据与口径 ═══════════════════════════════════════════════════════");
-    if let Ok(f) = live.freshness(sla) { println!("  实盘层  {}", f.banner()); }
-    if let Ok(f) = long.freshness(sla) { println!("  长周期层 {}", f.banner()); }
-    println!("  实盘层  {} 行，{} ~ {}；标的 = 018966/539001/007605/020341",
-        live.days.len(), live.days.first().map(|d| d.date.to_string()).unwrap_or_default(),
-        live.days.last().map(|d| d.date.to_string()).unwrap_or_default());
-    println!("  长周期层 {} 行，{} ~ {}；三腿为长历史代理，覆盖 2018Q4 / 2020 / 2022 / 2026 各段牛熊",
-        long.days.len(), long.days.first().map(|d| d.date.to_string()).unwrap_or_default(),
-        long.days.last().map(|d| d.date.to_string()).unwrap_or_default());
-    println!("  实盘三腿 {} / {} / {}",
+    if let Ok(f) = live.freshness(sla) {
+        println!("  实盘层  {}", f.banner());
+    }
+    if let Ok(f) = long.freshness(sla) {
+        println!("  长周期层 {}", f.banner());
+    }
+    println!(
+        "  实盘层  {} 行，{} ~ {}；标的 = 018966/539001/007605/020341",
+        live.days.len(),
+        live.days
+            .first()
+            .map(|d| d.date.to_string())
+            .unwrap_or_default(),
+        live.days
+            .last()
+            .map(|d| d.date.to_string())
+            .unwrap_or_default()
+    );
+    println!(
+        "  长周期层 {} 行，{} ~ {}；三腿为长历史代理，覆盖 2018Q4 / 2020 / 2022 / 2026 各段牛熊",
+        long.days.len(),
+        long.days
+            .first()
+            .map(|d| d.date.to_string())
+            .unwrap_or_default(),
+        long.days
+            .last()
+            .map(|d| d.date.to_string())
+            .unwrap_or_default()
+    );
+    println!(
+        "  实盘三腿 {} / {} / {}",
         crate::live_data::LEG_NAMES[0],
         crate::live_data::LEG_NAMES[1],
-        crate::live_data::LEG_NAMES[2]);
+        crate::live_data::LEG_NAMES[2]
+    );
     // QDII 净值 T+1/T+2 披露：沿用前值的天数就是实盘真实的信息滞后
-    let stale_qdii: Vec<i32> = live.days.iter()
+    let stale_qdii: Vec<i32> = live
+        .days
+        .iter()
         .map(|d| d.nav_stale_days[0].max(d.nav_stale_days[1]))
-        .filter(|&x| x > 0).collect();
+        .filter(|&x| x > 0)
+        .collect();
     let max_stale = stale_qdii.iter().copied().max().unwrap_or(0);
-    println!("  数据质量 QDII 净值沿用前值 {} / {} 日（最大滞后 {} 天）；这是实盘可知信息的约束，非插值",
-        stale_qdii.len(), live.days.len(), max_stale);
-    println!("  信号口径 平滑 {} 天 + 区间确认 {} 天 + 决策周期 {:?}（与 mns report 同源）",
-        config.rebalance.signal_smooth_days, config.rebalance.zone_confirm_days,
-        config.backtest.decision_interval);
-    println!("  执行时序 信号 T 日 → 成交 T+{} 日；卖出款按通道 T+n 到账，到账前不可用于买入",
-        config.backtest.execution_lag_days);
-    println!("  成本通道 QDII 场外 T+{}日/限购 {} / A股联接 T+{}日 / 场内 ETF T+{}日",
+    println!(
+        "  数据质量 QDII 净值沿用前值 {} / {} 日（最大滞后 {} 天）；这是实盘可知信息的约束，非插值",
+        stale_qdii.len(),
+        live.days.len(),
+        max_stale
+    );
+    println!(
+        "  信号口径 平滑 {} 天 + 区间确认 {} 天 + 决策周期 {:?}（与 mns report 同源）",
+        config.rebalance.signal_smooth_days,
+        config.rebalance.zone_confirm_days,
+        config.backtest.decision_interval
+    );
+    println!(
+        "  执行时序 信号 T 日 → 成交 T+{} 日；卖出款按通道 T+n 到账，到账前不可用于买入",
+        config.backtest.execution_lag_days
+    );
+    println!(
+        "  成本通道 QDII 场外 T+{}日/限购 {} / A股联接 T+{}日 / 场内 ETF T+{}日",
         config.channels.qdii_feeder.settlement_days,
         if config.channels.qdii_feeder.daily_subscription_cap > 0.0 {
-            format!("¥{:.0}/日", config.channels.qdii_feeder.daily_subscription_cap)
-        } else { "无".to_string() },
+            format!(
+                "¥{:.0}/日",
+                config.channels.qdii_feeder.daily_subscription_cap
+            )
+        } else {
+            "无".to_string()
+        },
         config.channels.cn_feeder.settlement_days,
-        config.channels.on_exchange_etf.settlement_days);
-    println!("  数据路径 实盘 {} / 长周期 {}", live.path.display(), long.path.display());
-    println!("  策略可验证段 实盘 {:?} ({} 日) / 长周期 {:?} ({} 日)",
-        live.meta.strategy_ready_range, live.meta.strategy_ready_observations,
-        long.meta.strategy_ready_range, long.meta.strategy_ready_observations);
+        config.channels.on_exchange_etf.settlement_days
+    );
+    println!(
+        "  数据路径 实盘 {} / 长周期 {}",
+        live.path.display(),
+        long.path.display()
+    );
+    println!(
+        "  策略可验证段 实盘 {:?} ({} 日) / 长周期 {:?} ({} 日)",
+        live.meta.strategy_ready_range,
+        live.meta.strategy_ready_observations,
+        long.meta.strategy_ready_range,
+        long.meta.strategy_ready_observations
+    );
     println!("  ⚠ 长周期层三腿为代理标的（红利腿 H30269 为价格指数、黄金腿为场内 ETF），");
     println!("    不得用于实盘收益预测；实盘结论以账户镜像层为准。");
 }
 
 pub fn print_result_table(results: &[&AuditResult], title: &str) {
     let widths = [26, 12, 12, 12, 12, 11, 10];
-    println!("\n── {} ───────────────────────────────────────────────────", title);
-    println!("{}", row(&["方案", "区间收益", "年化", "MaxDD(净值)", "MaxDD(账户)", "Calmar", "笔数/年"], &widths));
+    println!(
+        "\n── {} ───────────────────────────────────────────────────",
+        title
+    );
+    println!(
+        "{}",
+        row(
+            &[
+                "方案",
+                "区间收益",
+                "年化",
+                "MaxDD(净值)",
+                "MaxDD(账户)",
+                "Calmar",
+                "笔数/年"
+            ],
+            &widths
+        )
+    );
     println!("{}", "-".repeat(112));
     for r in results {
-        println!("{}", row(&[
-            &r.name,
-            &pct(r.total_return),
-            &pct(r.annualized),
-            &pct(-r.max_dd_flow),
-            &pct(-r.max_dd_account),
-            &format!("{:.2}", r.calmar),
-            &format!("{:.1}", r.trades_per_year),
-        ], &widths));
+        println!(
+            "{}",
+            row(
+                &[
+                    &r.name,
+                    &pct(r.total_return),
+                    &pct(r.annualized),
+                    &pct(-r.max_dd_flow),
+                    &pct(-r.max_dd_account),
+                    &format!("{:.2}", r.calmar),
+                    &format!("{:.1}", r.trades_per_year),
+                ],
+                &widths
+            )
+        );
     }
     println!("  注：MaxDD(净值) 为剔除资金流的复合日频净值口径（主口径）；");
     println!("      MaxDD(账户) 为含资金流的账户净值口径。本引擎按真实账户建模、无外部注资，");
@@ -1019,88 +1219,184 @@ pub fn print_result_table(results: &[&AuditResult], title: &str) {
 
 pub fn print_mirror(strict: &AuditResult, actual: &AuditResult, config: &AppConfig) {
     println!("\n═══ 账户镜像：严格执行 vs 实际执行 ═══════════════════════════════════");
-    println!("  入场日 {} · 期初 {} · 无后续外部注资（与回测旧的 10 万 + 年注资 5 万不同）",
-        config.backtest.entry_date, money(config.backtest.initial_cash));
+    println!(
+        "  入场日 {} · 期初 {} · 无后续外部注资（与回测旧的 10 万 + 年注资 5 万不同）",
+        config.backtest.entry_date,
+        money(config.backtest.initial_cash)
+    );
     print_result_table(&[strict, actual], "净值差与偏离");
     let gap = strict.final_value - actual.final_value;
-    println!("  期末净值差 {}（严格 {} vs 实际 {}）",
-        money(gap), money(strict.final_value), money(actual.final_value));
-    println!("  交易笔数：严格 {} 笔 / 实际 {} 笔；费用（策略口径）{}",
-        strict.trade_count(), actual.trade_count(), money(strict.fees));
+    println!(
+        "  期末净值差 {}（严格 {} vs 实际 {}）",
+        money(gap),
+        money(strict.final_value),
+        money(actual.final_value)
+    );
+    println!(
+        "  交易笔数：严格 {} 笔 / 实际 {} 笔；费用（策略口径）{}",
+        strict.trade_count(),
+        actual.trade_count(),
+        money(strict.fees)
+    );
     let years = ((actual.end - actual.start).num_days() as f64 / 365.0).max(f64::EPSILON);
-    println!("  年度交易预算 {}-{} 次；实际流水 {} 笔 / {:.2} 年 ≈ {:.1} 次/年",
-        config.backtest.annual_trade_budget_min, config.backtest.annual_trade_budget_max,
-        actual.trade_count(), years, actual.trades_per_year);
+    println!(
+        "  年度交易预算 {}-{} 次；实际流水 {} 笔 / {:.2} 年 ≈ {:.1} 次/年",
+        config.backtest.annual_trade_budget_min,
+        config.backtest.annual_trade_budget_max,
+        actual.trade_count(),
+        years,
+        actual.trades_per_year
+    );
     if strict.trades_per_year > config.backtest.annual_trade_budget_max as f64 {
-        println!("  ⚠ 严格执行会产生 {:.1} 次/年，超出年度预算上限 {} 次；",
-            strict.trades_per_year, config.backtest.annual_trade_budget_max);
-        println!("    这正是「日频信号 + 周频决策」需要显式频次预算的原因，日报应压缩建议而非逐日执行。");
+        println!(
+            "  ⚠ 严格执行会产生 {:.1} 次/年，超出年度预算上限 {} 次；",
+            strict.trades_per_year, config.backtest.annual_trade_budget_max
+        );
+        println!(
+            "    这正是「日频信号 + 周频决策」需要显式频次预算的原因，日报应压缩建议而非逐日执行。"
+        );
     }
     if strict.blocked_by_cap > 0 || strict.blocked_by_settlement > 0 {
-        println!("  严格执行受阻：限购 {} 次、在途资金未到账 {} 次（均为真实通道约束）",
-            strict.blocked_by_cap, strict.blocked_by_settlement);
+        println!(
+            "  严格执行受阻：限购 {} 次、在途资金未到账 {} 次（均为真实通道约束）",
+            strict.blocked_by_cap, strict.blocked_by_settlement
+        );
     }
 }
 
 pub fn print_validation_suite(s: &ValidationSuite, config: &AppConfig) {
     print_result_table(
-        &[&s.real, &s.delayed, &s.random, &s.constant_avg, &s.constant_70,
-          &s.constant_100, &s.buy_hold],
+        &[
+            &s.real,
+            &s.delayed,
+            &s.random,
+            &s.constant_avg,
+            &s.constant_70,
+            &s.constant_100,
+            &s.buy_hold,
+        ],
         "策略有效性对照（同一数据、同一成本、同一信号口径）",
     );
     let p = &s.permutation;
-    println!("\n  信号时序置换检验（{} 次，保留边际分布、只打乱时序）", p.iterations);
-    println!("  年化分布 P5 {} / P50 {} / P95 {}；真实信号 {} → 第 {:.0} 百分位",
-        pct(p.p5), pct(p.p50), pct(p.p95), pct(p.real_value), p.real_percentile);
-    println!("  判定：{}（门槛为进入前 {} 百分位）",
+    println!(
+        "\n  信号时序置换检验（{} 次，保留边际分布、只打乱时序）",
+        p.iterations
+    );
+    println!(
+        "  年化分布 P5 {} / P50 {} / P95 {}；真实信号 {} → 第 {:.0} 百分位",
+        pct(p.p5),
+        pct(p.p50),
+        pct(p.p95),
+        pct(p.real_value),
+        p.real_percentile
+    );
+    println!(
+        "  判定：{}（门槛为进入前 {} 百分位）",
         if p.significant {
             "择时有统计上可辨识的贡献".to_string()
         } else {
-            format!("择时无显著贡献；收益主要来自平均仓位 {:.1}%，而非情绪择时",
-                s.real.avg_risk_weight * 100.0)
+            format!(
+                "择时无显著贡献；收益主要来自平均仓位 {:.1}%，而非情绪择时",
+                s.real.avg_risk_weight * 100.0
+            )
         },
-        config.backtest.significance_percentile);
+        config.backtest.significance_percentile
+    );
     println!("  注：置换检验只检验时序信息；不排除情绪指标在非线性/更长周期下的价值。");
-    println!("  纯资产池日频 MaxDD（不含现金缓冲）：{:.2}%；FGI 缺失而跳过决策 {} 日",
-        s.real.max_dd_market * 100.0, s.real.skipped_no_fgi);
+    println!(
+        "  纯资产池日频 MaxDD（不含现金缓冲）：{:.2}%；FGI 缺失而跳过决策 {} 日",
+        s.real.max_dd_market * 100.0,
+        s.real.skipped_no_fgi
+    );
 }
 
 pub fn print_regimes(rows: &[RegimeRow]) {
     let widths = [30, 24, 14, 14, 14, 14, 8];
     println!("\n── 牛熊分段（策略与买入持有同口径） ────────────────────────────────");
-    println!("{}", row(&["区间", "起止", "策略收益", "策略MaxDD", "持有收益", "持有MaxDD", "笔数"], &widths));
+    println!(
+        "{}",
+        row(
+            &[
+                "区间",
+                "起止",
+                "策略收益",
+                "策略MaxDD",
+                "持有收益",
+                "持有MaxDD",
+                "笔数"
+            ],
+            &widths
+        )
+    );
     println!("{}", "-".repeat(128));
     for r in rows {
-        println!("{}", row(&[
-            &r.name,
-            &format!("{}~{}", r.from, r.to),
-            &pct(r.strategy_return),
-            &pct(-r.strategy_dd),
-            &pct(r.buy_hold_return),
-            &pct(-r.buy_hold_dd),
-            &r.trades.to_string(),
-        ], &widths));
+        println!(
+            "{}",
+            row(
+                &[
+                    &r.name,
+                    &format!("{}~{}", r.from, r.to),
+                    &pct(r.strategy_return),
+                    &pct(-r.strategy_dd),
+                    &pct(r.buy_hold_return),
+                    &pct(-r.buy_hold_dd),
+                    &r.trades.to_string(),
+                ],
+                &widths
+            )
+        );
     }
 }
 
 pub fn print_folds(rows: &[FoldRow], config: &AppConfig) {
     let widths = [8, 26, 26, 12, 14, 14, 10];
     println!("\n── 滚动多折 walk-forward（训练 24 月 / 样本外 12 月） ────────────────");
-    println!("{}", row(&["折", "训练区间", "样本外区间", "调优band", "默认年化", "调优年化", "调优更优"], &widths));
+    println!(
+        "{}",
+        row(
+            &[
+                "折",
+                "训练区间",
+                "样本外区间",
+                "调优band",
+                "默认年化",
+                "调优年化",
+                "调优更优"
+            ],
+            &widths
+        )
+    );
     println!("{}", "-".repeat(122));
     for r in rows {
-        println!("{}", row(&[
-            &r.label, &r.train, &r.test,
-            &format!("{:.0}pp", r.tuned_band),
-            &pct(r.default_oos), &pct(r.tuned_oos),
-            if r.tuned_better { "是" } else { "否" },
-        ], &widths));
+        println!(
+            "{}",
+            row(
+                &[
+                    &r.label,
+                    &r.train,
+                    &r.test,
+                    &format!("{:.0}pp", r.tuned_band),
+                    &pct(r.default_oos),
+                    &pct(r.tuned_oos),
+                    if r.tuned_better { "是" } else { "否" },
+                ],
+                &widths
+            )
+        );
     }
     let better = rows.iter().filter(|r| r.tuned_better).count();
-    let avg_gain: f64 = rows.iter().map(|r| r.tuned_oos - r.default_oos).sum::<f64>()
+    let avg_gain: f64 = rows
+        .iter()
+        .map(|r| r.tuned_oos - r.default_oos)
+        .sum::<f64>()
         / rows.len().max(1) as f64;
-    println!("  样本内调优在样本外更优的折数：{}/{}；平均年化改善 {:+.2}pp；当前配置 band={:.0}pp",
-        better, rows.len(), avg_gain * 100.0, config.rebalance.band_pp);
+    println!(
+        "  样本内调优在样本外更优的折数：{}/{}；平均年化改善 {:+.2}pp；当前配置 band={:.0}pp",
+        better,
+        rows.len(),
+        avg_gain * 100.0,
+        config.rebalance.band_pp
+    );
     if better * 2 <= rows.len() || avg_gain < 0.005 {
         println!("  结论：调参未带来稳定或可观的样本外改善（改善 <0.5pp/年），不建议据此调参。");
     }
@@ -1150,19 +1446,24 @@ mod tests {
         c.allocation.cn_stocks = 0.0;
         c.allocation.counter_cyclical = 0.0;
         c.rebalance.min_trade_amount = 1.0;
-        let prices = [100.0, 92.0, 85.0, 88.0, 90.0, 95.0,
-                      100.0, 105.0, 110.0, 112.0, 115.0, 118.0];
+        let prices = [
+            100.0, 92.0, 85.0, 88.0, 90.0, 95.0, 100.0, 105.0, 110.0, 112.0, 115.0, 118.0,
+        ];
         let start = NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
         let bs = BarSeries {
             kind: DatasetKind::Long,
             label: "start-drop".into(),
-            bars: prices.iter().enumerate().map(|(i, p)| Bar {
-                date: start + Duration::days(i as i64),
-                fgi: Some(50.0),
-                fgi_age_days: 1,
-                prices: [*p, *p, *p],
-                unit_nav: None,
-            }).collect(),
+            bars: prices
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Bar {
+                    date: start + Duration::days(i as i64),
+                    fgi: Some(50.0),
+                    fgi_age_days: 1,
+                    prices: [*p, *p, *p],
+                    unit_nav: None,
+                })
+                .collect(),
             caveats: vec![],
         };
         let n = bs.bars.len();
@@ -1184,7 +1485,8 @@ mod tests {
         assert!(
             (a.total_return - b.total_return).abs() < 0.005,
             "同一执行日建仓时常数满仓 {:+.4} 与买入持有 {:+.4} 应一致，差异说明存在起点偏差",
-            b.total_return, a.total_return
+            b.total_return,
+            a.total_return
         );
     }
 
@@ -1231,7 +1533,10 @@ mod tests {
         let r = run_audit(&c, &s, &sig, &o).unwrap();
         // 通道 T+n >= 1，卖出当天买入预算只来自已到账现金；结果必须可完成且资产非负
         assert!(r.final_value > 0.0);
-        assert!(r.account_curve.iter().all(|(_, v)| *v >= -1e-6), "不允许透支");
+        assert!(
+            r.account_curve.iter().all(|(_, v)| *v >= -1e-6),
+            "不允许透支"
+        );
     }
 
     #[test]
@@ -1250,7 +1555,10 @@ mod tests {
         let mut o = AuditOptions::spanning("const", &s, &c);
         o.variant = SignalVariant::Constant(0.7);
         let r = run_audit(&c, &s, &sig, &o).unwrap();
-        assert!(r.avg_risk_weight <= 0.75, "常数 70% 仓位的实际均值应接近 0.7");
+        assert!(
+            r.avg_risk_weight <= 0.75,
+            "常数 70% 仓位的实际均值应接近 0.7"
+        );
     }
 
     #[test]

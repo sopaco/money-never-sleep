@@ -215,16 +215,19 @@ fn status() -> Result<()> {
                 ),
             }
             for record in orchestrator::read_init_records(3).iter().rev() {
-                let detail = record
-                    .detail
-                    .as_deref()
-                    .unwrap_or(if record.outcome == orchestrator::AgentInitOutcome::Spoke {
+                let detail = record.detail.as_deref().unwrap_or(
+                    if record.outcome == orchestrator::AgentInitOutcome::Spoke {
                         "已开口"
                     } else {
                         ""
-                    });
+                    },
+                );
                 if detail.is_empty() {
-                    println!("  {} {}", record.at.format("%m-%d %H:%M"), record.outcome.label());
+                    println!(
+                        "  {} {}",
+                        record.at.format("%m-%d %H:%M"),
+                        record.outcome.label()
+                    );
                 } else {
                     println!(
                         "  {} {}：{}",
@@ -293,7 +296,10 @@ fn wake(ledger: Option<String>) -> Result<()> {
     match report.wake {
         schedule::WakeVerdict::Wake => println!("唤醒：是（{source:?}）"),
         schedule::WakeVerdict::TooSoon { next_allowed } => {
-            println!("唤醒：否，距上次巡检不足间隔，最早 {}", next_allowed.format("%H:%M"));
+            println!(
+                "唤醒：否，距上次巡检不足间隔，最早 {}",
+                next_allowed.format("%H:%M")
+            );
             return Ok(());
         }
         schedule::WakeVerdict::Duplicate => {
@@ -307,7 +313,10 @@ fn wake(ledger: Option<String>) -> Result<()> {
             println!("开口：是（{}）", candidate.reason.label());
             println!("文案：{}", candidate.draft);
             money_never_sleep::butler::orchestrator::enqueue_notice(now, &candidate)?;
-            println!("已放入出站队列：{}", money_never_sleep::butler::orchestrator::outbox_path().display());
+            println!(
+                "已放入出站队列：{}",
+                money_never_sleep::butler::orchestrator::outbox_path().display()
+            );
         }
         Some(schedule::SpeakDecision::Silent(reason)) => {
             println!("开口：否（{}）", reason.label());
@@ -396,12 +405,23 @@ fn list_memory(archived: bool) -> Result<()> {
         &butler.memory.facts
     };
     if rows.is_empty() {
-        println!("{}：空", if archived { "归档事实" } else { "常驻事实" });
+        println!(
+            "{}：空",
+            if archived {
+                "归档事实"
+            } else {
+                "常驻事实"
+            }
+        );
         return Ok(());
     }
     println!(
         "{}：{} 条",
-        if archived { "归档事实" } else { "常驻事实" },
+        if archived {
+            "归档事实"
+        } else {
+            "常驻事实"
+        },
         rows.len()
     );
     for fact in rows {
@@ -409,7 +429,11 @@ fn list_memory(archived: bool) -> Result<()> {
             .expires_at
             .map(|day| format!(" · 到期 {day}"))
             .unwrap_or_default();
-        let expired = if fact.is_expired(today) { " · 已过期" } else { "" };
+        let expired = if fact.is_expired(today) {
+            " · 已过期"
+        } else {
+            ""
+        };
         println!(
             "  {} [{}] {}{due}{expired}",
             fact.id,
@@ -483,7 +507,11 @@ fn list_tasks() -> Result<()> {
         println!("待执行：");
     }
     for task in pending {
-        let status = if task.is_expired(now) { "已过期待清理" } else { "待执行" };
+        let status = if task.is_expired(now) {
+            "已过期待清理"
+        } else {
+            "待执行"
+        };
         println!(
             "  {} [{}] {} · 到点 {} · {}",
             task.id,
@@ -552,7 +580,11 @@ fn task(action: TaskAction) -> Result<()> {
                 }
                 _ => anyhow::bail!("--at 和 --in 必须二选一"),
             };
-            let kind = if talk { TaskKind::Talk } else { TaskKind::Check };
+            let kind = if talk {
+                TaskKind::Talk
+            } else {
+                TaskKind::Check
+            };
             let origin = if user || talk {
                 TaskOrigin::User
             } else {
@@ -606,11 +638,11 @@ fn task(action: TaskAction) -> Result<()> {
 fn reject_reason(verdict: &TaskVerdict) -> String {
     match verdict {
         TaskVerdict::Accepted { id } => format!("已接受任务 {id}"),
-        TaskVerdict::Duplicate => {
-            "未接受：同一件事已经有任务了，先处理完或换个说法".to_owned()
-        }
+        TaskVerdict::Duplicate => "未接受：同一件事已经有任务了，先处理完或换个说法".to_owned(),
         TaskVerdict::DailyLimit => {
-            format!("未接受：今天已经建了 {MAX_NEW_PER_DAY} 条待办任务，明天再来；用户亲口要的提醒请加 --user")
+            format!(
+                "未接受：今天已经建了 {MAX_NEW_PER_DAY} 条待办任务，明天再来；用户亲口要的提醒请加 --user"
+            )
         }
         TaskVerdict::QueueFull => {
             format!("未接受：待执行任务已达 {MAX_ACTIVE} 条上限，先完成或等旧的作废")
@@ -634,7 +666,10 @@ fn outbox() -> Result<()> {
         }
         Err(error) => return Err(error).with_context(|| format!("读取 {} 失败", path.display())),
     };
-    let mut lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     for line in lines.drain(lines.len().saturating_sub(20)..) {
         println!("{line}");
     }
@@ -725,7 +760,10 @@ mod tests {
 
     #[test]
     fn 相对时长支持秒分时天() {
-        assert_eq!(parse_duration("90s").unwrap(), chrono::Duration::seconds(90));
+        assert_eq!(
+            parse_duration("90s").unwrap(),
+            chrono::Duration::seconds(90)
+        );
         assert_eq!(parse_duration("5m").unwrap(), chrono::Duration::minutes(5));
         assert_eq!(parse_duration("2h").unwrap(), chrono::Duration::hours(2));
         assert_eq!(parse_duration("1d").unwrap(), chrono::Duration::days(1));

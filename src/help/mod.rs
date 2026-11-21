@@ -7,7 +7,6 @@
 //! [`render::ImageCache`]).
 
 pub mod content;
-pub mod deeplink;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod markdown;
@@ -104,8 +103,6 @@ impl Global for HelpGlobals {}
 /// mns-help --page strategy-rebalance  直接翻到该页（slug 见 help/<slug>.md）
 /// ```
 pub fn run() {
-    // 启动时刻同时是「哪些跳页请求还算数」的分界线。
-    let started = std::time::SystemTime::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("用法: mns-help [--page <slug>]\n\n不带参数时打开帮助首页。");
@@ -130,10 +127,28 @@ pub fn run() {
         }
     }
 
-    // 单实例：已经在看帮助时再次双击，应该把已有窗口提到前面，而不是多开一个。
-    let instance = match crate::single_instance::acquire("mns-help") {
-        crate::single_instance::Acquired::Primary(guard) => guard,
-        crate::single_instance::Acquired::AlreadyRunning => return,
+    // 单实例：监听通道本身就是锁（管道/套接字绑定是原子的）。已经有窗口时
+    // 把「翻到哪一页」递过去，然后退出，不再需要命名事件 + 请求文件两套状态。
+    let (instance, events) = match crate::ipc::listen("mns-help") {
+        Ok((listener, events)) => (Some(listener), Some(events)),
+        Err(_) => {
+            let page = requested.clone().unwrap_or_default();
+            // 对方可能刚启动、还没 bind：补几次再放弃，别把这次点击吞掉。
+            for _ in 0..20 {
+                if crate::ipc::poke(
+                    "mns-help",
+                    &crate::ipc::Signal::OpenPage { page: page.clone() },
+                )
+                .is_ok()
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // 既绑不上也递不进去：宁可多开一个窗口，也别让用户打不开帮助。
+            eprintln!("[mns-help] 单实例通道不可用，无锁启动");
+            (None, None)
+        }
     };
 
     let app = gpui_kit::application()
@@ -246,7 +261,7 @@ pub fn run() {
         #[cfg(target_os = "macos")]
         sync_app_menu_name(cx);
 
-        spawn_link_watcher(cx, instance, started);
+        spawn_link_watcher(cx, instance, events);
     });
 }
 
@@ -309,44 +324,40 @@ fn help_menus() -> Vec<Menu> {
     ]
 }
 
-/// 轮询两件事：别处要求「唤起窗口」，以及别处要求「翻到某一页」。
+/// 接收 GUI 的「唤起 + 翻页」请求。
 ///
-/// Windows 上第二实例只留得下一个信号，翻页意图由 [`deeplink`] 的文件补足；
-/// macOS 没有单实例锁，GUI 靠子进程句柄保证不重复启动，翻页同样走文件。
-/// 两条来源合在一个循环里，是为了让「置前」和「翻页」发生在同一帧：先翻页
-/// 再置前，窗口被看见时已经停在目标页。
+/// 监听通道既是单实例锁，也是传参通道：第二次启动会在 bind 失败后把
+/// `OpenPage` 推进来，不再需要 400ms 轮询请求文件。置前与翻页放在同一帧，
+/// 窗口被看见时已经停在目标页。
 fn spawn_link_watcher(
     cx: &mut App,
-    guard: crate::single_instance::Guard,
-    started: std::time::SystemTime,
+    listener: Option<crate::ipc::Listener>,
+    events: Option<tokio::sync::mpsc::UnboundedReceiver<crate::ipc::Event>>,
 ) {
+    let Some(mut events) = events else {
+        return;
+    };
     cx.spawn(async move |cx| {
-        let mut watcher = deeplink::Watcher::since(deeplink::path(), started);
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(400))
-                .await;
-            let requested = watcher.poll();
-            if requested.is_none() && !guard.wakeup_requested() {
+        // 监听端必须活到进程退出：它是单实例锁，也是 socket 文件的清理者。
+        let _listener = listener;
+        while let Some(event) = events.recv().await {
+            let crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenPage { page }) = event else {
                 continue;
-            }
+            };
             let _ = cx.update(|cx| {
-                if let Some(slug) = requested.as_deref() {
-                    // 空串 = 只置前（GUI 顶栏的「帮助」按钮），不改变阅读位置。
-                    if let Some(target) = content::page_id(slug) {
-                        // 「点了问号没反应」是这条链路最可能的故障，留一行
-                        // 可追踪的痕迹：调试版从终端启动就能看见跳转发生了。
-                        #[cfg(debug_assertions)]
-                        eprintln!("[mns-help] 跳转到 {slug}");
-                        if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
-                            view.update(cx, |shell, cx| {
-                                shell.navigate(target);
-                                cx.notify();
-                            });
-                        }
-                    } else if !slug.is_empty() {
-                        eprintln!("[mns-help] 请求的页面 `{slug}` 不存在，停在当前页");
+                if let Some(target) = content::page_id(&page) {
+                    // 「点了问号没反应」是这条链路最可能的故障，留一行
+                    // 可追踪的痕迹：调试版从终端启动就能看见跳转发生了。
+                    #[cfg(debug_assertions)]
+                    eprintln!("[mns-help] 跳转到 {page}");
+                    if let Some(view) = cx.global::<HelpGlobals>().view.clone() {
+                        view.update(cx, |shell, cx| {
+                            shell.navigate(target);
+                            cx.notify();
+                        });
                     }
+                } else if !page.is_empty() {
+                    eprintln!("[mns-help] 请求的页面 `{page}` 不存在，停在当前页");
                 }
                 // 从别的应用（例如 GUI）触发时，只有窗口层的 `activate_window`
                 // 未必能把整个应用带到前台，菜单栏还会留在原处。

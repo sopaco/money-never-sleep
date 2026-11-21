@@ -98,7 +98,10 @@ async fn main() {
                 terminal = Some(RunState::Finished);
             }
             Ok(Some(AgentEvent::Decision(report))) => {
-                printer.entry(EntryKind::System, &format!("结构化结论：{}", report.headline()));
+                printer.entry(
+                    EntryKind::System,
+                    &format!("结构化结论：{}", report.headline()),
+                );
             }
             Ok(Some(AgentEvent::Entry(entry))) => {
                 printer.entry(entry.kind, &entry.text);

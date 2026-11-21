@@ -20,24 +20,41 @@
 //! （`connect_duplex`），上行发 `Chat*` 请求，下行收 `ChatSnapshot` /
 //! `ChatDelta` 推送；服务端用 `Listener::send_to` 定向推。`poke` 仍是
 //! 「连上就走」的短连接，供只需要递一句话的调用方使用。
+//!
+//! 监听端跑在一个专用 tokio reactor 上：Windows 用 overlapped I/O 等就绪
+//! （不再按 20ms 轮询 `PeekNamedPipe`），Unix 用 epoll/kqueue；每条连接只是
+//! reactor 上的读、写两个任务，共享两条工作线程，不再各占两个 OS 线程。
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// 一行协议能有多大。见模块注释：按快照最坏情况取 1MB。
 const MAX_LINE: usize = 1024 * 1024;
 
 /// 客户端发来的请求。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `kind` 字段是协议的唯一判别式：`#[serde(tag = "kind", rename_all = "kebab-case")]`
+/// 让枚举变体名与 JSON 一一对应，新增一条消息只需加一个变体，不再维护
+/// `encode` / `decode` 两套对称 match。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Signal {
     /// 把主窗口拿到前面（二次启动）。
     Open,
     /// 打开管家会话窗口。
     OpenButler,
     /// 守护进程自我介绍。带上 `role`，将来 GUI 与管家可以共用一个监听。
-    Hello { role: String },
+    Hello {
+        /// 老版本可能只发 `{"kind":"hello"}`，缺省角色保持兼容。
+        #[serde(default = "default_role")]
+        role: String,
+    },
     /// GUI 请守护进程立刻判定一次。`ledger` 有值是账本事件（不受巡检间隔
     /// 约束），无值是定时巡检。
-    Wake { ledger: Option<String> },
+    Wake {
+        #[serde(default)]
+        ledger: Option<String>,
+    },
     /// GUI 改了「主动开口」开关，让守护进程用自己的状态文件落盘——避免两个
     /// 进程同时写 `state.json`。
     SetProactive { enabled: bool },
@@ -58,6 +75,9 @@ pub enum Signal {
     /// 序列化；宿主按 `notices.jsonl` 的 delivered 记录去重，重复下发
     /// 不会重复弹。投递成功后 butlerd 才推进 `pending.offset`。
     DeliverNotice { json: String },
+    /// 宿主对开口的回执：投递（或确认已在会话里可见）之后才发。守护进程
+    /// 收到才推进 `pending` 偏移，宿主中途崩溃时同一 id 会重投。
+    NoticeDelivered { notice_id: String },
     /// 用户点了某条系统通知：请已打开的管家窗口定位到该条开口。
     /// 窗口不在时由宿主带 `--notice <id>` 拉起，不走这条。
     NoticeFocus { notice_id: String },
@@ -110,11 +130,27 @@ pub enum Event {
 /// 读得慢不能阻塞 butlerd 的回合推进，队列满了就断开这条连接，窗口重连
 /// 拿快照，不丢数据。
 pub struct Listener {
+    /// 监听循环跑在一个专用 tokio reactor 上：Windows 的命名管道读写走
+    /// overlapped I/O（不再 20ms 轮询），Unix 走 epoll/kqueue。reactor 只有
+    /// 2 个工作线程，每条连接只是它上面的两个任务，不再各占 2 个 OS 线程。
+    ///
+    /// `Option` 只为 `Drop`：`Runtime::shutdown_background` 按值消费。
+    _runtime: Option<tokio::runtime::Runtime>,
     /// 只为了活着：`Drop` 里删 socket 文件。
     #[cfg(unix)]
     _inner: unix_impl::Listener,
     #[cfg(windows)]
     _inner: windows_impl::Listener,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // 用 `shutdown_background` 而不是让它随字段析构：`Drop` 可能发生在
+        // 异步上下文里（butlerd 的 tokio main），阻塞式关停会 panic。
+        if let Some(runtime) = self._runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl Listener {
@@ -155,8 +191,8 @@ impl Listener {
 mod registry {
     use super::Signal;
     use std::collections::HashMap;
-    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::sync::Mutex;
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
 
     /// 每条连接的出站队列深度。快照最大 1MB，64 帧的内存上限足够吸收
     /// 一次慢读的突发；再堵说明对端已经不读，断开重连比无限积压好。
@@ -164,11 +200,11 @@ mod registry {
 
     #[derive(Default)]
     pub(super) struct Registry {
-        senders: Mutex<HashMap<u64, SyncSender<Signal>>>,
+        senders: Mutex<HashMap<u64, Sender<Signal>>>,
     }
 
     impl Registry {
-        pub(super) fn insert(&self, id: u64, sender: SyncSender<Signal>) {
+        pub(super) fn insert(&self, id: u64, sender: Sender<Signal>) {
             self.senders
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -184,17 +220,23 @@ mod registry {
 
         /// 队列满也返回 `false` 并把这条连接拆掉：慢读者拿到断线后重连、
         /// 重收全量快照，服务端回合不等待任何客户端。
+        ///
+        /// `try_send` 不依赖调用方处在异步上下文：`send_to` 由窗口与
+        /// butlerd 的同步代码调用。
         pub(super) fn send(&self, id: u64, signal: &Signal) -> bool {
-            let guard = self.senders.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = self
+                .senders
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.get(&id) {
                 Some(sender) => match sender.try_send(signal.clone()) {
                     Ok(()) => true,
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         drop(guard);
                         self.remove(id);
                         false
                     }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         drop(guard);
                         self.remove(id);
                         false
@@ -206,8 +248,18 @@ mod registry {
     }
 
     /// 建一条连接的出站队列。
-    pub(super) fn channel() -> (SyncSender<Signal>, std::sync::mpsc::Receiver<Signal>) {
-        sync_channel(OUTBOUND_QUEUE)
+    pub(super) fn outbound() -> (Sender<Signal>, Receiver<Signal>) {
+        channel(OUTBOUND_QUEUE)
+    }
+
+    /// 监听循环所在的 reactor。两条工作线程足够：每条连接只做本地小块
+    /// 读写，真正耗时的判定与会话都在阻塞线程池或独立 runtime 上。
+    pub(super) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("mns-ipc")
+            .enable_all()
+            .build()
     }
 }
 
@@ -235,19 +287,32 @@ impl std::fmt::Display for ConnectError {
 /// 监听 `app` 的唤醒通道。已有实例在监听时返回 `AlreadyListening`。
 pub fn listen(app: &str) -> std::io::Result<(Listener, UnboundedReceiver<Event>)> {
     let (tx, rx) = unbounded_channel();
+    let runtime = registry::runtime()?;
     #[cfg(unix)]
     {
-        let listener = unix_impl::listen(app, tx)?;
-        Ok((Listener { _inner: listener }, rx))
+        let inner = unix_impl::listen(app, tx, &runtime)?;
+        Ok((
+            Listener {
+                _runtime: Some(runtime),
+                _inner: inner,
+            },
+            rx,
+        ))
     }
     #[cfg(windows)]
     {
-        let listener = windows_impl::listen(app, tx)?;
-        Ok((Listener { _inner: listener }, rx))
+        let inner = windows_impl::listen(app, tx, &runtime)?;
+        Ok((
+            Listener {
+                _runtime: Some(runtime),
+                _inner: inner,
+            },
+            rx,
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (app, tx);
+        let _ = (app, tx, runtime);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "本地唤醒通道暂只支持 Unix 与 Windows",
@@ -332,34 +397,14 @@ pub fn connect(app: &str) -> Result<Client, ConnectError> {
 /// 管家窗口对 `mns-butlerd` 用这一条连接收发会话：上行 `Chat*` 请求走
 /// `Client::send`，下行的快照与增量从返回的通道里读。连接断开（服务端
 /// 退出、队列溢出被拆线）时通道关闭——调用方据此进入离线态或重连。
-pub fn connect_duplex(
-    app: &str,
-) -> Result<(Client, UnboundedReceiver<Signal>), ConnectError> {
+pub fn connect_duplex(app: &str) -> Result<(Client, UnboundedReceiver<Signal>), ConnectError> {
     #[cfg(unix)]
     {
-        match unix_impl::connect(app) {
-            Ok(inner) => {
-                let (tx, rx) = unbounded_channel();
-                if let Err(error) = inner.start_reader(tx) {
-                    return Err(ConnectError::Io(error));
-                }
-                Ok((Client { inner }, rx))
-            }
-            Err(error) => Err(error),
-        }
+        unix_impl::connect_duplex(app)
     }
     #[cfg(windows)]
     {
-        match windows_impl::connect(app) {
-            Ok(inner) => {
-                let (tx, rx) = unbounded_channel();
-                if let Err(error) = inner.start_reader(tx) {
-                    return Err(ConnectError::Io(error));
-                }
-                Ok((Client { inner }, rx))
-            }
-            Err(error) => Err(error),
-        }
+        windows_impl::connect_duplex(app)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -368,99 +413,18 @@ pub fn connect_duplex(
     }
 }
 
+fn default_role() -> String {
+    "unknown".to_owned()
+}
+
 fn encode(signal: &Signal) -> String {
-    let value = match signal {
-        Signal::Open => serde_json::json!({ "kind": "open" }),
-        Signal::OpenButler => serde_json::json!({ "kind": "open-butler" }),
-        Signal::Hello { role } => serde_json::json!({ "kind": "hello", "role": role }),
-        Signal::Wake { ledger } => serde_json::json!({ "kind": "wake", "ledger": ledger }),
-        Signal::SetProactive { enabled } => {
-            serde_json::json!({ "kind": "set-proactive", "enabled": enabled })
-        }
-        Signal::RequestBrief => serde_json::json!({ "kind": "request-brief" }),
-        Signal::Brief { json } => serde_json::json!({ "kind": "brief", "json": json }),
-        Signal::OpenPage { page } => serde_json::json!({ "kind": "open-page", "page": page }),
-        Signal::OpenAbout => serde_json::json!({ "kind": "open-about" }),
-        Signal::DeliverNotice { json } => {
-            serde_json::json!({ "kind": "deliver-notice", "json": json })
-        }
-        Signal::NoticeFocus { notice_id } => {
-            serde_json::json!({ "kind": "notice-focus", "notice_id": notice_id })
-        }
-        Signal::ButlerSeen => serde_json::json!({ "kind": "butler-seen" }),
-        Signal::StartButler => serde_json::json!({ "kind": "start-butler" }),
-        Signal::RefreshData => serde_json::json!({ "kind": "refresh-data" }),
-        Signal::ChatAttach => serde_json::json!({ "kind": "chat-attach" }),
-        Signal::ChatSend { text } => serde_json::json!({ "kind": "chat-send", "text": text }),
-        Signal::ChatClear => serde_json::json!({ "kind": "chat-clear" }),
-        Signal::ChatSeen => serde_json::json!({ "kind": "chat-seen" }),
-        Signal::ChatSnapshot { json } => {
-            serde_json::json!({ "kind": "chat-snapshot", "json": json })
-        }
-        Signal::ChatDelta { text } => serde_json::json!({ "kind": "chat-delta", "text": text }),
-        Signal::Shutdown => serde_json::json!({ "kind": "shutdown" }),
-        Signal::Bye => serde_json::json!({ "kind": "bye" }),
-    };
-    format!("{value}\n")
+    let mut line = serde_json::to_string(signal).expect("Signal 总是可序列化");
+    line.push('\n');
+    line
 }
 
 fn decode(line: &str) -> Option<Signal> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    match value.get("kind")?.as_str()? {
-        "open" => Some(Signal::Open),
-        "open-butler" => Some(Signal::OpenButler),
-        "hello" => Some(Signal::Hello {
-            role: value
-                .get("role")
-                .and_then(|role| role.as_str())
-                .unwrap_or("unknown")
-                .to_owned(),
-        }),
-        "wake" => Some(Signal::Wake {
-            ledger: value
-                .get("ledger")
-                .and_then(|ledger| ledger.as_str())
-                .map(str::to_owned),
-        }),
-        "set-proactive" => Some(Signal::SetProactive {
-            enabled: value.get("enabled").and_then(|flag| flag.as_bool())?,
-        }),
-        "request-brief" => Some(Signal::RequestBrief),
-        "brief" => Some(Signal::Brief {
-            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
-        }),
-        "open-page" => Some(Signal::OpenPage {
-            page: value.get("page").and_then(|page| page.as_str())?.to_owned(),
-        }),
-        "open-about" => Some(Signal::OpenAbout),
-        "deliver-notice" => Some(Signal::DeliverNotice {
-            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
-        }),
-        "notice-focus" => Some(Signal::NoticeFocus {
-            notice_id: value
-                .get("notice_id")
-                .and_then(|id| id.as_str())?
-                .to_owned(),
-        }),
-        "butler-seen" => Some(Signal::ButlerSeen),
-        "start-butler" => Some(Signal::StartButler),
-        "refresh-data" => Some(Signal::RefreshData),
-        "chat-attach" => Some(Signal::ChatAttach),
-        "chat-send" => Some(Signal::ChatSend {
-            text: value.get("text").and_then(|text| text.as_str())?.to_owned(),
-        }),
-        "chat-clear" => Some(Signal::ChatClear),
-        "chat-seen" => Some(Signal::ChatSeen),
-        "chat-snapshot" => Some(Signal::ChatSnapshot {
-            json: value.get("json").and_then(|json| json.as_str())?.to_owned(),
-        }),
-        "chat-delta" => Some(Signal::ChatDelta {
-            text: value.get("text").and_then(|text| text.as_str())?.to_owned(),
-        }),
-        "shutdown" => Some(Signal::Shutdown),
-        "bye" => Some(Signal::Bye),
-        _ => None,
-    }
+    serde_json::from_str(line).ok()
 }
 
 #[cfg(unix)]
@@ -468,8 +432,8 @@ mod unix_impl {
     use super::{Event, MAX_LINE, Signal, decode, encode, registry};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::fs::PermissionsExt;
     use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -538,6 +502,7 @@ mod unix_impl {
     pub(super) fn listen(
         app: &str,
         tx: UnboundedSender<Event>,
+        runtime: &tokio::runtime::Runtime,
     ) -> std::io::Result<Listener> {
         let path = socket_path(app);
         prepare_dir(&path)?;
@@ -553,44 +518,16 @@ mod unix_impl {
         let listener = UnixListener::bind(&path)?;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         let identity = Listener::identity_of(&path);
+        listener.set_nonblocking(true)?;
+        // 进 runtime 上下文再转换：`from_std` 要拿 reactor 的注册表。
+        let listener = {
+            let _guard = runtime.enter();
+            tokio::net::UnixListener::from_std(listener)?
+        };
 
         let registry = Arc::new(registry::Registry::default());
         let thread_registry = registry.clone();
-
-        std::thread::Builder::new()
-            .name("mns-ipc-accept".to_owned())
-            .spawn(move || {
-                let mut next_id: u64 = 0;
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
-                    next_id += 1;
-                    let id = next_id;
-                    if tx.send(Event::Connected(id)).is_err() {
-                        return;
-                    }
-                    // 双向连接：读线程与写线程各持一份克隆的流。读线程解析
-                    // 上行帧；写线程从有界出站队列取帧推送，队列满即拆线。
-                    let Ok(write_half) = stream.try_clone() else {
-                        let _ = tx.send(Event::Disconnected(id));
-                        continue;
-                    };
-                    let (out_tx, out_rx) = registry::channel();
-                    thread_registry.insert(id, out_tx);
-                    let read_registry = thread_registry.clone();
-                    // 每条连接两个线程：一个卡住的客户端不能堵住 accept，
-                    // 一个读得慢的客户端也不能堵住服务端推送。
-                    let tx = tx.clone();
-                    let _ = std::thread::Builder::new()
-                        .name(format!("mns-ipc-{id}"))
-                        .spawn(move || {
-                            read_connection(id, stream, tx);
-                            read_registry.remove(id);
-                        });
-                    let _ = std::thread::Builder::new()
-                        .name(format!("mns-ipc-{id}-w"))
-                        .spawn(move || write_connection(write_half, out_rx));
-                }
-            })?;
+        runtime.spawn(accept_loop(listener, tx, thread_registry));
 
         Ok(Listener {
             path,
@@ -599,40 +536,108 @@ mod unix_impl {
         })
     }
 
-    fn read_connection(id: u64, stream: UnixStream, tx: UnboundedSender<Event>) {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
+    /// 接受连接：每条连接在 reactor 上起两个任务（读 / 写），不再各占一个
+    /// OS 线程。两个任务共用 `Arc<UnixStream>`：tokio 的 `try_read` /
+    /// `try_write` 都只借 `&self`，可并发进行。
+    async fn accept_loop(
+        listener: tokio::net::UnixListener,
+        tx: UnboundedSender<Event>,
+        registry: Arc<registry::Registry>,
+    ) {
+        let mut next_id: u64 = 0;
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line.len() > MAX_LINE {
-                        break;
-                    }
-                    if let Some(signal) = decode(&line)
-                        && tx.send(Event::Signal(id, signal)).is_err()
-                    {
-                        break;
-                    }
+            let Ok((stream, _)) = listener.accept().await else {
+                // 单个 accept 失败不该结束监听：退避一下继续，否则一次
+                // EMFILE 就把进程变聋。
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            };
+            next_id += 1;
+            let id = next_id;
+            if tx.send(Event::Connected(id)).is_err() {
+                return;
+            }
+            let (out_tx, out_rx) = registry::outbound();
+            registry.insert(id, out_tx);
+            let stream = Arc::new(stream);
+
+            let writer_stream = Arc::clone(&stream);
+            let writer_registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let _ = write_loop(writer_stream.clone(), out_rx).await;
+                // 写半边收摊即整条连接收摊：读任务随之退出，对端看到 EOF。
+                let _ = writer_stream.shutdown(Shutdown::Both);
+                writer_registry.remove(id);
+            });
+
+            let reader_stream = Arc::clone(&stream);
+            let reader_registry = Arc::clone(&registry);
+            let reader_tx = tx.clone();
+            tokio::spawn(async move {
+                read_loop(id, reader_stream, reader_tx).await;
+                reader_registry.remove(id);
+            });
+        }
+    }
+
+    /// 读任务：拿 `readable()` 等数据，`try_read` 取一块，攒够一行就解码。
+    async fn read_loop(id: u64, stream: Arc<tokio::net::UnixStream>, tx: UnboundedSender<Event>) {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+                let mut raw: Vec<u8> = pending.drain(..=index).collect();
+                raw.pop();
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
                 }
+                let line = String::from_utf8_lossy(&raw);
+                if let Some(signal) = decode(&line)
+                    && tx.send(Event::Signal(id, signal)).is_err()
+                {
+                    let _ = tx.send(Event::Disconnected(id));
+                    return;
+                }
+            }
+            if pending.len() > MAX_LINE {
+                break;
+            }
+            if stream.readable().await.is_err() {
+                break;
+            }
+            match stream.try_read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => pending.extend_from_slice(&chunk[..count]),
+                // `readable()` 只保证「可以试一次」，并非一定有数据：假唤醒
+                // 与并发读都会让 `try_read` 返回 `WouldBlock`，必须重试而
+                // 不是当成断开——否则一条连接读到第一批帧之后就被自己掐掉。
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
             }
         }
         let _ = tx.send(Event::Disconnected(id));
     }
 
-    /// 服务端推送线程：从有界队列取帧写出。队列被拆（慢读者）或对端断开
-    /// 都直接退出——退出即关闭写半边，对端读侧看到 EOF 自行重连。
-    fn write_connection(stream: UnixStream, rx: std::sync::mpsc::Receiver<Signal>) {
-        let mut writer = stream;
-        while let Ok(signal) = rx.recv() {
+    /// 写任务：从有界队列取帧写下。队列被拆（慢读者）或对端断开都直接
+    /// 返回——调用方随后会关掉整条连接。
+    async fn write_loop(
+        stream: Arc<tokio::net::UnixStream>,
+        mut rx: tokio::sync::mpsc::Receiver<Signal>,
+    ) -> std::io::Result<()> {
+        while let Some(signal) = rx.recv().await {
             let line = encode(&signal);
-            if writer.write_all(line.as_bytes()).is_err()
-                || writer.flush().is_err()
-            {
-                break;
+            let mut offset = 0;
+            while offset < line.len() {
+                stream.writable().await?;
+                match stream.try_write(&line.as_bytes()[offset..]) {
+                    Ok(0) => return Ok(()),
+                    Ok(count) => offset += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
             }
         }
+        Ok(())
     }
 
     pub(super) struct Client {
@@ -659,10 +664,7 @@ mod unix_impl {
 
         /// 双向连接的读半边：独立线程持续读行，解码后送进通道。对端断开
         /// （或被服务端拆线）时通道关闭，调用方感知为「连接没了」。
-        pub(super) fn start_reader(
-            &self,
-            tx: UnboundedSender<Signal>,
-        ) -> std::io::Result<()> {
+        pub(super) fn start_reader(&self, tx: UnboundedSender<Signal>) -> std::io::Result<()> {
             let stream = self.stream.try_clone()?;
             std::thread::Builder::new()
                 .name("mns-ipc-client-read".to_owned())
@@ -704,11 +706,23 @@ mod unix_impl {
         }
     }
 
+    /// 双向连接：写走同步句柄，读交给一个常驻线程。两端都在本机，一条
+    /// 连接一个读线程已经够用（每进程最多一条）。
+    pub(super) fn connect_duplex(
+        app: &str,
+    ) -> Result<(super::Client, tokio::sync::mpsc::UnboundedReceiver<Signal>), super::ConnectError>
+    {
+        let inner = connect(app)?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        match inner.start_reader(tx) {
+            Ok(()) => Ok((super::Client { inner }, rx)),
+            Err(error) => Err(super::ConnectError::Io(error)),
+        }
+    }
+
     pub(super) fn poke(app: &str, signal: &Signal) -> Result<(), super::ConnectError> {
         let mut client = connect(app)?;
-        client
-            .send(signal)
-            .map_err(super::ConnectError::Io)
+        client.send(signal).map_err(super::ConnectError::Io)
     }
 }
 
@@ -725,25 +739,15 @@ mod windows_impl {
     use super::{Event, MAX_LINE, Signal, decode, encode, registry};
     use std::ffi::c_void;
     use std::fs::File;
-    use std::io::{Read, Write};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::io::Write;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::sync::Arc;
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
     use tokio::sync::mpsc::UnboundedSender;
 
-    /// Win32 句柄。管道句柄可以交给 `std::fs::File` 托管：有了 `Read` /
-    /// `Write`，读行逻辑就能和 Unix 版共用同一套写法。
+    /// Win32 句柄。`poke` 仍用同步句柄：它只写一帧就走，不需要 overlapped。
     type Handle = *mut c_void;
 
-    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
-    /// 只让第一条实例占名字：已有进程在监听时 `CreateNamedPipeW` 直接失败，
-    /// 不必先连一次探活——探活与真正监听之间有竞态，可能起出两个监听者。
-    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
-    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
-    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
-    const PIPE_WAIT: u32 = 0x0000_0000;
-    /// 只接本机客户端：这不是网络服务，没理由让同网段的机器连过来。
-    const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-    const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
@@ -751,36 +755,11 @@ mod windows_impl {
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_PIPE_BUSY: i32 = 231;
-    const ERROR_PIPE_CONNECTED: i32 = 535;
-    /// 客户端在服务端调用 ConnectNamedPipe 之前连了又断。GUI 的探活与
-    /// poke 都是「连上就走」的短连接，这是常态路径而非故障：accept 循环
-    /// 据此换一条新实例继续等，而不是退出——退出会让进程变聋，被 GUI
-    /// 重复拉起后进程就攒起来。
-    ///
-    /// 生产代码不按错误码分支（所有 `wait_for_client` 错误一律换实例
-    /// 重来），这个常量唯一的存在意义是给回归测试
-    /// `error_no_data_之后必须换实例继续监听` 钉住「客户端先断必报
-    /// 232」的契约，所以非测试编译允许它无引用。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) const ERROR_NO_DATA: i32 = 232;
-    const ERROR_BROKEN_PIPE: i32 = 109;
-    const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CreateNamedPipeW(
-            name: *const u16,
-            open_mode: u32,
-            pipe_mode: u32,
-            max_instances: u32,
-            out_buffer_size: u32,
-            in_buffer_size: u32,
-            default_timeout: u32,
-            attributes: *const c_void,
-        ) -> Handle;
-        fn ConnectNamedPipe(pipe: Handle, overlapped: *mut c_void) -> i32;
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -791,19 +770,6 @@ mod windows_impl {
             template: Handle,
         ) -> Handle;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
-        /// 只看管道里有没有数据，不消费。同步管道上不能长期挂着 `ReadFile`：
-        /// 同一文件对象的 I/O 是串行的，挂起的读会把另一个线程的写一起卡住。
-        fn PeekNamedPipe(
-            pipe: Handle,
-            buffer: *mut c_void,
-            buffer_size: u32,
-            bytes_read: *mut u32,
-            total_bytes_avail: *mut u32,
-            bytes_left_this_message: *mut u32,
-        ) -> i32;
-        /// 取消指定句柄上挂起的 I/O。dup 出去的读句柄指向同一管道文件对象，
-        /// 在任一克隆上调用都能打断另一克隆里阻塞中的 `ReadFile`。
-        fn CancelIoEx(handle: Handle, overlapped: *mut c_void) -> i32;
     }
 
     /// 管道名：`\\.\pipe\mns-<app>-<用户名>`。
@@ -835,294 +801,198 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn create_instance(name: &str, first: bool) -> std::io::Result<File> {
-        let name = wide(name);
-        let mut open_mode = PIPE_ACCESS_DUPLEX;
-        if first {
-            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-        }
-        // 默认安全描述符：创建者（本用户）与管理员可访问，其他用户连不上。
-        // 和 Unix 那边 socket 目录的 0700 是同一个意思。
-        let handle = unsafe {
-            CreateNamedPipeW(
-                name.as_ptr(),
-                open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES,
-                MAX_LINE as u32,
-                MAX_LINE as u32,
-                0,
-                std::ptr::null(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            let error = std::io::Error::last_os_error();
+    /// 建一条服务端实例。`first` 只给第一条：名字已被别的进程占用时
+    /// `CreateNamedPipeW` 直接失败，不必先连一次探活——探活与真正监听之间
+    /// 有竞态，可能起出两个监听者。
+    pub(super) fn create_server(name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+        let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .in_buffer_size(MAX_LINE as u32)
+            .out_buffer_size(MAX_LINE as u32);
+        options.create(name).map_err(|error| {
             // 名字已被占用：已有实例在监听。
-            let kind = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
-                std::io::ErrorKind::AddrInUse
+            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+                std::io::Error::new(std::io::ErrorKind::AddrInUse, error.to_string())
             } else {
-                error.kind()
-            };
-            return Err(std::io::Error::new(kind, error.to_string()));
-        }
-        // SAFETY: 句柄刚由 `CreateNamedPipeW` 创建，所有权交给 `File` 托管。
-        Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+                error
+            }
+        })
     }
 
-    /// 等一个客户端连上来。非重叠模式下阻塞到连接建立；客户端抢先连上时
-    /// 返回 `ERROR_PIPE_CONNECTED`——那是成功，不是失败。
-    /// `pub(super)` 是给回归测试直接驱动用的。
-    pub(super) fn wait_for_client(pipe: &File) -> std::io::Result<()> {
-        let ok = unsafe { ConnectNamedPipe(pipe.as_raw_handle() as Handle, std::ptr::null_mut()) };
-        if ok != 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_PIPE_CONNECTED) {
-            return Ok(());
-        }
-        Err(error)
-    }
-
-    pub(super) fn listen(app: &str, tx: UnboundedSender<Event>) -> std::io::Result<Listener> {
+    pub(super) fn listen(
+        app: &str,
+        tx: UnboundedSender<Event>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> std::io::Result<Listener> {
         let name = pipe_name(app);
-        let mut pending = create_instance(&name, true)?;
-
+        // `ServerOptions::create` 要把句柄注册进 reactor，必须在 runtime 上下文里调。
+        let server = {
+            let _guard = runtime.enter();
+            create_server(&name, true)?
+        };
         let registry = Arc::new(registry::Registry::default());
         let thread_registry = registry.clone();
-
-        std::thread::Builder::new()
-            .name("mns-ipc-accept".to_owned())
-            .spawn(move || {
-                let mut next_id: u64 = 0;
-                loop {
-                    if wait_for_client(&pending).is_err() {
-                        // 客户端在「实例建好」与「本线程调 ConnectNamedPipe」之间
-                        // 连了又断——GUI 启动时的探活（连上就走）与紧随其后的
-                        // poke 都是这样的短连接，ConnectNamedPipe 会报
-                        // ERROR_NO_DATA。这是常态路径，不是故障：换一条新实例
-                        // 接着等，绝不能就此退出。accept 线程一死，本进程就
-                        // 成了「活着但谁也连不上」的聋子——GUI 下次启动探活
-                        // 失败会再拉一个新的，进程就攒起来了。管道名仍被手里的
-                        // 实例占着，重建不会撞出第二个监听者。
-                        pending = match next_instance(&name) {
-                            Some(next) => next,
-                            None => return,
-                        };
-                        continue;
-                    }
-                    // 先把下一条实例建出来，再处理刚连上的这条：否则读取期间
-                    // 名字上没有任何空闲实例，第二次连接会撞 `ERROR_PIPE_BUSY`。
-                    let next = match next_instance(&name) {
-                        Some(file) => file,
-                        // 连接已到手但换不出下一条实例：进程已没有能力继续
-                        // 监听，退场交给上层收摊（事件通道关闭后调用方退出）。
-                        None => return,
-                    };
-                    let connected = std::mem::replace(&mut pending, next);
-                    next_id += 1;
-                    let id = next_id;
-                    if tx.send(Event::Connected(id)).is_err() {
-                        return;
-                    }
-                    // 双向连接：读线程与写线程各持一份克隆的句柄。读线程解析
-                    // 上行帧；写线程从有界出站队列取帧推送，队列满即拆线。
-                    let Ok(write_half) = connected.try_clone() else {
-                        let _ = tx.send(Event::Disconnected(id));
-                        continue;
-                    };
-                    let (out_tx, out_rx) = registry::channel();
-                    thread_registry.insert(id, out_tx);
-                    let read_registry = thread_registry.clone();
-                    let tx = tx.clone();
-                    let _ = std::thread::Builder::new()
-                        .name(format!("mns-ipc-{id}"))
-                        .spawn(move || {
-                            read_connection(id, connected, tx);
-                            read_registry.remove(id);
-                        });
-                    let _ = std::thread::Builder::new()
-                        .name(format!("mns-ipc-{id}-w"))
-                        .spawn(move || write_connection(write_half, out_rx));
-                }
-            })?;
-
+        runtime.spawn(accept_loop(name, server, tx, thread_registry));
         Ok(Listener { registry })
     }
 
-    /// 建下一条管道实例：成功路径用它「先建好下一条再收当前连接」，
-    /// `ERROR_NO_DATA` 后用它顶替已不可用的那条。
-    ///
-    /// 失败按 200ms 退避重试，累计 5 秒仍失败就放弃（返回 `None`）：此时进程
-    /// 已经没有能力继续监听，让 accept 线程退出、事件通道随之关闭，比留一个
-    /// 谁也连不上的聋子进程好。守护进程在 Windows 上由 GUI 拉起且没有控制台，
-    /// stderr 会被丢弃：只在放弃时留一行，不在每次重试时刷屏。
-    pub(super) fn next_instance(name: &str) -> Option<File> {
+    /// 接受连接。读写都在 reactor 的 overlapped I/O 上等就绪（不再 20ms
+    /// 轮询 `PeekNamedPipe`），每条连接只是两个任务，不再各占两个线程。
+    async fn accept_loop(
+        name: String,
+        mut server: NamedPipeServer,
+        tx: UnboundedSender<Event>,
+        registry: Arc<registry::Registry>,
+    ) {
+        let mut next_id: u64 = 0;
+        loop {
+            if server.connect().await.is_err() {
+                // 客户端在「实例建好」与「本任务调 connect」之间连了又断：
+                // GUI 的探活与 poke 都是「连上就走」的短连接，这是常态。
+                // 换一条新实例接着等，绝不能退出——accept 一死，进程就成了
+                // 「活着但谁也连不上」的聋子。
+                server = match next_server(&name).await {
+                    Some(next) => next,
+                    None => return,
+                };
+                continue;
+            }
+            // 先把下一条实例建出来，再处理刚连上的这条：否则读取期间名字上
+            // 没有任何空闲实例，第二次连接会撞 `ERROR_PIPE_BUSY`。
+            let connected = server;
+            server = match next_server(&name).await {
+                Some(next) => next,
+                None => return,
+            };
+
+            next_id += 1;
+            let id = next_id;
+            if tx.send(Event::Connected(id)).is_err() {
+                return;
+            }
+            let (out_tx, out_rx) = registry::outbound();
+            registry.insert(id, out_tx);
+            let pipe = Arc::new(connected);
+
+            let writer_pipe = Arc::clone(&pipe);
+            let writer_registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let _ = write_loop(writer_pipe.clone(), out_rx).await;
+                // 写半边收摊即整条连接收摊：读任务随之退出。
+                let _ = writer_pipe.disconnect();
+                writer_registry.remove(id);
+            });
+
+            let reader_pipe = Arc::clone(&pipe);
+            let reader_registry = Arc::clone(&registry);
+            let reader_tx = tx.clone();
+            tokio::spawn(async move {
+                read_loop(id, reader_pipe, reader_tx).await;
+                reader_registry.remove(id);
+            });
+        }
+    }
+
+    /// 建下一条实例。失败按 200ms 退避重试，累计 5 秒仍失败就放弃：此时
+    /// 进程已经没有能力继续监听，让 accept 任务退出比留一个聋子好。
+    async fn next_server(name: &str) -> Option<NamedPipeServer> {
         for _ in 0..25 {
-            match create_instance(name, false) {
-                Ok(file) => return Some(file),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            match create_server(name, false) {
+                Ok(server) => return Some(server),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
         }
         eprintln!("mns-ipc: {name} 连续 5 秒建不出下一条实例，放弃监听");
         None
     }
 
-    /// 轮询式行读取器。先 `PeekNamedPipe` 看有没有数据，有才 `ReadFile`。
-    ///
-    /// Windows 的同步（非 OVERLAPPED）管道句柄在同一个文件对象上串行化 I/O：
-    /// 读线程挂起的 `ReadFile` 会把写线程的 `WriteFile` 一起卡住。双向连接
-    /// （管家窗口 ↔ `mns-butlerd`）只要一挂读，另一头就再也写不出去——窗口
-    /// 表现为「发消息没反应」。轮询让 `ReadFile` 只在确有数据时发出，从不
-    /// 长期挂起；20ms 的间隔对本地会话足够。
-    struct LineReader {
-        pipe: File,
-        pending: Vec<u8>,
-        chunk: Vec<u8>,
-    }
-
-    impl LineReader {
-        fn new(pipe: File) -> Self {
-            Self {
-                pipe,
-                pending: Vec::new(),
-                chunk: Vec::new(),
-            }
-        }
-
-        /// 读到一行（去掉行尾 `\r\n`）；对端关闭返回 `None`。
-        fn next_line(&mut self) -> std::io::Result<Option<String>> {
-            loop {
-                if let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
-                    let mut raw: Vec<u8> = self.pending.drain(..=index).collect();
-                    if raw.last() == Some(&b'\n') {
-                        raw.pop();
-                    }
-                    if raw.last() == Some(&b'\r') {
-                        raw.pop();
-                    }
-                    return Ok(Some(String::from_utf8_lossy(&raw).into_owned()));
-                }
-                if self.pending.len() > MAX_LINE {
-                    return Ok(None);
-                }
-                let mut available: u32 = 0;
-                let ok = unsafe {
-                    PeekNamedPipe(
-                        self.pipe.as_raw_handle() as Handle,
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut available,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    let error = std::io::Error::last_os_error();
-                    return match error.raw_os_error() {
-                        Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => Ok(None),
-                        _ => Err(error),
-                    };
-                }
-                if available == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    continue;
-                }
-                let want = (available as usize).min(MAX_LINE);
-                self.chunk.resize(want, 0);
-                let count = self.pipe.read(&mut self.chunk)?;
-                if count == 0 {
-                    return Ok(None);
-                }
-                self.pending.extend_from_slice(&self.chunk[..count]);
-            }
-        }
-    }
-
-    fn read_connection(id: u64, pipe: File, tx: UnboundedSender<Event>) {
-        let mut reader = LineReader::new(pipe);
+    async fn read_loop(id: u64, pipe: Arc<NamedPipeServer>, tx: UnboundedSender<Event>) {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
         loop {
-            match reader.next_line() {
-                Ok(Some(line)) => {
-                    if let Some(signal) = decode(&line)
-                        && tx.send(Event::Signal(id, signal)).is_err()
-                    {
-                        break;
-                    }
+            while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+                let mut raw: Vec<u8> = pending.drain(..=index).collect();
+                raw.pop();
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
                 }
-                // 对端关闭（`ERROR_BROKEN_PIPE`）与读失败都到此为止。
-                Ok(None) | Err(_) => break,
+                let line = String::from_utf8_lossy(&raw);
+                if let Some(signal) = decode(&line)
+                    && tx.send(Event::Signal(id, signal)).is_err()
+                {
+                    let _ = tx.send(Event::Disconnected(id));
+                    return;
+                }
+            }
+            if pending.len() > MAX_LINE {
+                break;
+            }
+            if pipe.readable().await.is_err() {
+                break;
+            }
+            match pipe.try_read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => pending.extend_from_slice(&chunk[..count]),
+                // 同 Unix：`readable()` 只是「可以试一次」，假唤醒要重试。
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
             }
         }
         let _ = tx.send(Event::Disconnected(id));
     }
 
-    /// 服务端推送线程：从有界队列取帧写出。队列被拆（慢读者）或对端断开
-    /// （`WriteFile` 报 `ERROR_BROKEN_PIPE`）都直接退出——退出即放弃句柄，
-    /// 对端读侧看到 EOF 自行重连。
-    fn write_connection(pipe: File, rx: std::sync::mpsc::Receiver<Signal>) {
-        let mut writer = pipe;
-        while let Ok(signal) = rx.recv() {
+    async fn write_loop(
+        pipe: Arc<NamedPipeServer>,
+        mut rx: tokio::sync::mpsc::Receiver<Signal>,
+    ) -> std::io::Result<()> {
+        while let Some(signal) = rx.recv().await {
             let line = encode(&signal);
-            if writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err() {
-                break;
+            let mut offset = 0;
+            while offset < line.len() {
+                pipe.writable().await?;
+                match pipe.try_write(&line.as_bytes()[offset..]) {
+                    Ok(0) => return Ok(()),
+                    Ok(count) => offset += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
             }
         }
+        Ok(())
     }
 
+    /// 客户端两种形态：
+    ///
+    /// - `connect` / `poke`：同步句柄，一次写一帧就走，不需要 reactor；
+    /// - `connect_duplex`：overlapped 句柄，读任务在专用线程的 reactor 上
+    ///   等就绪，写通过无界队列交给它，`send` 不依赖调用方处在异步上下文。
     pub(super) struct Client {
-        pipe: File,
-    }
-
-    impl Drop for Client {
-        fn drop(&mut self) {
-            // 关闭即 detach（与 Unix 的 `shutdown(Both)` 对应）：读线程持有
-            // 同一管道对象 dup 出来的句柄，单纯 drop 手里这份不会让阻塞中的
-            // `ReadFile` 返回。CancelIoEx 打断挂起的读，读线程随即退出并
-            // 关闭下行通道；两边句柄都放手后服务端下一次读看到断管。
-            // 没有挂起 I/O 时调用只会失败（ERROR_NOT_FOUND），无害。
-            unsafe {
-                CancelIoEx(self.pipe.as_raw_handle() as Handle, std::ptr::null_mut());
-            }
-        }
+        pipe: Option<File>,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<Signal>>,
     }
 
     impl Client {
         pub(super) fn send(&mut self, signal: &Signal) -> std::io::Result<()> {
-            self.pipe.write_all(encode(signal).as_bytes())?;
-            self.pipe.flush()
-        }
-
-        /// 双向连接的读半边：独立线程持续读行，解码后送进通道。对端断开
-        /// （或被服务端拆线）时通道关闭，调用方感知为「连接没了」。
-        pub(super) fn start_reader(
-            &self,
-            tx: UnboundedSender<Signal>,
-        ) -> std::io::Result<()> {
-            let pipe = self.pipe.try_clone()?;
-            std::thread::Builder::new()
-                .name("mns-ipc-client-read".to_owned())
-                .spawn(move || {
-                    let mut reader = LineReader::new(pipe);
-                    loop {
-                        match reader.next_line() {
-                            Ok(Some(line)) => {
-                                if let Some(signal) = decode(&line)
-                                    && tx.send(signal).is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            // 对端关闭（`ERROR_BROKEN_PIPE`）与读失败都到此为止。
-                            Ok(None) | Err(_) => break,
-                        }
-                    }
-                })
-                .map(|_| ())
+            if let Some(pipe) = self.pipe.as_mut() {
+                pipe.write_all(encode(signal).as_bytes())?;
+                return pipe.flush();
+            }
+            match self.tx.as_ref() {
+                Some(tx) => tx.send(signal.clone()).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::NotConnected, "双向连接已断开")
+                }),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "连接已关闭",
+                )),
+            }
         }
     }
 
-    fn open(app: &str) -> Result<File, super::ConnectError> {
+    /// 同步打开：`poke` 只用它写一帧，不涉及挂起的读，没有串行化问题。
+    fn open_sync(app: &str) -> Result<File, super::ConnectError> {
         let name = wide(&pipe_name(app));
         // 服务端「刚连上一条、还没建下一条」的瞬间会报 `ERROR_PIPE_BUSY`：
         // 等一小会儿再试一次，别白白丢掉一次唤醒。
@@ -1157,13 +1027,148 @@ mod windows_impl {
         Err(super::ConnectError::Absent)
     }
 
+    /// overlapped 打开：双向连接要能在等读的同时写，只能用 overlapped 句柄。
+    fn open_overlapped(app: &str) -> Result<NamedPipeClient, super::ConnectError> {
+        let name = pipe_name(app);
+        for attempt in 0..2 {
+            match ClientOptions::new().open(&name) {
+                Ok(pipe) => return Ok(pipe),
+                Err(error) => match error.raw_os_error() {
+                    Some(ERROR_FILE_NOT_FOUND) => return Err(super::ConnectError::Absent),
+                    Some(ERROR_PIPE_BUSY) if attempt == 0 => {
+                        unsafe { WaitNamedPipeW(wide(&name).as_ptr(), 100) };
+                    }
+                    Some(ERROR_PIPE_BUSY) => return Err(super::ConnectError::Absent),
+                    _ => return Err(super::ConnectError::Io(error)),
+                },
+            }
+        }
+        Err(super::ConnectError::Absent)
+    }
+
     pub(super) fn connect(app: &str) -> Result<Client, super::ConnectError> {
-        open(app).map(|pipe| Client { pipe })
+        open_sync(app).map(|pipe| Client {
+            pipe: Some(pipe),
+            tx: None,
+        })
     }
 
     pub(super) fn poke(app: &str, signal: &Signal) -> Result<(), super::ConnectError> {
         let mut client = connect(app)?;
         client.send(signal).map_err(super::ConnectError::Io)
+    }
+
+    /// 双向连接：一个专用线程驱动 current-thread reactor，读任务在
+    /// overlapped I/O 上等数据（不再 20ms 轮询），写任务从无界队列取帧。
+    /// 连接断开时下行通道关闭，调用方据此进入离线态或重连。
+    pub(super) fn connect_duplex(
+        app: &str,
+    ) -> Result<(super::Client, tokio::sync::mpsc::UnboundedReceiver<Signal>), super::ConnectError>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(super::ConnectError::Io)?;
+        // `ClientOptions::open` 同样要把句柄注册进 reactor。
+        let pipe = {
+            let _guard = runtime.enter();
+            open_overlapped(app)?
+        };
+        let (down_tx, down_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (up_tx, up_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("mns-ipc-duplex".to_owned())
+            .spawn(move || {
+                let pipe = Arc::new(pipe);
+                runtime.block_on(async move {
+                    let mut reader = tokio::spawn(read_client(Arc::clone(&pipe), down_tx));
+                    let mut writer = tokio::spawn(write_client(Arc::clone(&pipe), up_rx));
+                    // 任何一半收摊都拆掉另一半：`NamedPipeClient` 没有
+                    // `disconnect`，abort 之后 Arc 释放即关闭句柄。读任务
+                    // 卡在 `readable()` 上时，只有 abort 能把它叫醒。
+                    tokio::select! {
+                        _ = &mut reader => writer.abort(),
+                        _ = &mut writer => reader.abort(),
+                    }
+                });
+            })
+            .map_err(super::ConnectError::Io)?;
+        Ok((
+            super::Client {
+                inner: Client {
+                    pipe: None,
+                    tx: Some(up_tx),
+                },
+            },
+            down_rx,
+        ))
+    }
+
+    async fn read_client(
+        pipe: Arc<NamedPipeClient>,
+        tx: tokio::sync::mpsc::UnboundedSender<Signal>,
+    ) {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+                let mut raw: Vec<u8> = pending.drain(..=index).collect();
+                raw.pop();
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+                let line = String::from_utf8_lossy(&raw);
+                if let Some(signal) = decode(&line)
+                    && tx.send(signal).is_err()
+                {
+                    return;
+                }
+            }
+            if pending.len() > MAX_LINE {
+                break;
+            }
+            if pipe.readable().await.is_err() {
+                break;
+            }
+            match pipe.try_read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => pending.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
+    async fn write_client(
+        pipe: Arc<NamedPipeClient>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Signal>,
+    ) {
+        while let Some(signal) = rx.recv().await {
+            let line = encode(&signal);
+            let mut offset = 0;
+            let mut broken = false;
+            while offset < line.len() {
+                if pipe.writable().await.is_err() {
+                    broken = true;
+                    break;
+                }
+                match pipe.try_write(&line.as_bytes()[offset..]) {
+                    Ok(0) => {
+                        broken = true;
+                        break;
+                    }
+                    Ok(count) => offset += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => {
+                        broken = true;
+                        break;
+                    }
+                }
+            }
+            if broken {
+                break;
+            }
+        }
     }
 }
 
@@ -1238,6 +1243,110 @@ mod tests {
     }
 
     #[test]
+    fn wire_格式与旧协议逐字一致() {
+        let cases = [
+            (Signal::Open, r#"{"kind":"open"}"#),
+            (Signal::OpenButler, r#"{"kind":"open-butler"}"#),
+            (
+                Signal::Hello {
+                    role: "daemon".to_owned(),
+                },
+                r#"{"kind":"hello","role":"daemon"}"#,
+            ),
+            (
+                Signal::Wake { ledger: None },
+                r#"{"kind":"wake","ledger":null}"#,
+            ),
+            (
+                Signal::Wake {
+                    ledger: Some("trade:1".to_owned()),
+                },
+                r#"{"kind":"wake","ledger":"trade:1"}"#,
+            ),
+            (
+                Signal::SetProactive { enabled: true },
+                r#"{"kind":"set-proactive","enabled":true}"#,
+            ),
+            (Signal::RequestBrief, r#"{"kind":"request-brief"}"#),
+            (
+                Signal::Brief {
+                    json: "{}".to_owned(),
+                },
+                r#"{"kind":"brief","json":"{}"}"#,
+            ),
+            (
+                Signal::OpenPage {
+                    page: "plan".to_owned(),
+                },
+                r#"{"kind":"open-page","page":"plan"}"#,
+            ),
+            (Signal::OpenAbout, r#"{"kind":"open-about"}"#),
+            (
+                Signal::DeliverNotice {
+                    json: "{}".to_owned(),
+                },
+                r#"{"kind":"deliver-notice","json":"{}"}"#,
+            ),
+            (
+                Signal::NoticeFocus {
+                    notice_id: "n1".to_owned(),
+                },
+                r#"{"kind":"notice-focus","notice_id":"n1"}"#,
+            ),
+            (
+                Signal::NoticeDelivered {
+                    notice_id: "n1".to_owned(),
+                },
+                r#"{"kind":"notice-delivered","notice_id":"n1"}"#,
+            ),
+            (Signal::ButlerSeen, r#"{"kind":"butler-seen"}"#),
+            (Signal::StartButler, r#"{"kind":"start-butler"}"#),
+            (Signal::RefreshData, r#"{"kind":"refresh-data"}"#),
+            (Signal::ChatAttach, r#"{"kind":"chat-attach"}"#),
+            (
+                Signal::ChatSend {
+                    text: "hi".to_owned(),
+                },
+                r#"{"kind":"chat-send","text":"hi"}"#,
+            ),
+            (Signal::ChatClear, r#"{"kind":"chat-clear"}"#),
+            (Signal::ChatSeen, r#"{"kind":"chat-seen"}"#),
+            (
+                Signal::ChatSnapshot {
+                    json: "{}".to_owned(),
+                },
+                r#"{"kind":"chat-snapshot","json":"{}"}"#,
+            ),
+            (
+                Signal::ChatDelta {
+                    text: "hi".to_owned(),
+                },
+                r#"{"kind":"chat-delta","text":"hi"}"#,
+            ),
+            (Signal::Shutdown, r#"{"kind":"shutdown"}"#),
+            (Signal::Bye, r#"{"kind":"bye"}"#),
+        ];
+        for (signal, expected) in cases {
+            assert_eq!(encode(&signal), format!("{expected}\n"));
+            assert_eq!(decode(&format!("{expected}\n")), Some(signal));
+        }
+    }
+
+    #[test]
+    fn 老客户端省略可选字段仍能解析() {
+        assert_eq!(
+            decode("{\"kind\":\"hello\"}\n"),
+            Some(Signal::Hello {
+                role: "unknown".to_owned()
+            })
+        );
+        assert_eq!(
+            decode("{\"kind\":\"wake\"}\n"),
+            Some(Signal::Wake { ledger: None })
+        );
+    }
+
+    #[test]
     fn 唤醒信号带账本_id() {
         let line = encode(&Signal::Wake {
             ledger: Some("trade:1794826433501".to_owned()),
@@ -1264,11 +1373,26 @@ mod tests {
 
     #[test]
     fn 宿主与守护进程的新信号可往返() {
-        assert_eq!(decode(&encode(&Signal::RequestBrief)), Some(Signal::RequestBrief));
-        assert_eq!(decode(&encode(&Signal::ButlerSeen)), Some(Signal::ButlerSeen));
-        assert_eq!(decode(&encode(&Signal::RefreshData)), Some(Signal::RefreshData));
-        assert_eq!(decode(&encode(&Signal::StartButler)), Some(Signal::StartButler));
-        assert_eq!(decode(&encode(&Signal::ChatAttach)), Some(Signal::ChatAttach));
+        assert_eq!(
+            decode(&encode(&Signal::RequestBrief)),
+            Some(Signal::RequestBrief)
+        );
+        assert_eq!(
+            decode(&encode(&Signal::ButlerSeen)),
+            Some(Signal::ButlerSeen)
+        );
+        assert_eq!(
+            decode(&encode(&Signal::RefreshData)),
+            Some(Signal::RefreshData)
+        );
+        assert_eq!(
+            decode(&encode(&Signal::StartButler)),
+            Some(Signal::StartButler)
+        );
+        assert_eq!(
+            decode(&encode(&Signal::ChatAttach)),
+            Some(Signal::ChatAttach)
+        );
         assert_eq!(decode(&encode(&Signal::ChatClear)), Some(Signal::ChatClear));
         assert_eq!(decode(&encode(&Signal::ChatSeen)), Some(Signal::ChatSeen));
 
@@ -1387,9 +1511,9 @@ mod tests {
     ///
     /// 探活与 poke 都是「连上就走」的短连接：GUI 启动时先 connect 探活、
     /// 紧接着 poke Wake，第二条连接可能落在服务端「实例已建、还没调
-    /// ConnectNamedPipe」的窗口里（Windows 报 `ERROR_NO_DATA`）。修复前
-    /// accept 线程在这种连接上直接退出，进程变成「活着但谁也连不上」的
-    /// 聋子——GUI 下次启动探活失败，再拉一个新的，butlerd 进程就攒起来。
+    /// ConnectNamedPipe」的窗口里（Windows 报 `ERROR_NO_DATA`）。accept
+    /// 循环对这种客户端先断的连接一律换实例重来，绝不退出——退出会让进程
+    /// 变成「活着但谁也连不上」的聋子，被 GUI 重复拉起后进程就攒起来。
     /// Unix 没有这个窗口（连接进内核积压队列），这条测试在两个平台都
     /// 守住「短连接形态不弄死监听者」的不变量。
     #[test]
@@ -1430,8 +1554,7 @@ mod tests {
     fn 双向连接能收能发_断开即_detach() {
         let app = format!("mns-ipc-duplex-{}", std::process::id());
         let (listener, mut events) = listen(&app).expect("监听本地通道");
-        let (mut client, mut downstream) =
-            connect_duplex(&app).expect("双向连接");
+        let (mut client, mut downstream) = connect_duplex(&app).expect("双向连接");
 
         client.send(&Signal::ChatAttach).expect("上行发 attach");
 
@@ -1451,12 +1574,12 @@ mod tests {
         let snapshot = Signal::ChatSnapshot {
             json: "{\"session\":[]}".to_owned(),
         };
-        assert!(
-            listener.send_to(conn_id, &snapshot),
-            "活跃连接的推送应成功"
-        );
+        assert!(listener.send_to(conn_id, &snapshot), "活跃连接的推送应成功");
         // 重复推给不存在的连接：返回 false，不阻塞、不 panic。
-        assert!(!listener.send_to(conn_id + 999, &snapshot), "未知连接应返回 false");
+        assert!(
+            !listener.send_to(conn_id + 999, &snapshot),
+            "未知连接应返回 false"
+        );
 
         match downstream.blocking_recv().expect("下行通道关闭") {
             got @ Signal::ChatSnapshot { .. } => assert_eq!(got, snapshot),
@@ -1486,48 +1609,5 @@ mod tests {
         }
         assert!(gone, "断开的连接最终应从注册表消失");
         drop(listener);
-    }
-
-    /// `ERROR_NO_DATA` 之后必须换实例继续监听（确定性复现，Windows 专属）。
-    ///
-    /// 风暴测试撞的是概率窗口（连了又断恰好落在服务端 `ConnectNamedPipe`
-    /// 之前），在 CI 里可能永远执行不到出错分支。这条测试把每一步钉死：
-    /// 实例建好 → 客户端连上立刻断开 → 服务端此刻才调 `ConnectNamedPipe`。
-    /// 客户端先断在 Windows 上**必然**报 `ERROR_NO_DATA`（MSDN 文档行为，
-    /// 非竞态），这正是 GUI「连上就走的探活」撞上 accept 窗口时的出错点。
-    ///
-    /// 修复前的代码在这种错误上直接退出 accept 线程，进程变聋、被 GUI
-    /// 重复拉起后攒起来；修复后的契约是：换一条新实例接着等。这里用
-    /// `pending = next_instance(...)` 的赋值顺序复刻 accept 循环的时序
-    /// ——新实例到手之后旧实例才被 drop，管道名始终有人占着。
-    #[cfg(windows)]
-    #[test]
-    fn error_no_data_之后必须换实例继续监听() {
-        use super::windows_impl::{
-            create_instance, next_instance, pipe_name, wait_for_client, ERROR_NO_DATA,
-        };
-
-        let app = format!("mns-ipc-nodata-{}", std::process::id());
-        let name = pipe_name(&app);
-
-        // 场景回放：实例建好，客户端连上立刻断开。
-        let mut pending = create_instance(&name, true).expect("建第一条实例");
-        drop(connect(&app).expect("客户端连上"));
-        // 服务端此刻才等连接：客户端先断，必然报 `ERROR_NO_DATA`。
-        let error = wait_for_client(&pending).expect_err("客户端先断必报错");
-        assert_eq!(
-            error.raw_os_error(),
-            Some(ERROR_NO_DATA),
-            "期望 ERROR_NO_DATA，实际 {error}"
-        );
-
-        // 修复契约：不许退出，换一条新实例（旧实例还占着名字时也必须建得出来，
-        // 管道名自始至终没有被释放，第二个进程永远绑不上）。
-        pending = next_instance(&name).expect("ERROR_NO_DATA 后换出下一条实例");
-        // 换出来的新实例必须能正常接客：客户端先连、服务端后收，
-        // `ConnectNamedPipe` 报 `ERROR_PIPE_CONNECTED`，按成功处理。
-        let client = connect(&app).expect("连上换出来的新实例");
-        wait_for_client(&pending).expect("新实例能正常接客");
-        drop(client);
     }
 }

@@ -55,15 +55,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let value = format!("\"{}\" {}", exe.display(), BACKGROUND_ARG);
     let output = command("reg")
         .args([
-            "add",
-            RUN_KEY,
-            "/v",
-            VALUE_NAME,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &value,
-            "/f",
+            "add", RUN_KEY, "/v", VALUE_NAME, "/t", "REG_SZ", "/d", &value, "/f",
         ])
         .output()
         .map_err(|error| format!("无法执行 reg add：{error}"))?;

@@ -30,8 +30,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                 data.latest_report.is_some(),
             ];
             let completed = done.iter().filter(|step| **step).count();
-            let show_checklist =
-                !shell.agent_settings.hide_start_checklist && completed < 3;
+            let show_checklist = !shell.agent_settings.hide_start_checklist && completed < 3;
             // 720 首屏预算：全空账户只放清单；部分完成时先看账户，再把
             // 剩下的步骤压成一条细条，不让引导挤掉曲线卡。
             if show_checklist {
@@ -911,10 +910,7 @@ fn start_strip(done: [bool; 3], cx: &mut Context<AppShell>) -> Div {
 fn start_checklist(done: [bool; 3], cx: &mut Context<AppShell>) -> Div {
     let completed = done.iter().filter(|step| **step).count();
 
-    let row = |done: bool,
-               title: &'static str,
-               body: &'static str,
-               action: Option<AnyElement>| {
+    let row = |done: bool, title: &'static str, body: &'static str, action: Option<AnyElement>| {
         div()
             .h_flex()
             .items_center()
@@ -1004,13 +1000,16 @@ fn start_checklist(done: [bool; 3], cx: &mut Context<AppShell>) -> Div {
                     Button::new("checklist-dismiss")
                         .compact()
                         .label("收起")
-                        .on_click(
-                            cx.listener(|shell, _, _, cx| shell.dismiss_start_checklist(cx)),
-                        ),
+                        .on_click(cx.listener(|shell, _, _, cx| shell.dismiss_start_checklist(cx))),
                 ),
         )
         .child(row(done[0], "入金", "登记转入账户的资金。", deposit))
-        .child(row(done[1], "添加标的", "先建标的，再记录实际成交。", asset))
+        .child(row(
+            done[1],
+            "添加标的",
+            "先建标的，再记录实际成交。",
+            asset,
+        ))
         .child(row(
             done[2],
             "生成第一份报告",

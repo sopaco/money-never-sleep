@@ -96,10 +96,10 @@ pub fn next(now: DateTime<Local>, butler: &Butler) -> Option<Agenda> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crate::butler::memory::{Fact, FactKind, Memory};
     use crate::butler::schedule::WakeScheduler;
     use crate::butler::tasks::{ButlerTask, TaskBoard};
+    use chrono::TimeZone;
 
     fn at(hour: u32, minute: u32) -> DateTime<Local> {
         date_at(17, hour, minute)
@@ -150,12 +150,7 @@ mod tests {
         });
         butler.tasks = board;
         let agenda = next(at(10, 0), &butler).unwrap();
-        assert_eq!(
-            agenda.source,
-            WakeSource::Task {
-                id: "t1".into()
-            }
-        );
+        assert_eq!(agenda.source, WakeSource::Task { id: "t1".into() });
         assert_eq!(agenda.at, at(11, 30));
     }
 
@@ -177,7 +172,11 @@ mod tests {
         butler.tasks = board;
         butler.state.scheduler.seen_tasks.insert("t1".into());
         let agenda = next(at(10, 0), &butler).unwrap();
-        assert_eq!(agenda.source, WakeSource::Scheduled, "不该再为一个已醒过的任务重排");
+        assert_eq!(
+            agenda.source,
+            WakeSource::Scheduled,
+            "不该再为一个已醒过的任务重排"
+        );
     }
 
     #[test]
@@ -242,7 +241,11 @@ mod tests {
         case.state.last_agent_init = Some(at(9, 0));
         case.state.agent_init_failures = 3;
         let agenda = next(at(9, 5), &case).unwrap();
-        assert_eq!(agenda.source, WakeSource::Scheduled, "6 小时退避晚于 4 小时后的巡检");
+        assert_eq!(
+            agenda.source,
+            WakeSource::Scheduled,
+            "6 小时退避晚于 4 小时后的巡检"
+        );
 
         // 同一个重试时刻已消费过：不再重排（防止空转）。
         let mut case = butler();

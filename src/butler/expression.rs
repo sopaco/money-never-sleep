@@ -691,7 +691,10 @@ mod tests {
     fn 问能做什么时答能力与诚实底线而不是反问() {
         let reply = reply("你都能做什么", &rich_facts());
         assert!(reply.contains("偏离"), "应列出能核的事，实际 {reply}");
-        assert!(reply.contains("我的看法"), "自主人格要声明观点归属，实际 {reply}");
+        assert!(
+            reply.contains("我的看法"),
+            "自主人格要声明观点归属，实际 {reply}"
+        );
         assert!(reply.contains("下单我帮不了"), "不谎称能执行，实际 {reply}");
         assert!(!reply.contains("你想核对哪一段"), "不能退回开场白");
         assert_eq!(classify("你都能做什么"), Intent::Capability);
@@ -733,7 +736,10 @@ mod tests {
         let reply = reply("明天美股会涨吗", &rich_facts());
         assert_eq!(classify("明天美股会涨吗"), Intent::Forecast);
         assert!(reply.contains("说不准"), "模板没有市场数据，要如实说不准");
-        assert!(reply.contains("偏离"), "说完没把握的，递上有把握的，实际 {reply}");
+        assert!(
+            reply.contains("偏离"),
+            "说完没把握的，递上有把握的，实际 {reply}"
+        );
         assert!(schedule::validate_dialogue(&reply).is_ok());
     }
 

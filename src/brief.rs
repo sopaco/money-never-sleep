@@ -34,6 +34,10 @@ pub struct BriefData {
     /// 快照读取失败时的原因。数字全为 0 时，宿主要先说清「读不到」，
     /// 不能让 0 读成「账户空了」。
     pub load_error: Option<String>,
+    /// 账本健康状态。守护进程本来就要写它，这里随简报一起下发，宿主
+    /// 不必再去读 `health.json`——跨进程状态因此只剩 IPC 一条路。
+    #[serde(default)]
+    pub health: Option<crate::butler::orchestrator::Health>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +86,7 @@ impl BriefData {
             price_stale: snapshot.freshness.price_is_stale(),
             fgi_age_days: snapshot.freshness.fgi_age_days,
             load_error: None,
+            health: None,
         }
     }
 
@@ -133,6 +138,7 @@ mod tests {
             price_stale: false,
             fgi_age_days: Some(0),
             load_error: None,
+            health: None,
         };
         let json = serde_json::to_string(&brief).unwrap();
         assert_eq!(serde_json::from_str::<BriefData>(&json).unwrap(), brief);

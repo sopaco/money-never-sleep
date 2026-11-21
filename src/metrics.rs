@@ -166,7 +166,10 @@ pub fn xirr_flows_from_ledger(
 ) -> Vec<CashFlow> {
     let mut out: Vec<CashFlow> = flows
         .iter()
-        .map(|&(d, a)| CashFlow { date: d, amount: -a })
+        .map(|&(d, a)| CashFlow {
+            date: d,
+            amount: -a,
+        })
         .collect();
     out.push(CashFlow {
         date: terminal_date,
@@ -199,7 +202,13 @@ pub fn downside_dev(xs: &[f64], threshold: f64) -> f64 {
     }
     let sum: f64 = xs
         .iter()
-        .map(|x| if *x < threshold { (x - threshold).powi(2) } else { 0.0 })
+        .map(|x| {
+            if *x < threshold {
+                (x - threshold).powi(2)
+            } else {
+                0.0
+            }
+        })
         .sum();
     (sum / (xs.len() - 1) as f64).sqrt()
 }
@@ -227,8 +236,16 @@ pub fn risk_metrics(
     let dd = downside_dev(returns, rf_period);
     let ann = periods_per_year.sqrt();
     RiskMetrics {
-        sharpe: if sd > 0.0 { mean(&excess) / sd * ann } else { 0.0 },
-        sortino: if dd > 0.0 { mean(&excess) / dd * ann } else { 0.0 },
+        sharpe: if sd > 0.0 {
+            mean(&excess) / sd * ann
+        } else {
+            0.0
+        },
+        sortino: if dd > 0.0 {
+            mean(&excess) / dd * ann
+        } else {
+            0.0
+        },
         calmar: if max_dd > 0.0 { cagr / max_dd } else { 0.0 },
         volatility: sd * ann,
     }
@@ -250,7 +267,11 @@ impl Rng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
     pub fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 }
 
@@ -328,8 +349,14 @@ mod tests {
     fn xirr_单笔投入翻倍一年应为百分之百() {
         // 用非闰年跨度（365天），与 XIRR 的 365 天惯例一致
         let flows = vec![
-            CashFlow { date: d(2021, 1, 1), amount: -100.0 },
-            CashFlow { date: d(2022, 1, 1), amount: 200.0 },
+            CashFlow {
+                date: d(2021, 1, 1),
+                amount: -100.0,
+            },
+            CashFlow {
+                date: d(2022, 1, 1),
+                amount: 200.0,
+            },
         ];
         let r = xirr(&flows).unwrap();
         assert!((r - 1.0).abs() < 1e-4, "期望约100%, 实际{}", r);
@@ -339,8 +366,14 @@ mod tests {
     fn xirr_采用365天惯例_闰年跨度略低于百分之百() {
         // 2020-01-01 -> 2021-01-01 实为 366 天，故 2^(365/366)-1 ≈ 99.62%
         let flows = vec![
-            CashFlow { date: d(2020, 1, 1), amount: -100.0 },
-            CashFlow { date: d(2021, 1, 1), amount: 200.0 },
+            CashFlow {
+                date: d(2020, 1, 1),
+                amount: -100.0,
+            },
+            CashFlow {
+                date: d(2021, 1, 1),
+                amount: 200.0,
+            },
         ];
         let r = xirr(&flows).unwrap();
         assert!((r - 0.99621).abs() < 1e-3, "实际{}", r);
@@ -349,8 +382,14 @@ mod tests {
     #[test]
     fn xirr_零收益应为零() {
         let flows = vec![
-            CashFlow { date: d(2020, 1, 1), amount: -100.0 },
-            CashFlow { date: d(2023, 1, 1), amount: 100.0 },
+            CashFlow {
+                date: d(2020, 1, 1),
+                amount: -100.0,
+            },
+            CashFlow {
+                date: d(2023, 1, 1),
+                amount: 100.0,
+            },
         ];
         assert!(xirr(&flows).unwrap().abs() < 1e-6);
     }
@@ -360,9 +399,18 @@ mod tests {
         // 期初10万，第2年末又投10万，期末25万。
         // 简单口径 (25/20)^(1/3)-1 ≈ 7.7%，但第二笔只投了1年，真实年化更高。
         let flows = vec![
-            CashFlow { date: d(2020, 1, 1), amount: -100_000.0 },
-            CashFlow { date: d(2022, 1, 1), amount: -100_000.0 },
-            CashFlow { date: d(2023, 1, 1), amount: 250_000.0 },
+            CashFlow {
+                date: d(2020, 1, 1),
+                amount: -100_000.0,
+            },
+            CashFlow {
+                date: d(2022, 1, 1),
+                amount: -100_000.0,
+            },
+            CashFlow {
+                date: d(2023, 1, 1),
+                amount: 250_000.0,
+            },
         ];
         let x = xirr(&flows).unwrap();
         let naive = (250_000.0_f64 / 200_000.0).powf(1.0 / 3.0) - 1.0;
@@ -372,8 +420,14 @@ mod tests {
     #[test]
     fn xirr_亏损应为负() {
         let flows = vec![
-            CashFlow { date: d(2020, 1, 1), amount: -100.0 },
-            CashFlow { date: d(2021, 1, 1), amount: 50.0 },
+            CashFlow {
+                date: d(2020, 1, 1),
+                amount: -100.0,
+            },
+            CashFlow {
+                date: d(2021, 1, 1),
+                amount: 50.0,
+            },
         ];
         assert!(xirr(&flows).unwrap() < 0.0);
     }
@@ -400,7 +454,11 @@ mod tests {
             (d(2026, 11, 1), 11_000.0),
         ];
         let sum = drawdown_summary(&s).unwrap();
-        assert!((sum.max_dd - 2_000.0 / 12_000.0).abs() < 1e-9, "{}", sum.max_dd);
+        assert!(
+            (sum.max_dd - 2_000.0 / 12_000.0).abs() < 1e-9,
+            "{}",
+            sum.max_dd
+        );
         assert_eq!(sum.peak_date, d(2026, 9, 1));
         assert_eq!(sum.trough_date, d(2026, 10, 1));
         assert_eq!(sum.peak_value, 12_000.0);
@@ -414,8 +472,8 @@ mod tests {
     fn 回撤摘要_深回撤后创新高时全期峰值为新峰() {
         let s = [
             (d(2026, 1, 1), 100.0),
-            (d(2026, 2, 1), 50.0),   // MaxDD 50%
-            (d(2026, 3, 1), 150.0),  // 新高
+            (d(2026, 2, 1), 50.0),  // MaxDD 50%
+            (d(2026, 3, 1), 150.0), // 新高
         ];
         let sum = drawdown_summary(&s).unwrap();
         assert!((sum.max_dd - 0.5).abs() < 1e-9);
@@ -461,7 +519,12 @@ mod tests {
         // 收益偏正、少量小幅回调 → 下行风险小于总波动
         let rets = vec![0.05, 0.06, -0.01, 0.07, 0.04, -0.005, 0.05];
         let m = risk_metrics(&rets, 12.0, 0.0, 0.30, 0.05);
-        assert!(m.sortino > m.sharpe, "sortino={} sharpe={}", m.sortino, m.sharpe);
+        assert!(
+            m.sortino > m.sharpe,
+            "sortino={} sharpe={}",
+            m.sortino,
+            m.sharpe
+        );
     }
 
     #[test]
@@ -472,7 +535,9 @@ mod tests {
 
     #[test]
     fn bootstrap_可复现且数量正确() {
-        let rets: Vec<f64> = (0..60).map(|i| if i % 5 == 0 { -0.02 } else { 0.01 }).collect();
+        let rets: Vec<f64> = (0..60)
+            .map(|i| if i % 5 == 0 { -0.02 } else { 0.01 })
+            .collect();
         let a = block_bootstrap(&rets, 6, 50, 12.0, 42);
         let b = block_bootstrap(&rets, 6, 50, 12.0, 42);
         assert_eq!(a.len(), 50);

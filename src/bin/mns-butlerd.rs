@@ -47,14 +47,14 @@ use money_never_sleep::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind,
 use money_never_sleep::butler::agenda;
 use money_never_sleep::butler::chat::{self, ChatEffect};
 use money_never_sleep::butler::orchestrator::{
-    self, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice, AGENT_INIT_MIN_IDLE_HOURS,
+    self, AGENT_INIT_MIN_IDLE_HOURS, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice,
     agent_init_backoff, append_init_record,
 };
 use money_never_sleep::butler::schedule;
 use money_never_sleep::butler::talk;
 use money_never_sleep::butler::{
-    writer_lock, Butler, Session, SilentBecause, SpeakCandidate, SpeakDecision, SpeakReason,
-    WakeSource, WakeVerdict,
+    Butler, Session, SilentBecause, SpeakCandidate, SpeakDecision, SpeakReason, WakeSource,
+    WakeVerdict, writer_lock,
 };
 use money_never_sleep::ipc::{self, Client, Listener, Signal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -226,13 +226,18 @@ async fn handle_event(
             let brief = match tokio::task::spawn_blocking(|| {
                 match money_never_sleep::app::load_snapshot_read_only() {
                     Ok(snapshot) => {
-                        orchestrator::record_health(true, None);
-                        money_never_sleep::brief::BriefData::from_snapshot(&snapshot)
+                        let health = orchestrator::record_health(true, None);
+                        let mut brief =
+                            money_never_sleep::brief::BriefData::from_snapshot(&snapshot);
+                        brief.health = Some(health);
+                        brief
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
-                        orchestrator::record_health(false, Some(message.clone()));
-                        money_never_sleep::brief::BriefData::from_error(message)
+                        let health = orchestrator::record_health(false, Some(message.clone()));
+                        let mut brief = money_never_sleep::brief::BriefData::from_error(message);
+                        brief.health = Some(health);
+                        brief
                     }
                 }
             })
@@ -248,6 +253,17 @@ async fn handle_event(
             }
             // 宿主刚跟我们说过话：顺手排一次投递积压。
             chat.drain_pending(link, runtime).await;
+        }
+        ipc::Event::Signal(_, Signal::NoticeDelivered { notice_id }) => {
+            // 宿主确认处理过这条开口，才允许推进 pending 偏移。收不到回执
+            // 的条目留在 backlog 里，下一轮重投（幂等，不会重复弹）。
+            let before = link.backlog.len();
+            link.backlog.retain(|notice| notice.notice_id != notice_id);
+            if link.backlog.len() != before && link.backlog.is_empty() {
+                if let Some(offset) = link.backlog_offset.take() {
+                    orchestrator::write_pending_offset(offset);
+                }
+            }
         }
         ipc::Event::Signal(_, Signal::SetProactive { enabled }) => {
             if let Err(error) = set_proactive(enabled) {
@@ -265,10 +281,8 @@ async fn handle_event(
         // 用户发话：账户事实是整段阻塞调用（只读连接全库读取），放阻塞
         // 线程池算完再进会话服务。
         ipc::Event::Signal(_, Signal::ChatSend { text }) => {
-            let facts = match tokio::task::spawn_blocking(move || {
-                chat::current_facts(Local::now())
-            })
-            .await
+            let facts = match tokio::task::spawn_blocking(move || chat::current_facts(Local::now()))
+                .await
             {
                 Ok(facts) => facts,
                 Err(error) => {
@@ -324,7 +338,10 @@ async fn wake(
             Ok((facts, error)) => (facts, error),
             Err(error) => {
                 eprintln!("mns-butlerd: 账户事实计算任务失败：{error}");
-                (AccountFacts::default(), Some(format!("账户事实计算任务失败：{error}")))
+                (
+                    AccountFacts::default(),
+                    Some(format!("账户事实计算任务失败：{error}")),
+                )
             }
         };
     // 成败都落一次：失败让托盘亮红灯，成功把旧错误清掉。
@@ -437,18 +454,18 @@ async fn run_agent_init() -> Result<bool> {
 
     // 账户事实与判定同源：只读连接算出来（阻塞调用放阻塞线程池，理由同
     // `wake`），承诺在锁外合并——`butler` 是刚从锁内读出的那份。
-    let ledger = match tokio::task::spawn_blocking(move || orchestrator::ledger_facts_report(now)).await
-    {
-        Ok((facts, error)) => {
-            orchestrator::record_health(error.is_none(), error);
-            facts
-        }
-        Err(error) => {
-            eprintln!("mns-butlerd: 账户事实计算任务失败：{error}");
-            orchestrator::record_health(false, Some(format!("账户事实计算任务失败：{error}")));
-            AccountFacts::default()
-        }
-    };
+    let ledger =
+        match tokio::task::spawn_blocking(move || orchestrator::ledger_facts_report(now)).await {
+            Ok((facts, error)) => {
+                orchestrator::record_health(error.is_none(), error);
+                facts
+            }
+            Err(error) => {
+                eprintln!("mns-butlerd: 账户事实计算任务失败：{error}");
+                orchestrator::record_health(false, Some(format!("账户事实计算任务失败：{error}")));
+                AccountFacts::default()
+            }
+        };
     let facts = ledger.with_promises(&butler.memory, now.date_naive());
     let memory = talk::memory_lines(&butler.memory, now.date_naive());
     let recent = talk::recent_lines(&session);
@@ -585,7 +602,11 @@ async fn collect_reply(
             }
             AgentEvent::TurnFinished { .. } => return Some(buffer),
             AgentEvent::Finished { .. } => {
-                return if buffer.is_empty() { None } else { Some(buffer) };
+                return if buffer.is_empty() {
+                    None
+                } else {
+                    Some(buffer)
+                };
             }
             AgentEvent::Failed { message } => {
                 eprintln!("mns-butlerd: agent-init 报错：{message}");
@@ -600,11 +621,7 @@ async fn collect_reply(
 ///
 /// 用「任何往来」而不是只看用户发言：用户刚聊完、或管家刚提醒过，都不该再
 /// 自己起话头。开口记录也算，因为 GUI 没开时会话文件不会更新。
-fn recent_activity(
-    butler: &Butler,
-    session: &Session,
-    now: DateTime<Local>,
-) -> bool {
+fn recent_activity(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
     let cutoff = now - chrono::Duration::hours(AGENT_INIT_MIN_IDLE_HOURS);
     session.messages.iter().any(|message| message.at >= cutoff)
         || butler
@@ -780,21 +797,19 @@ impl ChatState {
         let effects = self.service.merge_notices(&notices, self.conn.is_some());
         self.apply(effects, runtime);
 
-        // 逐条投给宿主：宿主按 notices.jsonl 的 delivered 记录去重，所以
-        // 重投是安全的；这里按发送成败决定要不要留着重试。
-        let mut undelivered = Vec::new();
+        // 发出后不立刻移出 backlog：等宿主回执 `NoticeDelivered`。回执丢了
+        // 下一轮会重投，宿主按 `notices.jsonl` 幂等，最多多一次 IPC 往返。
+        let mut kept = Vec::with_capacity(notices.len());
         for notice in notices {
             // 序列化失败（实际上不可能：全是字符串与时间戳）只能跳过，
             // 不能让一条坏数据堵住后面的。
             let Ok(json) = serde_json::to_string(&notice) else {
                 continue;
             };
-            if link.send(&Signal::DeliverNotice { json }) {
-                continue;
-            }
-            undelivered.push(notice);
+            let _ = link.send(&Signal::DeliverNotice { json });
+            kept.push(notice);
         }
-        link.backlog = undelivered;
+        link.backlog = kept;
         if link.backlog.is_empty() {
             if let Some(offset) = link.backlog_offset.take() {
                 orchestrator::write_pending_offset(offset);
@@ -898,14 +913,14 @@ mod tests {
             tasks: money_never_sleep::butler::TaskBoard::default(),
         };
         for (when, trigger) in records {
-            butler
-                .state
-                .ledger
-                .record(when, &SpeakCandidate {
+            butler.state.ledger.record(
+                when,
+                &SpeakCandidate {
                     reason: SpeakReason::AgentInit,
                     trigger: trigger.to_owned(),
                     draft: "x".to_owned(),
-                });
+                },
+            );
         }
         butler
     }
@@ -926,10 +941,9 @@ mod tests {
 
         // 用户 13 小时前聊过：可以开口。
         let mut session = Session::default();
-        session.messages.push(money_never_sleep::butler::Message::user(
-            at(15, 21),
-            "晚安",
-        ));
+        session
+            .messages
+            .push(money_never_sleep::butler::Message::user(at(15, 21), "晚安"));
         assert!(!recent_activity(&empty, &session, now));
     }
 
@@ -970,10 +984,12 @@ mod tests {
         butler.state.last_agent_init = Some(now - chrono::Duration::hours(3));
         butler.state.agent_init_failures = 3;
         let mut session = Session::default();
-        session.messages.push(money_never_sleep::butler::Message::user(
-            now - chrono::Duration::minutes(1),
-            "刚聊完",
-        ));
+        session
+            .messages
+            .push(money_never_sleep::butler::Message::user(
+                now - chrono::Duration::minutes(1),
+                "刚聊完",
+            ));
         assert!(!agent_init_due(&butler, &session, now));
     }
 

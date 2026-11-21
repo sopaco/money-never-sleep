@@ -26,10 +26,10 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
+use super::expression;
 use super::memory::{self, Fact, Forgot, Memory, Remembered};
 use super::orchestrator::{self, AccountFacts, Notice};
 use super::session::{Message, Role, Session};
-use super::expression;
 #[cfg(any(test, feature = "agent"))]
 use super::talk;
 use crate::ipc::Signal;
@@ -121,7 +121,10 @@ impl TurnState {
             return None;
         }
         self.waiting = false;
-        Some((std::mem::take(&mut self.buffer), std::mem::take(&mut self.template)))
+        Some((
+            std::mem::take(&mut self.buffer),
+            std::mem::take(&mut self.template),
+        ))
     }
 
     /// 丢弃这一轮：会话被清空、服务退出时用。
@@ -213,7 +216,9 @@ impl ChatService {
             Ok(session) => (session, None, true),
             Err(error) => (
                 Session::default(),
-                Some(format!("会话存档读取失败，本次对话不会覆盖原文件：{error:#}")),
+                Some(format!(
+                    "会话存档读取失败，本次对话不会覆盖原文件：{error:#}"
+                )),
                 false,
             ),
         };
@@ -237,11 +242,14 @@ impl ChatService {
     #[cfg(test)]
     fn with_scratch(scratch: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&scratch);
-        let (session, error, persist) = match Session::load_from(&scratch.join("conversation.json")) {
+        let (session, error, persist) = match Session::load_from(&scratch.join("conversation.json"))
+        {
             Ok(session) => (session, None, true),
             Err(error) => (
                 Session::default(),
-                Some(format!("会话存档读取失败，本次对话不会覆盖原文件：{error:#}")),
+                Some(format!(
+                    "会话存档读取失败，本次对话不会覆盖原文件：{error:#}"
+                )),
                 false,
             ),
         };
@@ -339,7 +347,9 @@ impl ChatService {
             self.persist();
             vec![
                 ChatEffect::Runtime(command),
-                ChatEffect::Timeout { turn: self.turn.turn },
+                ChatEffect::Timeout {
+                    turn: self.turn.turn,
+                },
                 self.snapshot_effect(None),
             ]
         }
@@ -497,9 +507,10 @@ impl ChatService {
         // 被 cancel 的会话不再复用：下一问重新开一个，免得接在半截上下文上。
         self.started = false;
         let mut effects = vec![ChatEffect::Runtime(crate::agent::AgentCommand::Stop)];
-        effects.extend(
-            self.settle(Some(format!("agent 超过 {} 秒没答完", CHAT_TIMEOUT.as_secs()))),
-        );
+        effects.extend(self.settle(Some(format!(
+            "agent 超过 {} 秒没答完",
+            CHAT_TIMEOUT.as_secs()
+        ))));
         effects
     }
 
@@ -574,7 +585,11 @@ impl ChatService {
                         };
                         let reply = match verdict {
                             Remembered::Merged => {
-                                format!("这条我记过了，又确认了一次：{}{}。", clip(&text, 40), due_note)
+                                format!(
+                                    "这条我记过了，又确认了一次：{}{}。",
+                                    clip(&text, 40),
+                                    due_note
+                                )
                             }
                             _ => format!(
                                 "记下了：{}{}。要改口径就说「忘掉…」。",
@@ -644,7 +659,7 @@ impl ChatService {
         let memory = match self.load_memory() {
             Ok(memory) => memory,
             Err(_) => {
-                return Some("记忆文件这次读不出来，我念不了，也不会拿空记忆糊弄你。".to_owned())
+                return Some("记忆文件这次读不出来，我念不了，也不会拿空记忆糊弄你。".to_owned());
             }
         };
         let today = Local::now().date_naive();
@@ -752,8 +767,7 @@ impl ChatService {
 /// 内多次构造（测试）也互不相同。
 fn next_instance() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    ((std::process::id() as u64) << 32)
-        | COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ((std::process::id() as u64) << 32) | COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn valid_or(reply: String, fallback: &str) -> String {
@@ -843,12 +857,7 @@ mod tests {
 
     fn last_reply(effects: &[ChatEffect]) -> String {
         let data = snapshot_of(effects);
-        data.session
-            .messages
-            .last()
-            .expect("应有回复")
-            .text
-            .clone()
+        data.session.messages.last().expect("应有回复").text.clone()
     }
 
     fn memory_of(name: &str) -> Memory {
@@ -865,7 +874,11 @@ mod tests {
         assert!(data.restore.is_none());
         #[cfg(feature = "agent")]
         {
-            assert_eq!(data.session.messages.len(), 1, "agent 构建首帧只有用户的问题");
+            assert_eq!(
+                data.session.messages.len(),
+                1,
+                "agent 构建首帧只有用户的问题"
+            );
             assert!(data.waiting, "agent 构建在等回答");
             assert!(data.buffer.is_empty(), "正文未到，没有半截");
         }
@@ -919,7 +932,11 @@ mod tests {
         let data = snapshot_of(&effects);
         #[cfg(not(feature = "agent"))]
         {
-            assert_eq!(data.session.messages.len(), 2, "一轮问答应是用户 + 管家两条");
+            assert_eq!(
+                data.session.messages.len(),
+                2,
+                "一轮问答应是用户 + 管家两条"
+            );
             assert_eq!(data.session.messages[0].role, Role::User);
             assert_eq!(data.session.messages[1].role, Role::Butler);
             assert!(
@@ -984,16 +1001,16 @@ mod tests {
         // 用绝对日期，避免测试依赖运行当天的日历。
         service.send("记住 2026-12-27 截止 补美股".to_owned(), &facts());
         service.send("记住 2026-12-30 截止 补美股".to_owned(), &facts());
-        assert_eq!(memory_of("ambiguity").facts.len(), 2, "不同到期日应各存一条");
+        assert_eq!(
+            memory_of("ambiguity").facts.len(),
+            2,
+            "不同到期日应各存一条"
+        );
 
         // 不带日期：同文两条 → 歧义，一条不动，候选带日期。
         let effects = service.send("忘掉补美股".to_owned(), &facts());
         let ambiguous = last_reply(&effects);
-        assert_eq!(
-            memory_of("ambiguity").facts.len(),
-            2,
-            "歧义时一条都不能动"
-        );
+        assert_eq!(memory_of("ambiguity").facts.len(), 2, "歧义时一条都不能动");
 
         // 带日期：只删那一天的那条。
         let effects = service.send("忘掉 2026-12-27 截止 补美股".to_owned(), &facts());
@@ -1070,7 +1087,9 @@ mod tests {
         let effects = service.send("现在偏离多少".to_owned(), &facts());
         let data = snapshot_of(&effects);
         assert!(
-            data.error.as_deref().is_some_and(|error| error.contains("读取失败")),
+            data.error
+                .as_deref()
+                .is_some_and(|error| error.contains("读取失败")),
             "损坏原因应摆到快照上，实际 {:?}",
             data.error
         );
@@ -1086,7 +1105,10 @@ mod tests {
     fn merge_notices按id幂等() {
         let mut service = open("merge");
         let notice = Notice {
-            at: Local.with_ymd_and_hms(2026, 11, 20, 9, 0, 0).single().unwrap(),
+            at: Local
+                .with_ymd_and_hms(2026, 11, 20, 9, 0, 0)
+                .single()
+                .unwrap(),
             reason: SpeakReason::ActionableStep,
             trigger: "drift:2026-11-20".to_owned(),
             draft: "美股偏离 6.2pp".to_owned(),
@@ -1120,7 +1142,10 @@ mod tests {
         service.merge_notices(
             &[Notice {
                 notice_id: "n-merge-2".to_owned(),
-                at: Local.with_ymd_and_hms(2026, 11, 20, 9, 5, 0).single().unwrap(),
+                at: Local
+                    .with_ymd_and_hms(2026, 11, 20, 9, 5, 0)
+                    .single()
+                    .unwrap(),
                 ..notice
             }],
             true,
@@ -1272,7 +1297,10 @@ mod tests {
             memory.remember(Fact::new(
                 memory::FactKind::Commitment,
                 "外部写入的承诺".to_owned(),
-                Local.with_ymd_and_hms(2026, 11, 20, 8, 0, 0).single().unwrap(),
+                Local
+                    .with_ymd_and_hms(2026, 11, 20, 8, 0, 0)
+                    .single()
+                    .unwrap(),
             ))
         })
         .unwrap();
@@ -1335,7 +1363,10 @@ mod tests {
             text: "这个我没法".to_owned(),
         });
         assert!(
-            matches!(effects.as_slice(), [ChatEffect::Broadcast(Signal::ChatDelta { .. })]),
+            matches!(
+                effects.as_slice(),
+                [ChatEffect::Broadcast(Signal::ChatDelta { .. })]
+            ),
             "正文增长只广播 Delta，实际 {effects:?}"
         );
         service.on_agent_event(AgentEvent::Delta {
@@ -1460,14 +1491,13 @@ mod tests {
         let mut service = open("permission");
         service.send("现在偏离多少".to_owned(), &facts());
 
-        let effects = service.on_agent_event(AgentEvent::Permission(
-            crate::agent::PermissionPrompt {
+        let effects =
+            service.on_agent_event(AgentEvent::Permission(crate::agent::PermissionPrompt {
                 id: 7,
                 title: "执行 shell 命令".to_owned(),
                 detail: String::new(),
                 options: Vec::new(),
-            },
-        ));
+            }));
         assert!(matches!(
             runtime_command(&effects),
             Some(AgentCommand::Deny { id: 7 })

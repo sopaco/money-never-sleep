@@ -183,13 +183,11 @@ pub fn summarize(events: &[BehaviorEvent], since: DateTime<Local>) -> BehaviorWi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Duration};
+    use chrono::{Duration, TimeZone};
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mns-butler-events-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mns-butler-events-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("events.jsonl")
     }
@@ -219,8 +217,11 @@ mod tests {
     fn 损坏行被跳过而不是拖垮整份日志() {
         let path = scratch("corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{\"oops\"\n{\"at\":\"2026-11-16T10:00:00+08:00\",\"kind\":\"app_open\"}\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "{\"oops\"\n{\"at\":\"2026-11-16T10:00:00+08:00\",\"kind\":\"app_open\"}\n",
+        )
+        .unwrap();
         let rows = read_from(&path).unwrap();
         assert_eq!(rows.len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

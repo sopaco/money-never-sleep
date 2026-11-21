@@ -263,7 +263,9 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                         shell.toggle_launch_at_login(cx);
                     }))),
             )
-            .child(caption("登录后常驻托盘，不打开窗口；管家横幅也能及时送达。")),
+            .child(caption(
+                "登录后常驻托盘，不打开窗口；管家横幅也能及时送达。",
+            )),
     );
 
     // ── 行为记录（管家） ───────────────────────────────────────
@@ -318,11 +320,9 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
 
     // ── 管家 ─────────────────────────────────────────────────
     let proactive = shell.butler_proactive;
-    let mut proactive_toggle = Button::new("butler-proactive").compact().label(if proactive {
-        "已开启"
-    } else {
-        "已停止"
-    });
+    let mut proactive_toggle = Button::new("butler-proactive")
+        .compact()
+        .label(if proactive { "已开启" } else { "已停止" });
     if proactive {
         proactive_toggle = proactive_toggle.primary();
     }
@@ -439,11 +439,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
 }
 
 /// 设置页里的窄数字输入：标签在上，输入框与单位在同一行。
-fn number_field(
-    label: &'static str,
-    input: &Entity<InputState>,
-    unit: &'static str,
-) -> AnyElement {
+fn number_field(label: &'static str, input: &Entity<InputState>, unit: &'static str) -> AnyElement {
     div()
         .v_flex()
         .gap(px(4.))

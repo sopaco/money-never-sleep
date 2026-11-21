@@ -23,14 +23,18 @@ pub struct RiskWarning {
 
 #[derive(Debug)]
 pub enum RiskAdvice {
-    ConsiderBuyMore,  // 恐慌环境下浮亏，可能是加仓机会
+    ConsiderBuyMore,    // 恐慌环境下浮亏，可能是加仓机会
     ReviewFundamentals, // 中性环境下浮亏，审视基本面
-    UrgentReview,      // 贪婪环境下浮亏，需要紧急审视
+    UrgentReview,       // 贪婪环境下浮亏，需要紧急审视
 }
 
 /// 检查风险警告（浮亏超 20%）
 /// 改进：结合市场情绪给出差异化建议
-pub fn check_risk_warnings(config: &AppConfig, score: f64, positions: &[Position]) -> Vec<RiskWarning> {
+pub fn check_risk_warnings(
+    config: &AppConfig,
+    score: f64,
+    positions: &[Position],
+) -> Vec<RiskWarning> {
     let mut warnings = Vec::new();
     for pos in positions {
         if pos.shares <= 0.0 || pos.cost_price <= 0.0 {
@@ -195,7 +199,11 @@ pub fn calculate_rebalance_plan(
 
     // 空持仓时 .sum() 的浮点累加起点会留下 -0.0，"{:.1}" 打印成 "-0.0%"——
     // 加 0.0 归一化符号（-0.0 + 0.0 == 0.0，与 report.rs 账户概览同款处理）
-    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let holdings: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     let total = cash_balance + holdings;
 
     let mut legs: Vec<LegPlan> = Vec::new();
@@ -205,10 +213,18 @@ pub fn calculate_rebalance_plan(
     for (idx, cat) in categories.iter().enumerate() {
         let members: Vec<&Position> = positions.iter().filter(|p| p.category == *cat).collect();
         // 同上：空腿 -0.0 归一化，避免腿表格"当前 -0.0%"
-        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+        let current: f64 = members
+            .iter()
+            .map(|p| p.market_value_or_cost())
+            .sum::<f64>()
+            + 0.0;
         let target_value = total * leg_target[idx];
         let target_weight = leg_target[idx] * 100.0;
-        let current_weight = if total > 0.0 { current / total * 100.0 } else { 0.0 };
+        let current_weight = if total > 0.0 {
+            current / total * 100.0
+        } else {
+            0.0
+        };
         let drift_pp = current_weight - target_weight;
         let diff = current - target_value;
 
@@ -284,7 +300,11 @@ pub fn calculate_rebalance_plan(
     let mut total_buy = 0.0;
 
     for (idx, need) in &buy_needs {
-        let amount = if need_sum > 0.0 { budget * (need / need_sum) } else { 0.0 };
+        let amount = if need_sum > 0.0 {
+            budget * (need / need_sum)
+        } else {
+            0.0
+        };
         let leg = &mut legs[*idx];
         if amount < min_trade {
             leg.hold_reason = Some(if cash_constrained {
@@ -321,7 +341,11 @@ pub fn calculate_rebalance_plan(
 
     RebalancePlan {
         target_risk_weight: risk_w * 100.0,
-        current_risk_weight: if total > 0.0 { holdings / total * 100.0 } else { 0.0 },
+        current_risk_weight: if total > 0.0 {
+            holdings / total * 100.0
+        } else {
+            0.0
+        },
         total_assets: total,
         cash_balance,
         band_pp: band,
@@ -354,7 +378,11 @@ pub fn calculate_monthly_plan(
     let leg_target = [tu, tc, tcc];
     let risk_w = config.target_weight_for(score) / 100.0;
     // 同上：空持仓时 -0.0 归一化，避免计划行"当前 -0.0%"
-    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let holdings: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     // 新钱到账后的总资产口径
     let total = cash_balance + holdings + monthly;
 
@@ -365,9 +393,17 @@ pub fn calculate_monthly_plan(
     for (idx, cat) in categories.iter().enumerate() {
         let members: Vec<&Position> = positions.iter().filter(|p| p.category == *cat).collect();
         // 同上：空腿 -0.0 归一化，避免腿表格"当前 -0.0%"
-        let current: f64 = members.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+        let current: f64 = members
+            .iter()
+            .map(|p| p.market_value_or_cost())
+            .sum::<f64>()
+            + 0.0;
         let target_value = total * leg_target[idx];
-        let current_weight = if total > 0.0 { current / total * 100.0 } else { 0.0 };
+        let current_weight = if total > 0.0 {
+            current / total * 100.0
+        } else {
+            0.0
+        };
         let deficit = (target_value - current).max(0.0);
         deficit_sum += deficit;
         deficits.push(deficit);
@@ -391,7 +427,11 @@ pub fn calculate_monthly_plan(
             monthly * deficits[idx] / deficit_sum
         } else {
             // 缺口全部补齐，剩余按目标权重分配
-            let share = if risk_w > 0.0 { leg_target[idx] / risk_w } else { 0.0 };
+            let share = if risk_w > 0.0 {
+                leg_target[idx] / risk_w
+            } else {
+                0.0
+            };
             deficits[idx] + (monthly - deficit_sum) * share
         };
 
@@ -421,7 +461,11 @@ pub fn calculate_monthly_plan(
 
     RebalancePlan {
         target_risk_weight: risk_w * 100.0,
-        current_risk_weight: if total > 0.0 { holdings / total * 100.0 } else { 0.0 },
+        current_risk_weight: if total > 0.0 {
+            holdings / total * 100.0
+        } else {
+            0.0
+        },
         total_assets: total,
         cash_balance,
         band_pp: config.rebalance.band_pp,
@@ -472,13 +516,25 @@ pub fn profile_switch_impact(
     let new_target = new.target_weight_for(score);
     // 空持仓时 f64 的 .sum() 返回 -0.0，"{:.1}" 会打印成 "-0.0%"——加 0.0 归一化
     // （与 report.rs 的账户概览同款处理）
-    let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let holdings: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     let total = cash + holdings;
-    let current_risk = if total > 0.0 { holdings / total * 100.0 } else { 0.0 };
+    let current_risk = if total > 0.0 {
+        holdings / total * 100.0
+    } else {
+        0.0
+    };
     let drift_pp = new_target - current_risk;
     let band = new.rebalance.band_pp;
     let in_band = total <= 0.0 || drift_pp.abs() <= band;
-    let est_amount = if in_band { 0.0 } else { drift_pp.abs() / 100.0 * total };
+    let est_amount = if in_band {
+        0.0
+    } else {
+        drift_pp.abs() / 100.0 * total
+    };
     ProfileSwitchImpact {
         old_target,
         new_target,
@@ -506,10 +562,7 @@ fn split_within_leg(members: &[&Position], amount: f64, max_weight: f64) -> Vec<
     let eligible: Vec<&&Position> = members
         .iter()
         .filter(|p| {
-            let deep_loss = p
-                .absolute_return()
-                .map(|r| r <= -0.30)
-                .unwrap_or(false);
+            let deep_loss = p.absolute_return().map(|r| r <= -0.30).unwrap_or(false);
             !(deep_loss && !is_broad_index(&p.asset_name, &p.asset_code))
         })
         .collect();
@@ -534,7 +587,11 @@ fn split_within_leg(members: &[&Position], amount: f64, max_weight: f64) -> Vec<
         .map(|(p, w)| LegItem {
             asset_code: p.asset_code.clone(),
             asset_name: p.asset_name.clone(),
-            amount: if sum > 0.0 { amount * (w / sum) } else { amount / pool.len() as f64 },
+            amount: if sum > 0.0 {
+                amount * (w / sum)
+            } else {
+                amount / pool.len() as f64
+            },
             note: None,
             holding_days: None,
         })
@@ -544,10 +601,24 @@ fn split_within_leg(members: &[&Position], amount: f64, max_weight: f64) -> Vec<
 /// 粗略判断是否为宽基指数/ETF（用于区分"指数下跌"与"个股基本面恶化"）
 pub fn is_broad_index(name: &str, code: &str) -> bool {
     const KEYWORDS: [&str; 14] = [
-        "指数", "ETF", "etf", "沪深300", "中证", "上证", "创业板", "科创",
-        "纳斯达克", "纳指", "标普", "500", "红利", "联接",
+        "指数",
+        "ETF",
+        "etf",
+        "沪深300",
+        "中证",
+        "上证",
+        "创业板",
+        "科创",
+        "纳斯达克",
+        "纳指",
+        "标普",
+        "500",
+        "红利",
+        "联接",
     ];
-    KEYWORDS.iter().any(|k| name.contains(k) || code.contains(k))
+    KEYWORDS
+        .iter()
+        .any(|k| name.contains(k) || code.contains(k))
 }
 
 #[cfg(test)]
@@ -559,7 +630,15 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 7, 31).unwrap()
     }
 
-    fn pos(code: &str, name: &str, cat: &str, shares: f64, cost: f64, cur: f64, first: &str) -> Position {
+    fn pos(
+        code: &str,
+        name: &str,
+        cat: &str,
+        shares: f64,
+        cost: f64,
+        cur: f64,
+        first: &str,
+    ) -> Position {
         Position {
             id: 1,
             asset_code: code.to_string(),
@@ -608,7 +687,15 @@ mod tests {
         // 标的存在、份额还是 0（刚 add 未买）也算可执行：不能把「还没买」
         // 误判成「买不到」。另外两条没有标的的腿必须清零，不进总额。
         let c = AppConfig::default_config();
-        let positions = vec![pos("QQQ", "纳指ETF", "us_stocks", 0.0, 0.0, 1.0, "2020-01-01")];
+        let positions = vec![pos(
+            "QQQ",
+            "纳指ETF",
+            "us_stocks",
+            0.0,
+            0.0,
+            1.0,
+            "2020-01-01",
+        )];
         let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
 
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
@@ -633,7 +720,15 @@ mod tests {
         let positions = vec![
             pos("QQQ", "纳指ETF", "us_stocks", 330.0, 1.0, 1.0, "2020-01-01"),
             pos("DIV", "红利ETF", "cn_stocks", 150.0, 1.0, 1.0, "2020-01-01"),
-            pos("AU", "黄金ETF", "counter_cyclical", 120.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "AU",
+                "黄金ETF",
+                "counter_cyclical",
+                120.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let p = calculate_rebalance_plan(&c, 50.0, 400.0, &positions, today());
         assert!(!p.has_action(), "应无动作, legs={:?}", p.legs);
@@ -651,7 +746,12 @@ mod tests {
         let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
         assert!(p.total_sell > 0.0);
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
-        assert_eq!(us.items.len(), 2, "两只都应被卖出，而不是只砍赢家: {:?}", us.items);
+        assert_eq!(
+            us.items.len(),
+            2,
+            "两只都应被卖出，而不是只砍赢家: {:?}",
+            us.items
+        );
         // 卖出金额应与市值成比例（2000 : 1100）
         let a = us.items.iter().find(|i| i.asset_code == "A").unwrap();
         let b = us.items.iter().find(|i| i.asset_code == "B").unwrap();
@@ -690,8 +790,24 @@ mod tests {
         let mut c = AppConfig::default_config();
         c.rebalance.min_holding_days_for_sell = 30;
         let positions = vec![
-            pos("OLD", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2020-01-01"),
-            pos("NEW", "纳指联接", "us_stocks", 1000.0, 1.0, 2.0, "2026-07-30"),
+            pos(
+                "OLD",
+                "纳指ETF",
+                "us_stocks",
+                1000.0,
+                1.0,
+                2.0,
+                "2020-01-01",
+            ),
+            pos(
+                "NEW",
+                "纳指联接",
+                "us_stocks",
+                1000.0,
+                1.0,
+                2.0,
+                "2026-07-30",
+            ),
         ];
         let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
@@ -727,7 +843,15 @@ mod tests {
         let positions = vec![
             pos("QQQ", "纳指ETF", "us_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
             pos("DIV", "红利ETF", "cn_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
-            pos("GLD", "黄金ETF", "counter_cyclical", 100.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "GLD",
+                "黄金ETF",
+                "counter_cyclical",
+                100.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let p = calculate_monthly_plan(&c, 50.0, 1_000.0, &positions, 3_000.0);
         let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
@@ -737,7 +861,11 @@ mod tests {
         assert!((p.total_buy - 3000.0).abs() < 0.01);
         // 低配腿应分到更多钱
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
-        let cc = p.legs.iter().find(|l| l.category == "counter_cyclical").unwrap();
+        let cc = p
+            .legs
+            .iter()
+            .find(|l| l.category == "counter_cyclical")
+            .unwrap();
         assert!(us.amount > cc.amount);
     }
 
@@ -748,7 +876,13 @@ mod tests {
         // 拿着钱买不到东西，同屏的结论卡却说「该类别暂无可买标的」。
         let c = AppConfig::default_config();
         let positions = vec![pos(
-            "QQQ", "纳指ETF", "us_stocks", 100.0, 1.0, 1.0, "2020-01-01",
+            "QQQ",
+            "纳指ETF",
+            "us_stocks",
+            100.0,
+            1.0,
+            1.0,
+            "2020-01-01",
         )];
         let monthly = 3_000.0;
         let p = calculate_monthly_plan(&c, 22.0, 1_000.0, &positions, monthly);
@@ -768,7 +902,10 @@ mod tests {
             assert!(leg.items.is_empty());
         }
         let legs_sum: f64 = p.legs.iter().map(|l| l.amount).sum();
-        assert!((p.total_buy - legs_sum).abs() < 0.01, "合计应等于可执行腿之和");
+        assert!(
+            (p.total_buy - legs_sum).abs() < 0.01,
+            "合计应等于可执行腿之和"
+        );
         assert!(
             p.total_buy < monthly,
             "合计应小于月投入（缺口留在现金）: {}",
@@ -781,9 +918,33 @@ mod tests {
         let c = AppConfig::default_config();
         // 极度贪婪时目标仅 35%，现金充裕 → 所有腿都无需补缺
         let positions = vec![
-            pos("QQQ", "纳指ETF", "us_stocks", 40_000.0, 1.0, 1.0, "2020-01-01"),
-            pos("DIV", "红利ETF", "cn_stocks", 40_000.0, 1.0, 1.0, "2020-01-01"),
-            pos("GLD", "黄金ETF", "counter_cyclical", 40_000.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "QQQ",
+                "纳指ETF",
+                "us_stocks",
+                40_000.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
+            pos(
+                "DIV",
+                "红利ETF",
+                "cn_stocks",
+                40_000.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
+            pos(
+                "GLD",
+                "黄金ETF",
+                "counter_cyclical",
+                40_000.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let p = calculate_monthly_plan(&c, 90.0, 1_000_000.0, &positions, 3_000.0);
         let sum: f64 = p.legs.iter().map(|l| l.amount).sum();
@@ -795,7 +956,15 @@ mod tests {
         let mut c = AppConfig::default_config();
         c.rebalance.min_holding_days_for_sell = 30;
         // 昨天刚买入，极度贪婪本应减仓
-        let positions = vec![pos("A", "纳指ETF", "us_stocks", 1000.0, 1.0, 2.0, "2026-07-30")];
+        let positions = vec![pos(
+            "A",
+            "纳指ETF",
+            "us_stocks",
+            1000.0,
+            1.0,
+            2.0,
+            "2026-07-30",
+        )];
         let p = calculate_rebalance_plan(&c, 90.0, 0.0, &positions, today());
         assert_eq!(p.total_sell, 0.0, "应因惩罚性赎回费窗口而不卖");
         let us = p.legs.iter().find(|l| l.category == "us_stocks").unwrap();
@@ -811,9 +980,25 @@ mod tests {
         // 条腿会被「暂无可买标的」清零，`buy <= 10_000` 就成了一恒真断言，
         // 测不到「按比例缩减」这件事。
         let positions = vec![
-            pos("A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2026-07-30"),
+            pos(
+                "A",
+                "纳指ETF",
+                "us_stocks",
+                100_000.0,
+                1.0,
+                1.0,
+                "2026-07-30",
+            ),
             pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
-            pos("GLD", "黄金ETF", "counter_cyclical", 0.0, 0.0, 1.0, "2020-01-01"),
+            pos(
+                "GLD",
+                "黄金ETF",
+                "counter_cyclical",
+                0.0,
+                0.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let p = calculate_rebalance_plan(&c, 50.0, 10_000.0, &positions, today());
         assert_eq!(p.total_sell, 0.0, "美股未满持有期不应卖出");
@@ -829,7 +1014,10 @@ mod tests {
         for leg in p.legs.iter().filter(|l| l.amount > 0.0) {
             assert!(!leg.items.is_empty(), "{}腿应有可执行明细", leg.category_cn);
             assert!(
-                leg.hold_reason.as_deref().unwrap_or("").contains("受可用资金限制"),
+                leg.hold_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("受可用资金限制"),
                 "{}腿应披露缩减原因",
                 leg.category_cn
             );
@@ -844,7 +1032,15 @@ mod tests {
         let positions = vec![
             pos("QQQ", "纳指ETF", "us_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
             pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
-            pos("GLD", "黄金ETF", "counter_cyclical", 0.0, 0.0, 1.0, "2020-01-01"),
+            pos(
+                "GLD",
+                "黄金ETF",
+                "counter_cyclical",
+                0.0,
+                0.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let p = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
         assert_eq!(p.target_risk_weight, 85.0);
@@ -869,7 +1065,11 @@ mod tests {
                 leg.amount
             );
             assert!(!leg.items.is_empty(), "{}腿应有可执行明细", leg.category_cn);
-            assert!(leg.hold_reason.is_none(), "{}腿不应有阻碍原因", leg.category_cn);
+            assert!(
+                leg.hold_reason.is_none(),
+                "{}腿不应有阻碍原因",
+                leg.category_cn
+            );
         }
     }
 
@@ -880,7 +1080,15 @@ mod tests {
         // A股给一个份额为 0 的标的（刚 add 未买），否则该腿没有可买对象，
         // 引擎会按「暂无可买标的」清零，这笔钱就无处可去。
         let positions = vec![
-            pos("A", "纳指ETF", "us_stocks", 100_000.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "A",
+                "纳指ETF",
+                "us_stocks",
+                100_000.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
             pos("DIV", "红利ETF", "cn_stocks", 0.0, 0.0, 1.0, "2020-01-01"),
         ];
         let p = calculate_rebalance_plan(&c, 50.0, 0.0, &positions, today());
@@ -897,7 +1105,15 @@ mod tests {
     #[test]
     fn 宽基指数深度浮亏不应被排除加仓() {
         // 这是对旧规则的修正：指数跌30%正是该买的时候
-        let members = vec![pos("510880", "红利ETF", "cn_stocks", 100.0, 2.0, 1.2, "2020-01-01")];
+        let members = vec![pos(
+            "510880",
+            "红利ETF",
+            "cn_stocks",
+            100.0,
+            2.0,
+            1.2,
+            "2020-01-01",
+        )];
         let refs: Vec<&Position> = members.iter().collect();
         let items = split_within_leg(&refs, 10_000.0, 2.0);
         assert_eq!(items.len(), 1, "宽基指数应仍可加仓");
@@ -907,8 +1123,24 @@ mod tests {
     #[test]
     fn 个股深度浮亏应被排除加仓() {
         let members = vec![
-            pos("600519", "某白酒股份", "cn_stocks", 100.0, 2.0, 1.2, "2020-01-01"), // -40%
-            pos("510880", "红利ETF", "cn_stocks", 100.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "600519",
+                "某白酒股份",
+                "cn_stocks",
+                100.0,
+                2.0,
+                1.2,
+                "2020-01-01",
+            ), // -40%
+            pos(
+                "510880",
+                "红利ETF",
+                "cn_stocks",
+                100.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ];
         let refs: Vec<&Position> = members.iter().collect();
         let items = split_within_leg(&refs, 10_000.0, 2.0);
@@ -930,7 +1162,11 @@ mod tests {
         let mut prev = f64::INFINITY;
         for score in [10.0, 35.0, 50.0, 60.0, 80.0] {
             let p = calculate_rebalance_plan(&c, score, 100_000.0, &[], today());
-            assert!(p.target_risk_weight <= prev, "情绪{}目标仓位不应升高", score);
+            assert!(
+                p.target_risk_weight <= prev,
+                "情绪{}目标仓位不应升高",
+                score
+            );
             prev = p.target_risk_weight;
         }
     }
@@ -946,7 +1182,15 @@ mod tests {
         let positions = vec![
             pos("A", "纳指ETF", "us_stocks", 500.0, 1.0, 1.0, "2020-01-01"),
             pos("B", "红利ETF", "cn_stocks", 300.0, 1.0, 1.0, "2020-01-01"),
-            pos("C", "黄金ETF", "counter_cyclical", 200.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "C",
+                "黄金ETF",
+                "counter_cyclical",
+                200.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ]; // 风险资产 1000 + 现金 1000 → current 50%
         let impact = profile_switch_impact(&old, &new, 30.0, 1_000.0, &positions);
         assert!((impact.old_target - 85.0).abs() < 1e-9);
@@ -968,7 +1212,15 @@ mod tests {
         let positions = vec![
             pos("A", "纳指ETF", "us_stocks", 720.0, 1.0, 1.0, "2020-01-01"),
             pos("B", "红利ETF", "cn_stocks", 0.0, 1.0, 1.0, "2020-01-01"),
-            pos("C", "黄金ETF", "counter_cyclical", 0.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "C",
+                "黄金ETF",
+                "counter_cyclical",
+                0.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ]; // 风险 720 + 现金 280 → current 恰为 72%
         let impact = profile_switch_impact(&c, &new, 90.0, 280.0, &positions);
         assert!((impact.new_target - 74.0).abs() < 1e-9);
@@ -987,11 +1239,22 @@ mod tests {
         let positions = vec![
             pos("A", "纳指ETF", "us_stocks", 650.0, 1.0, 1.0, "2020-01-01"),
             pos("B", "红利ETF", "cn_stocks", 390.0, 1.0, 1.0, "2020-01-01"),
-            pos("C", "黄金ETF", "counter_cyclical", 260.0, 1.0, 1.0, "2020-01-01"),
+            pos(
+                "C",
+                "黄金ETF",
+                "counter_cyclical",
+                260.0,
+                1.0,
+                1.0,
+                "2020-01-01",
+            ),
         ]; // 风险 1300 + 现金 700 → current 65%
         let impact = profile_switch_impact(&old, &new, 90.0, 700.0, &positions);
         assert!((impact.old_target - 61.0).abs() < 1e-9);
-        assert!((impact.new_target - 35.0).abs() < 1e-9, "无档位贪婪目标应为曲线原样 35");
+        assert!(
+            (impact.new_target - 35.0).abs() < 1e-9,
+            "无档位贪婪目标应为曲线原样 35"
+        );
         assert_eq!(impact.direction, "卖出");
         assert!((impact.est_amount - 0.30 * 2000.0).abs() < 1e-9);
     }
@@ -1000,9 +1263,33 @@ mod tests {
     fn 定投与再平衡的目标风险仓位严格相等且偏离按含新钱口径差() {
         let c = AppConfig::default_config();
         let positions = vec![
-            pos("QQQ", "纳指ETF", "us_stocks", 1_000.0, 1.0, 1.2, "2020-01-01"),
-            pos("DIV", "红利ETF", "cn_stocks", 2_000.0, 1.0, 0.9, "2020-01-01"),
-            pos("GLD", "黄金ETF", "counter_cyclical", 500.0, 1.0, 1.4, "2020-01-01"),
+            pos(
+                "QQQ",
+                "纳指ETF",
+                "us_stocks",
+                1_000.0,
+                1.0,
+                1.2,
+                "2020-01-01",
+            ),
+            pos(
+                "DIV",
+                "红利ETF",
+                "cn_stocks",
+                2_000.0,
+                1.0,
+                0.9,
+                "2020-01-01",
+            ),
+            pos(
+                "GLD",
+                "黄金ETF",
+                "counter_cyclical",
+                500.0,
+                1.0,
+                1.4,
+                "2020-01-01",
+            ),
         ];
         let (cash, monthly, score) = (5_000.0, 3_000.0, 37.0);
 
@@ -1010,9 +1297,16 @@ mod tests {
         let monthly_plan = calculate_monthly_plan(&c, score, cash, &positions, monthly);
 
         // 同一分数、同一份配置：目标风险仓位必须逐位相等，不能「差不多」。
-        assert_eq!(rebalance.target_risk_weight, monthly_plan.target_risk_weight);
+        assert_eq!(
+            rebalance.target_risk_weight,
+            monthly_plan.target_risk_weight
+        );
 
-        let holdings: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+        let holdings: f64 = positions
+            .iter()
+            .map(|p| p.market_value_or_cost())
+            .sum::<f64>()
+            + 0.0;
         let total_now = cash + holdings;
         let total_with_new = total_now + monthly;
         assert!((rebalance.total_assets - total_now).abs() < 1e-9);
@@ -1066,7 +1360,13 @@ mod tests {
     fn 缺标的腿在两条计划链路中的结论一致() {
         let c = AppConfig::default_config();
         let positions = vec![pos(
-            "QQQ", "纳指ETF", "us_stocks", 1_000.0, 1.0, 1.0, "2020-01-01",
+            "QQQ",
+            "纳指ETF",
+            "us_stocks",
+            1_000.0,
+            1.0,
+            1.0,
+            "2020-01-01",
         )];
         let rebalance = calculate_rebalance_plan(&c, 20.0, 100_000.0, &positions, today());
         let monthly_plan = calculate_monthly_plan(&c, 20.0, 100_000.0, &positions, 3_000.0);
@@ -1114,9 +1414,33 @@ mod tests {
         let c = AppConfig::default_config();
         let mk = |scale: f64| {
             vec![
-                pos("A", "纳指ETF", "us_stocks", 550.0 * scale, 1.0, 1.0, "2020-01-01"),
-                pos("B", "红利ETF", "cn_stocks", 250.0 * scale, 1.0, 1.0, "2020-01-01"),
-                pos("C", "黄金ETF", "counter_cyclical", 200.0 * scale, 1.0, 1.0, "2020-01-01"),
+                pos(
+                    "A",
+                    "纳指ETF",
+                    "us_stocks",
+                    550.0 * scale,
+                    1.0,
+                    1.0,
+                    "2020-01-01",
+                ),
+                pos(
+                    "B",
+                    "红利ETF",
+                    "cn_stocks",
+                    250.0 * scale,
+                    1.0,
+                    1.0,
+                    "2020-01-01",
+                ),
+                pos(
+                    "C",
+                    "黄金ETF",
+                    "counter_cyclical",
+                    200.0 * scale,
+                    1.0,
+                    1.0,
+                    "2020-01-01",
+                ),
             ]
         };
         // 两个规模不同但权重结构相同的组合（风险资产 100%，目标 60%）

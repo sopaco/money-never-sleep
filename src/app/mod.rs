@@ -414,7 +414,10 @@ pub fn ensure_initialized() -> Result<bool> {
 pub fn publish_butler_ledger(kind: &str) {
     let now = chrono::Local::now();
     let id = format!("cli:{kind}:{}", now.timestamp_millis());
-    let _ = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::Wake { ledger: Some(id) });
+    let _ = crate::ipc::poke(
+        "mns-butlerd",
+        &crate::ipc::Signal::Wake { ledger: Some(id) },
+    );
 }
 
 pub fn load_snapshot() -> Result<Snapshot> {
@@ -1145,8 +1148,7 @@ mod tests {
 
     /// 独立临时目录，避免测试碰 `~/.mns`。
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("mns-app-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mns-app-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -19,8 +19,7 @@ use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UT
 use std::collections::HashMap;
 
 /// 真实全收益数据集（人民币计价，含分红，无拼接断点）
-const DATASET: &str =
-    include_str!("../.agents/skills/mns-backtest/data/monthly_total_return.csv");
+const DATASET: &str = include_str!("../.agents/skills/mns-backtest/data/monthly_total_return.csv");
 
 /// 样本外 holdout 区块（CNN 近端 FGI，与主序列不连续，单独回测）
 const DATASET_HOLDOUT: &str =
@@ -60,8 +59,12 @@ pub fn parse_dataset(data: &str) -> Vec<MonthRow> {
         let (Ok(y), Ok(m)) = (ym[0].parse::<i32>(), ym[1].parse::<u32>()) else {
             continue;
         };
-        let Some(date) = month_end(y, m) else { continue };
-        let Ok(fgi) = p[1].parse::<f64>() else { continue };
+        let Some(date) = month_end(y, m) else {
+            continue;
+        };
+        let Ok(fgi) = p[1].parse::<f64>() else {
+            continue;
+        };
         let mut prices = [0.0; 3];
         let mut ok = true;
         for i in 0..3 {
@@ -124,7 +127,11 @@ impl Leg {
         if shares <= 0.0 {
             return;
         }
-        self.lots.push(Lot { shares, price, date });
+        self.lots.push(Lot {
+            shares,
+            price,
+            date,
+        });
     }
 
     /// FIFO 卖出指定份额，按每个批次各自的持有天数计赎回费。
@@ -158,7 +165,11 @@ impl Leg {
             remaining -= take;
             let left = lot.shares - take;
             if left > 1e-12 {
-                keep.push(Lot { shares: left, price: lot.price, date: lot.date });
+                keep.push(Lot {
+                    shares: left,
+                    price: lot.price,
+                    date: lot.date,
+                });
             }
         }
         self.lots = keep;
@@ -281,7 +292,10 @@ impl Default for SignalConfig {
 
 impl SignalConfig {
     pub fn trend_tilt() -> Self {
-        Self { anchor: Anchor::TrendTilt, ..Self::default() }
+        Self {
+            anchor: Anchor::TrendTilt,
+            ..Self::default()
+        }
     }
 
     /// 情绪倾斜量（百分点），随情绪升高单调递减
@@ -333,7 +347,11 @@ pub fn compute_target_risk_weights(
                         // 历史不足时按上升趋势处理，避免开局系统性空仓
                         let up = i + 1 < w || row.prices[leg] >= ma;
                         base += sleeve[leg]
-                            * if up { cfg.trend_on_weight } else { cfg.trend_off_weight };
+                            * if up {
+                                cfg.trend_on_weight
+                            } else {
+                                cfg.trend_off_weight
+                            };
                     }
                     let tilted = base + cfg.tilt_for(config, signals[i]);
                     (tilted / 100.0).clamp(0.0, 1.0)
@@ -422,7 +440,11 @@ pub struct BacktestResult {
 
 impl BacktestResult {
     pub fn returns(&self) -> Vec<f64> {
-        self.monthly.iter().skip(1).map(|m| m.period_return).collect()
+        self.monthly
+            .iter()
+            .skip(1)
+            .map(|m| m.period_return)
+            .collect()
     }
 }
 
@@ -447,7 +469,10 @@ impl State {
             total_inflow: initial,
             fees: 0.0,
             interest: 0.0,
-            flows: vec![CashFlow { date: start, amount: -initial }],
+            flows: vec![CashFlow {
+                date: start,
+                amount: -initial,
+            }],
             trades: Vec::new(),
             last_inflow_year: 0,
         }
@@ -602,7 +627,10 @@ pub fn run(
                 st.cash += amount;
                 st.total_inflow += amount;
                 inflow = amount;
-                st.flows.push(CashFlow { date: row.date, amount: -amount });
+                st.flows.push(CashFlow {
+                    date: row.date,
+                    amount: -amount,
+                });
             }
         } else {
             st.last_inflow_year = row.date.year();
@@ -630,7 +658,15 @@ pub fn run(
                     let (a, b, c) = config.sleeve_split();
                     let cash = st.cash;
                     for (leg, w) in [(0, a), (1, b), (2, c)] {
-                        st.do_buy(leg, cash * w, row.prices[leg], row.date, costs, &zone, row.fgi);
+                        st.do_buy(
+                            leg,
+                            cash * w,
+                            row.prices[leg],
+                            row.date,
+                            costs,
+                            &zone,
+                            row.fgi,
+                        );
                     }
                 }
             }
@@ -641,12 +677,27 @@ pub fn run(
                     let (a, b, c) = config.sleeve_split();
                     let cash = st.cash;
                     for (leg, w) in [(0, a), (1, b), (2, c)] {
-                        st.do_buy(leg, cash * w, row.prices[leg], row.date, costs, &zone, row.fgi);
+                        st.do_buy(
+                            leg,
+                            cash * w,
+                            row.prices[leg],
+                            row.date,
+                            costs,
+                            &zone,
+                            row.fgi,
+                        );
                     }
                 }
                 if yearly && i > 0 {
                     rebalance_to_weights(
-                        &mut st, config, row, config.sleeve_split(), 1.0, &zone, 0.0, min_trade,
+                        &mut st,
+                        config,
+                        row,
+                        config.sleeve_split(),
+                        1.0,
+                        &zone,
+                        0.0,
+                        min_trade,
                         min_hold,
                     );
                 }
@@ -673,7 +724,11 @@ pub fn run(
             total_value: total,
             inflow,
             period_return,
-            risk_weight: if total > 0.0 { risk_value / total * 100.0 } else { 0.0 },
+            risk_weight: if total > 0.0 {
+                risk_value / total * 100.0
+            } else {
+                0.0
+            },
             target_risk_weight: match engine {
                 Engine::TargetWeight => effective_ws[i] * 100.0,
                 _ => 100.0,
@@ -717,7 +772,14 @@ fn rebalance_to_weights(
         let drift_pp = excess / total * 100.0;
         if drift_pp > band && excess >= min_trade {
             st.do_sell(
-                leg, excess, row.prices[leg], row.date, costs, min_hold, zone, row.fgi,
+                leg,
+                excess,
+                row.prices[leg],
+                row.date,
+                costs,
+                min_hold,
+                zone,
+                row.fgi,
             );
         }
     }
@@ -761,7 +823,10 @@ fn finalize(
 ) -> BacktestResult {
     let final_value = monthly.last().map(|m| m.total_value).unwrap_or(0.0);
     let end = monthly.last().map(|m| m.date).unwrap_or(bt.end_date);
-    st.flows.push(CashFlow { date: end, amount: final_value });
+    st.flows.push(CashFlow {
+        date: end,
+        amount: final_value,
+    });
 
     let total_return = if st.total_inflow > 0.0 {
         final_value / st.total_inflow - 1.0
@@ -853,16 +918,34 @@ pub fn print_report(r: &BacktestResult) {
     println!("  【收益概览】");
     println!("    总投入资金:       ¥{:>12.2}", r.total_inflow);
     println!("    期末总资产:       ¥{:>12.2}", r.final_value);
-    println!("    总收益:           ¥{:>12.2}", r.final_value - r.total_inflow);
-    println!("    总收益率:                 {:>10.2}%", r.total_return * 100.0);
+    println!(
+        "    总收益:           ¥{:>12.2}",
+        r.final_value - r.total_inflow
+    );
+    println!(
+        "    总收益率:                 {:>10.2}%",
+        r.total_return * 100.0
+    );
     println!("    年化(XIRR):               {:>10.2}%", r.xirr * 100.0);
-    println!("    年化(简单口径):           {:>10.2}%", r.naive_annualized * 100.0);
+    println!(
+        "    年化(简单口径):           {:>10.2}%",
+        r.naive_annualized * 100.0
+    );
     println!();
     println!("  【风险】");
-    println!("    最大回撤(剔除资金流/主口径): {:>8.2}%", r.max_drawdown * 100.0);
-    println!("    最大回撤(含注资/旧口径):    {:>8.2}%", r.max_drawdown_account * 100.0);
+    println!(
+        "    最大回撤(剔除资金流/主口径): {:>8.2}%",
+        r.max_drawdown * 100.0
+    );
+    println!(
+        "    最大回撤(含注资/旧口径):    {:>8.2}%",
+        r.max_drawdown_account * 100.0
+    );
     println!("    （注：月频采样仍不含月内低点，日频口径见 `mns backtest`）");
-    println!("    年化波动:                 {:>10.2}%", r.risk.volatility * 100.0);
+    println!(
+        "    年化波动:                 {:>10.2}%",
+        r.risk.volatility * 100.0
+    );
     println!("    Sharpe:                   {:>10.2}", r.risk.sharpe);
     println!("    Sortino:                  {:>10.2}", r.risk.sortino);
     println!("    Calmar:                   {:>10.2}", r.risk.calmar);
@@ -872,13 +955,20 @@ pub fn print_report(r: &BacktestResult) {
     println!("    现金利息收入:     ¥{:>12.2}", r.cash_interest);
     println!(
         "    费用占期末资产:           {:>10.2}%",
-        if r.final_value > 0.0 { r.total_fees / r.final_value * 100.0 } else { 0.0 }
+        if r.final_value > 0.0 {
+            r.total_fees / r.final_value * 100.0
+        } else {
+            0.0
+        }
     );
     println!();
     println!("  【交易】");
     println!(
         "    买入 {:>3} 次 | 卖出 {:>3} 次 | 合计 {:>3} 次 | 年均 {:.1} 次",
-        r.buy_count, r.sell_count, r.trades.len(), r.trades_per_year
+        r.buy_count,
+        r.sell_count,
+        r.trades.len(),
+        r.trades_per_year
     );
     println!(
         "    其中：注资驱动 {} 笔 / 纯信号驱动 {} 笔（策略换手只看后者）",
@@ -894,7 +984,12 @@ pub fn print_report(r: &BacktestResult) {
     let mut legs: Vec<_> = by_leg.into_iter().collect();
     legs.sort_by_key(|(k, _)| *k);
     for (leg, (n, amt)) in legs {
-        println!("      {} {:>4} 次, ¥{:>12.2}", pad_to_width(LEG_NAMES[leg], 16), n, amt);
+        println!(
+            "      {} {:>4} 次, ¥{:>12.2}",
+            pad_to_width(LEG_NAMES[leg], 16),
+            n,
+            amt
+        );
     }
     println!();
 
@@ -906,7 +1001,9 @@ pub fn print_report(r: &BacktestResult) {
 fn print_yearly(r: &BacktestResult) {
     println!("  【逐年表现】");
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("年份"),
         Cell::new("收益"),
@@ -932,7 +1029,11 @@ fn print_yearly(r: &BacktestResult) {
         let avg_fgi = ms.iter().map(|m| m.signal).sum::<f64>() / ms.len() as f64;
         let last = ms[ms.len() - 1];
         let pct = |v: f64| {
-            if last.total_value > 0.0 { v / last.total_value * 100.0 } else { 0.0 }
+            if last.total_value > 0.0 {
+                v / last.total_value * 100.0
+            } else {
+                0.0
+            }
         };
         let composition = format!(
             "{:.0}/{:.0}/{:.0}/{:.0}%",
@@ -1011,7 +1112,9 @@ pub fn print_comparison(results: &[BacktestResult]) {
     println!("=================================================================");
     println!();
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("策略"),
         Cell::new("年化XIRR"),
@@ -1023,7 +1126,11 @@ pub fn print_comparison(results: &[BacktestResult]) {
         Cell::new("年均交易"),
     ]);
     for r in results {
-        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        let c = if r.xirr >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
         table.add_row(vec![
             Cell::new(&r.name),
             Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
@@ -1050,7 +1157,9 @@ pub fn print_profile_comparison(results: &[BacktestResult]) {
     println!("        档位越高＝底仓越高、择时摆幅越小，回撤未必更低；请按三维指标选档。");
     println!();
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("档位"),
         Cell::new("常驻仓位"),
@@ -1062,7 +1171,11 @@ pub fn print_profile_comparison(results: &[BacktestResult]) {
         Cell::new("费用"),
     ]);
     for r in results {
-        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        let c = if r.xirr >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
         let core = r.monthly.iter().map(|m| m.target_risk_weight).sum::<f64>()
             / r.monthly.len().max(1) as f64;
         let years = match (r.monthly.first(), r.monthly.last()) {
@@ -1097,7 +1210,9 @@ pub fn print_inflow_comparison(results: &[BacktestResult]) {
     println!("=================================================================");
     println!();
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     table.set_header(vec![
         Cell::new("注资方式"),
         Cell::new("年化XIRR"),
@@ -1107,7 +1222,11 @@ pub fn print_inflow_comparison(results: &[BacktestResult]) {
         Cell::new("费用"),
     ]);
     for r in results {
-        let c = if r.xirr >= 0.0 { Color::Green } else { Color::Red };
+        let c = if r.xirr >= 0.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
         table.add_row(vec![
             Cell::new(&r.name),
             Cell::new(format!("{:.2}%", r.xirr * 100.0)).fg(c),
@@ -1166,7 +1285,9 @@ mod tests {
                 assert!(
                     ch.abs() < 0.35,
                     "{} 第{}腿单月跳变 {:.1}% 疑似数据断点",
-                    w[1].date, leg, ch * 100.0
+                    w[1].date,
+                    leg,
+                    ch * 100.0
                 );
             }
         }
@@ -1243,13 +1364,22 @@ mod tests {
 
     #[test]
     fn fifo_应先卖最早批次() {
-        let costs = crate::config::Costs { buy_fee_pct: 0.0, sell_fee_pct: 0.0, cash_annual_yield: 0.0, redemption_tiers: vec![] };
+        let costs = crate::config::Costs {
+            buy_fee_pct: 0.0,
+            sell_fee_pct: 0.0,
+            cash_annual_yield: 0.0,
+            redemption_tiers: vec![],
+        };
         let mut leg = Leg::default();
         leg.buy(10.0, 1.0, d(2020, 1, 1));
         leg.buy(10.0, 5.0, d(2021, 1, 1));
         leg.sell_fifo(10.0, 3.0, d(2023, 1, 1), &costs, 0);
         // 卖掉最早的低成本批次后，剩余成本应为第二批的 5.0
-        assert!((leg.avg_cost() - 5.0).abs() < 1e-9, "avg={}", leg.avg_cost());
+        assert!(
+            (leg.avg_cost() - 5.0).abs() < 1e-9,
+            "avg={}",
+            leg.avg_cost()
+        );
     }
 
     #[test]
@@ -1257,7 +1387,13 @@ mod tests {
         let cfg = AppConfig::default_config();
         let rows = load_main();
         let bt = BacktestConfig::default();
-        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let r = run(
+            &cfg,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         // 跳过建仓初期，检查权重跟踪误差
         let late: Vec<&Monthly> = r.monthly.iter().skip(12).collect();
         let bad = late
@@ -1280,7 +1416,13 @@ mod tests {
         let cfg = AppConfig::default_config();
         let rows = load_main();
         let bt = BacktestConfig::default();
-        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let r = run(
+            &cfg,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         let fear_months: Vec<&Monthly> = r
             .monthly
             .iter()
@@ -1288,8 +1430,8 @@ mod tests {
             .filter(|m| m.signal < cfg.thresholds.extreme_fear)
             .collect();
         if !fear_months.is_empty() {
-            let avg_risk = fear_months.iter().map(|m| m.risk_weight).sum::<f64>()
-                / fear_months.len() as f64;
+            let avg_risk =
+                fear_months.iter().map(|m| m.risk_weight).sum::<f64>() / fear_months.len() as f64;
             assert!(
                 avg_risk > 60.0,
                 "极度恐慌期平均风险仓位仅 {:.1}%，疑似弹药衰减",
@@ -1310,8 +1452,20 @@ mod tests {
             redemption_tiers: vec![],
         };
         let with_cost = AppConfig::default_config();
-        let a = run(&free, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
-        let b = run(&with_cost, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let a = run(
+            &free,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
+        let b = run(
+            &with_cost,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         assert_eq!(a.total_fees, 0.0);
         assert!(b.total_fees > 0.0, "应产生费用");
     }
@@ -1340,8 +1494,20 @@ mod tests {
         narrow.rebalance.band_pp = 1.0;
         let mut wide = AppConfig::default_config();
         wide.rebalance.band_pp = 12.0;
-        let a = run(&narrow, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
-        let b = run(&wide, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let a = run(
+            &narrow,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
+        let b = run(
+            &wide,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         assert!(
             a.trades.len() > b.trades.len(),
             "窄带 {} 应多于宽带 {}",
@@ -1355,7 +1521,13 @@ mod tests {
         let rows = load_main();
         let bt = BacktestConfig::default();
         let cfg = AppConfig::default_config();
-        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let r = run(
+            &cfg,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         assert!(r.cash_interest > 0.0, "闲置现金应有货币基金收益");
     }
 
@@ -1367,15 +1539,22 @@ mod tests {
         let rows = load_main();
         let bt = BacktestConfig::default();
         let cfg = AppConfig::default_config();
-        let r = run(&cfg, &bt, &SignalConfig::default(), Engine::TargetWeight, &rows);
+        let r = run(
+            &cfg,
+            &bt,
+            &SignalConfig::default(),
+            Engine::TargetWeight,
+            &rows,
+        );
         assert_eq!(
             r.inflow_driven_trades + r.signal_driven_trades,
             r.trades.len(),
             "两类和应等于总笔数"
         );
         assert!(r.trades_per_year <= 36.0, "保留上限兜底");
-        let years = (r.monthly.last().unwrap().date - r.monthly.first().unwrap().date)
-            .num_days() as f64 / 365.0;
+        let years = (r.monthly.last().unwrap().date - r.monthly.first().unwrap().date).num_days()
+            as f64
+            / 365.0;
         let signal_per_year = r.signal_driven_trades as f64 / years;
         assert!(
             signal_per_year < cfg.backtest.annual_trade_budget_min as f64,
@@ -1395,15 +1574,36 @@ mod tests {
         let bt = BacktestConfig::spanning(&rows, 100_000.0, 50_000.0);
         let mut results = Vec::new();
         for (name, sc) in [
-            ("情绪锚(平滑1月)", SignalConfig { smooth_months: 1, ..SignalConfig::default() }),
+            (
+                "情绪锚(平滑1月)",
+                SignalConfig {
+                    smooth_months: 1,
+                    ..SignalConfig::default()
+                },
+            ),
             ("情绪锚(平滑3月)", SignalConfig::default()),
-            ("情绪锚(平滑6月)", SignalConfig { smooth_months: 6, ..SignalConfig::default() }),
+            (
+                "情绪锚(平滑6月)",
+                SignalConfig {
+                    smooth_months: 6,
+                    ..SignalConfig::default()
+                },
+            ),
             ("趋势锚+情绪倾斜", SignalConfig::trend_tilt()),
-            ("趋势锚(倾斜0)", SignalConfig { tilt_pp: 0.0, ..SignalConfig::trend_tilt() }),
+            (
+                "趋势锚(倾斜0)",
+                SignalConfig {
+                    tilt_pp: 0.0,
+                    ..SignalConfig::trend_tilt()
+                },
+            ),
         ] {
             let r = run(&cfg, &bt, &sc, Engine::TargetWeight, &rows);
             assert!(r.xirr.is_finite(), "{name} 的 XIRR 应有限");
-            assert!(r.max_drawdown >= 0.0 && r.max_drawdown <= 1.0, "{name} 回撤应合法");
+            assert!(
+                r.max_drawdown >= 0.0 && r.max_drawdown <= 1.0,
+                "{name} 回撤应合法"
+            );
             results.push((name, r));
         }
         // 平滑窗口增大不应增加交易频次（1月 >= 3月 >= 6月）

@@ -101,7 +101,9 @@ impl ButlerTask {
 /// 提议一个任务的判定结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskVerdict {
-    Accepted { id: String },
+    Accepted {
+        id: String,
+    },
     /// 同一事件已有任务（或已归档不久）。
     Duplicate,
     /// 今天已经建满 2 个。
@@ -109,7 +111,10 @@ pub enum TaskVerdict {
     /// 活跃队列已满。
     QueueFull,
     /// 到点时间已经过去：闹钟不能设在昨天。
-    TooSoon { now: DateTime<Local>, due_at: DateTime<Local> },
+    TooSoon {
+        now: DateTime<Local>,
+        due_at: DateTime<Local>,
+    },
     /// 意图写成了预测，不是检查。
     IntentNotCheck(String),
 }
@@ -125,7 +130,9 @@ pub fn validate_intent(intent: &str) -> Result<(), String> {
     }
     const CHECK_WORDS: [&str; 5] = ["检查", "核对", "确认", "看", "复盘"];
     if !CHECK_WORDS.iter().any(|word| text.contains(word)) {
-        return Err("任务意图要写「到时检查什么」，例如「到点检查当天是否有计划外操作」".to_owned());
+        return Err(
+            "任务意图要写「到时检查什么」，例如「到点检查当天是否有计划外操作」".to_owned(),
+        );
     }
     if let Some(word) = PREDICT_WORDS.iter().find(|word| text.contains(*word)) {
         return Err(format!("任务意图不能是预测（含「{word}」）"));
@@ -368,7 +375,10 @@ mod tests {
     use chrono::{Duration, TimeZone};
 
     fn now() -> DateTime<Local> {
-        Local.with_ymd_and_hms(2026, 11, 16, 9, 0, 0).single().unwrap()
+        Local
+            .with_ymd_and_hms(2026, 11, 16, 9, 0, 0)
+            .single()
+            .unwrap()
     }
 
     fn task(key: &str, hours: i64) -> ButlerTask {
@@ -529,7 +539,9 @@ mod tests {
         board.propose(task("on-time", 0), now());
         assert_eq!(board.due(now()).len(), 1);
         assert_eq!(
-            board.due(now() + Duration::hours(EXPIRE_GRACE_HOURS + 1)).len(),
+            board
+                .due(now() + Duration::hours(EXPIRE_GRACE_HOURS + 1))
+                .len(),
             0,
             "超过宽限期就不再是「该检查」而是「早就错过」"
         );

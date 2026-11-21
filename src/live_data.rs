@@ -26,7 +26,11 @@ pub const LEG_OF: [usize; 4] = [0, 0, 1, 2];
 /// 腿内权重（纳指腿由两只 QDII 各半合成，来自实盘持仓市值比）
 pub const LEG_IN_WEIGHT: [f64; 4] = [0.5, 0.5, 1.0, 1.0];
 
-pub const LEG_NAMES: [&str; 3] = ["纳指QDII(018966+539001)", "300红利低波(007605)", "黄金(020341)"];
+pub const LEG_NAMES: [&str; 3] = [
+    "纳指QDII(018966+539001)",
+    "300红利低波(007605)",
+    "黄金(020341)",
+];
 
 /// 通道映射由数据集类型 + 腿序号决定（见 `audit::channel`），此处不再重复定义。
 
@@ -223,7 +227,11 @@ impl LiveDataset {
     pub fn freshness(&self, sla_days: u32) -> Result<Freshness> {
         let last = self.days.last().context("数据集无行")?.date;
         let today = chrono::Local::now().date_naive();
-        Ok(Freshness { last_date: last, age_days: (today - last).num_days(), sla_days })
+        Ok(Freshness {
+            last_date: last,
+            age_days: (today - last).num_days(),
+            sla_days,
+        })
     }
 
     /// 把四只基金合成为三条腿的净值指数，并以 `start_idx` 为起点归一到 1.0。
@@ -247,8 +255,7 @@ impl LiveDataset {
 
     /// 触发三个数据集的重建（调用仓库内 Python 脚本，单一实现避免两套抓取逻辑）。
     pub fn update_all(config: &AppConfig) -> Result<String> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".agents/skills/mns-backtest/data");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".agents/skills/mns-backtest/data");
         let mut text = String::new();
         for (script, out) in [
             ("build_live_dataset.py", Self::resolve_path(config)),
@@ -456,7 +463,11 @@ impl LongDataset {
     pub fn freshness(&self, sla_days: u32) -> Result<Freshness> {
         let last = self.days.last().context("长周期数据集无行")?.date;
         let today = chrono::Local::now().date_naive();
-        Ok(Freshness { last_date: last, age_days: (today - last).num_days(), sla_days })
+        Ok(Freshness {
+            last_date: last,
+            age_days: (today - last).num_days(),
+            sla_days,
+        })
     }
 }
 
@@ -519,13 +530,17 @@ impl LiveDataset {
 
 impl LongDataset {
     pub fn to_bars(&self) -> BarSeries {
-        let bars = self.days.iter().map(|d| Bar {
-            date: d.date,
-            fgi: d.fgi,
-            fgi_age_days: d.fgi_age_days,
-            prices: d.prices,
-            unit_nav: None,
-        }).collect();
+        let bars = self
+            .days
+            .iter()
+            .map(|d| Bar {
+                date: d.date,
+                fgi: d.fgi,
+                fgi_age_days: d.fgi_age_days,
+                prices: d.prices,
+                unit_nav: None,
+            })
+            .collect();
         // 口径限制以 meta.limitations 为唯一来源，避免与手写条目重复
         let mut caveats = Vec::new();
         if !self.meta.purpose.is_empty() {
@@ -597,7 +612,9 @@ mod tests {
     #[test]
     fn 单资产实验数据集按名称加载且三腿同值() {
         let cfg = AppConfig::default_config();
-        let Ok(ds) = LongDataset::load_named(&cfg, "hs300") else { return };
+        let Ok(ds) = LongDataset::load_named(&cfg, "hs300") else {
+            return;
+        };
         assert!(ds.meta.single_asset, "hs300 应标记为单资产实验数据集");
         assert!(!ds.days.is_empty());
         assert!(!ds.meta.label.is_empty(), "实验数据集应有自己的标签");
@@ -610,11 +627,20 @@ mod tests {
     #[test]
     fn 真实数据集应覆盖实盘入场日且无前视() {
         let cfg = AppConfig::default_config();
-        let Ok(ds) = LiveDataset::load(&cfg) else { return };
+        let Ok(ds) = LiveDataset::load(&cfg) else {
+            return;
+        };
         let entry = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
-        assert!(ds.days.iter().any(|d| d.date >= entry), "数据集必须覆盖真实入场日");
+        assert!(
+            ds.days.iter().any(|d| d.date >= entry),
+            "数据集必须覆盖真实入场日"
+        );
         // 任何可用 FGI 都必须严格早于其所在交易日
-        assert!(ds.days.iter().all(|d| d.fgi.is_none() || d.fgi_age_days >= 1),
-                "FGI 必须至少滞后 1 天，否则存在前视偏差");
+        assert!(
+            ds.days
+                .iter()
+                .all(|d| d.fgi.is_none() || d.fgi_age_days >= 1),
+            "FGI 必须至少滞后 1 天，否则存在前视偏差"
+        );
     }
 }

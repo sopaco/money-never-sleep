@@ -12,10 +12,10 @@ use std::sync::{Arc, OnceLock};
 use chrono::{Local, Timelike};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
+use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants};
 use gpui_kit::component::input::{Enter, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::Disableable;
 use gpui_kit::*;
 
 use crate::butler::chat::{self, ChatSnapshotData};
@@ -182,11 +182,7 @@ impl ButlerView {
             self.scroll.scroll_to_top_of_item(index);
         }
         self.pending_notice = None;
-        self.notice_focus = Some(NoticeFocus {
-            index,
-            at,
-            text,
-        });
+        self.notice_focus = Some(NoticeFocus { index, at, text });
         cx.notify();
     }
 
@@ -257,10 +253,7 @@ impl ButlerView {
     /// 横幅文案本身就是答案。
     fn offline_banner(&self, cx: &mut Context<Self>) -> Div {
         let (title, body) = if self.retrying {
-            (
-                "正在连接守护进程…",
-                "最长等 8 秒，起来了会自动回到会话。",
-            )
+            ("正在连接守护进程…", "最长等 8 秒，起来了会自动回到会话。")
         } else {
             (
                 "没连上守护进程",
@@ -617,8 +610,7 @@ impl ButlerView {
         }
         self.clear_armed = false;
         if !self.send_signal(Signal::ChatClear) {
-            self.error =
-                Some("没连上守护进程，这次没清。连上后再试一次。".to_owned());
+            self.error = Some("没连上守护进程，这次没清。连上后再试一次。".to_owned());
         }
         cx.notify();
     }
@@ -666,8 +658,8 @@ impl Render for ButlerView {
         }
         // 流式正文：守护进程逐段推来，气泡逐段生长；快照落地（等待解除）
         // 后由正式气泡顶上。
-        let streaming = (self.waiting && !self.stream_buffer.is_empty())
-            .then(|| self.stream_buffer.as_str());
+        let streaming =
+            (self.waiting && !self.stream_buffer.is_empty()).then(|| self.stream_buffer.as_str());
         if let Some(text) = streaming {
             stream = stream.child(streaming_row(text));
         }
@@ -812,11 +804,7 @@ impl Render for ButlerView {
                         )),
                     ),
             )
-            .children(
-                self.notice_focus
-                    .is_some()
-                    .then(|| self.notice_banner(cx)),
-            )
+            .children(self.notice_focus.is_some().then(|| self.notice_banner(cx)))
             .children((!self.online).then(|| self.offline_banner(cx)))
             .child(
                 div()
@@ -1238,10 +1226,7 @@ mod tests {
     }
 
     /// 断言上行通道里是一条 `ChatSend`，且文本相符。
-    fn expect_chat_send(
-        uplink: &mut tokio::sync::mpsc::UnboundedReceiver<Signal>,
-        expected: &str,
-    ) {
+    fn expect_chat_send(uplink: &mut tokio::sync::mpsc::UnboundedReceiver<Signal>, expected: &str) {
         match uplink.try_recv().expect("应递出 ChatSend") {
             Signal::ChatSend { text } => assert_eq!(text, expected, "递出的话应与输入一致"),
             other => panic!("应递 ChatSend，实际 {other:?}"),
@@ -1430,9 +1415,8 @@ mod tests {
 
         let value = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                view.input.update(cx, |input, cx| {
-                    input.set_value("插队的一句", window, cx)
-                });
+                view.input
+                    .update(cx, |input, cx| input.set_value("插队的一句", window, cx));
                 view.send(window, cx);
                 view.input.read(cx).value().to_string()
             })
@@ -1660,10 +1644,7 @@ mod tests {
             assert!(view.clear_armed, "第一次点击只进入待确认");
             assert_eq!(view.session.messages.len(), 1, "第一次点击不删消息");
         });
-        assert!(
-            uplink.try_recv().is_err(),
-            "第一次点击不该递 ChatClear"
-        );
+        assert!(uplink.try_recv().is_err(), "第一次点击不该递 ChatClear");
 
         // 第二次：意图递给守护进程；本地副本等快照整帧替换，不抢先清。
         view.update(cx, |view, cx| view.clear_session(cx));
@@ -1702,9 +1683,8 @@ mod tests {
         targeted.notice_id = Some("n1-abc".to_owned());
         session.push(targeted);
         session.push(Message::butler(Local::now(), "后来的一条"));
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            ButlerView::with_session(session, facts(), window, cx)
-        });
+        let (view, cx) =
+            cx.add_window_view(|window, cx| ButlerView::with_session(session, facts(), window, cx));
 
         cx.update(|window, cx| {
             window.refresh();

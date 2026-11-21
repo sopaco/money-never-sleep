@@ -147,12 +147,10 @@ fn cmd_config(key: Option<String>, value: Option<String>) -> Result<()> {
             let content = toml::to_string_pretty(&config)?;
             println!("{}", content);
         }
-        (Some(k), None) => {
-            match config.get_value(&k) {
-                Some(v) => println!("{} = {}", k, v),
-                None => anyhow::bail!("未知的配置项: {}", k),
-            }
-        }
+        (Some(k), None) => match config.get_value(&k) {
+            Some(v) => println!("{} = {}", k, v),
+            None => anyhow::bail!("未知的配置项: {}", k),
+        },
         (Some(k), Some(v)) => {
             // 修改配置项：校验通过后才落盘，避免写出无法加载的配置
             let old_config = config.clone();

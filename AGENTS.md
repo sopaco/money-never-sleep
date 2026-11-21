@@ -30,11 +30,11 @@
   `clicked` 同 id 各一条）后拉起 `mns-gui --window butler --notice <id>`，
   窗口顶部显示通知上下文并滚动/高亮到对应消息；窗口已开则只 poke
   `Signal::NoticeFocus` 定位并置前，不重开、不重弹。
-  管家健康落在 `~/.mns/agent/butler/health.json`（`orchestrator::record_health`），
-  托盘读它亮红灯（菜单栏只放 22pt 图标，结论在 tooltip 与菜单首行——macOS 26
-  菜单栏拥挤时会把带标题的状态项整项藏进溢出区）；同一判断还会把 Dock 图标整枚
-  换成带红点的版本（`assets/icon-dock-alert.png`，`set_dock_alert`），保证菜单栏
-  图标被藏时仍有一条可见告警。`--tray` / `--background` 现在只表示「不自动开主窗」，
+  管家健康由 `orchestrator::record_health` 落在 `~/.mns/agent/butler/health.json`，
+  并随 `Signal::Brief` 的 `health` 字段一起回给宿主（宿主不再自己读状态文件），
+  托盘据此亮红灯（菜单栏只放 22pt 图标，结论在 tooltip 与菜单首行——macOS 26
+  菜单栏拥挤时会把带标题的状态项整项藏进溢出区）；同一判断还会把 Dock 图标
+  换成带红点的版本（`set_dock_alert`），保证菜单栏图标被藏时仍有一条可见告警。`--tray` / `--background` 现在只表示「不自动开主窗」，
   宿主仍常驻 Dock。
 - **Butler daemon**: `MNS.app/Contents/MacOS/mns-butlerd` is spawned by the GUI and keeps
   evaluating butler wake sources after the window closes. It reads the ledger directly
@@ -90,13 +90,13 @@ mns backtest legacy   # 已降级，结论不可迁移到实盘
 ```
 更多命令与数据契约见 [`.agents/skills/mns-backtest/SKILL.md`](.agents/skills/mns-backtest/SKILL.md)，
 实盘买卖决策编排见 [`.agents/skills/mns-advisor/SKILL.md`](.agents/skills/mns-advisor/SKILL.md)，
-功能地图与正确用法见 [`README_zh.md`](README_zh.md)，整改结论见 [`docs/remediation-2026-11-08.md`](docs/remediation-2026-11-08.md)。
+功能地图与正确用法见 [`README_zh.md`](README_zh.md)。
 
 使用 mns 辅助实盘决策前，先读 mns-advisor 的 `references/buy-sell-playbook.md` 与
 `references/evidence-boundary.md`：情绪信号已被证伪为择时依据，不得据新闻或 FGI 给出买卖点。
-该约束适用于 mns 助手、报告与买卖决策编排；管家（butler）是自主人格，按
-`docs/butler-persona-upgrade-2026-11-17.md` 的双人格边界执行——会话可给倾向性
-观点（自我标注、数字同源、不谎称下单），通知 banner 仍走最严话术口径。
+该约束适用于 mns 助手、报告与买卖决策编排；管家（butler）是自主人格，按双人格边界
+执行——会话可给倾向性观点（自我标注、数字同源、不谎称下单），通知 banner 仍走最严
+话术口径。
 
 ### Package (Windows)
 ```powershell

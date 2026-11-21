@@ -65,7 +65,11 @@ async fn fetch_fund_entry(code: &str) -> Result<Option<serde_json::Value>> {
 
     let json: serde_json::Value = resp.json().await.context("解析东方财富响应失败")?;
 
-    if !json.get("Success").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !json
+        .get("Success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
 
@@ -124,21 +128,30 @@ pub struct FundCandidate {
 /// 只做「建议 + 依据」，绝不静默改用户的类别选择：猜错的类别会让整条
 /// 再平衡链路算错，代价远高于让用户多点一次。
 pub fn category_hint(name: &str, fund_type: &str) -> (Option<&'static str>, &'static str) {
-    let quoted = fund_type.contains("债券") || fund_type.contains("货币") || fund_type.contains("FOF");
+    let quoted =
+        fund_type.contains("债券") || fund_type.contains("货币") || fund_type.contains("FOF");
 
     if quoted {
         return (None, "债券/货币/FOF 不属于这三条腿，请确认后再归。");
     }
     // 黄金股/矿业是股票敞口，不是商品腿。这条必须先于「名称含金」判断。
-    if name.contains("黄金股") || name.contains("矿业") || (name.contains("黄金") && name.contains("股票")) {
+    if name.contains("黄金股")
+        || name.contains("矿业")
+        || (name.contains("黄金") && name.contains("股票"))
+    {
         return (None, "黄金股/矿业属于股票敞口，不是商品腿。");
     }
-    if fund_type.contains("QDII-商品") || (fund_type.contains("指数型-其他") && name.contains("金")) {
-        return (Some("counter_cyclical"), "商品类（黄金/原油等）对应逆周期腿。");
+    if fund_type.contains("QDII-商品") || (fund_type.contains("指数型-其他") && name.contains("金"))
+    {
+        return (
+            Some("counter_cyclical"),
+            "商品类（黄金/原油等）对应逆周期腿。",
+        );
     }
     if fund_type.contains("指数型-海外股票") {
-        const CROSS_MARKET: [&str; 9] =
-            ["全球", "海外", "亚太", "新兴", "恒生", "港股", "欧洲", "日本", "德国"];
+        const CROSS_MARKET: [&str; 9] = [
+            "全球", "海外", "亚太", "新兴", "恒生", "港股", "欧洲", "日本", "德国",
+        ];
         if CROSS_MARKET.iter().any(|word| name.contains(word)) {
             return (None, "跨市场指数，请确认是否归入美股腿。");
         }
@@ -148,8 +161,7 @@ pub fn category_hint(name: &str, fund_type: &str) -> (Option<&'static str>, &'st
         return (None, "QDII 主动基金，跨市场，请确认归属。");
     }
     if fund_type.contains("指数型-股票") {
-        const CN_MARKET: [&str; 7] =
-            ["沪深", "中证", "上证", "深证", "红利", "科创", "创业"];
+        const CN_MARKET: [&str; 7] = ["沪深", "中证", "上证", "深证", "红利", "科创", "创业"];
         if CN_MARKET.iter().any(|word| name.contains(word)) {
             return (Some("cn_stocks"), "A 股宽基/红利指数，对应 A 股腿。");
         }
@@ -180,11 +192,19 @@ fn parse_fund_candidates(json: &serde_json::Value) -> Vec<FundCandidate> {
         };
         let code = {
             let code = json_text(base.get("FCODE"));
-            if code.is_empty() { json_text(row.get("CODE")) } else { code }
+            if code.is_empty() {
+                json_text(row.get("CODE"))
+            } else {
+                code
+            }
         };
         let name = {
             let name = json_text(base.get("SHORTNAME"));
-            if name.is_empty() { json_text(row.get("NAME")) } else { name }
+            if name.is_empty() {
+                json_text(row.get("NAME"))
+            } else {
+                name
+            }
         };
         if code.is_empty() || name.is_empty() {
             continue;
@@ -530,7 +550,10 @@ mod tests {
             Some("counter_cyclical")
         );
         assert_eq!(category_hint("华夏恒生ETF联接A", "指数型-海外股票").0, None);
-        assert_eq!(category_hint("中证黄金产业股票指数A", "指数型-股票").0, None);
+        assert_eq!(
+            category_hint("中证黄金产业股票指数A", "指数型-股票").0,
+            None
+        );
     }
 
     #[test]
@@ -587,6 +610,9 @@ mod tests {
         assert_eq!(rows[0].nav, Some(7.9583));
         assert_eq!(rows[1].nav, Some(2.8944));
         assert_eq!(rows[1].company, "华安基金");
-        assert!(rows.iter().all(|row| row.suggested == Some("counter_cyclical")));
+        assert!(
+            rows.iter()
+                .all(|row| row.suggested == Some("counter_cyclical"))
+        );
     }
 }

@@ -169,9 +169,9 @@ impl Database {
     /// 新库余额为 0 也写——标记台账启用日。CREATE TABLE IF NOT EXISTS 原地
     /// 升级，用户已有数据零接触。
     fn ensure_cash_flow_opening(&self) -> Result<()> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM cash_flows", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cash_flows", [], |row| row.get(0))?;
         if count > 0 {
             return Ok(());
         }
@@ -255,10 +255,9 @@ impl Database {
     /// (id, flow_date, amount, kind, note) 列序 → CashFlow。
     fn cash_flow_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CashFlow> {
         let date_str: String = row.get(1)?;
-        let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                0, rusqlite::types::Type::Text, Box::new(e),
-            ))?;
+        let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok(CashFlow {
             id: row.get(0)?,
             flow_date: date,
@@ -304,10 +303,13 @@ impl Database {
 
     /// 资产曲线的追踪起点（最早快照日期）。表为空时返回 None。
     pub fn portfolio_tracking_since(&self) -> Result<Option<chrono::NaiveDate>> {
-        let since: Option<String> = self.conn
-            .query_row("SELECT MIN(snap_date) FROM portfolio_snapshots", [], |row| {
-                row.get(0)
-            })
+        let since: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MIN(snap_date) FROM portfolio_snapshots",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(None);
         Ok(since.and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()))
     }
@@ -327,15 +329,18 @@ impl Database {
 
     /// 每日总资产序列（snap_date 升序, total_value）——实际回撤的输入。
     pub fn portfolio_snapshot_series(&self) -> Result<Vec<(chrono::NaiveDate, f64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT snap_date, total_value FROM portfolio_snapshots ORDER BY snap_date",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT snap_date, total_value FROM portfolio_snapshots ORDER BY snap_date")?;
         let rows = stmt.query_map([], |row| {
             let date_str: String = row.get(0)?;
-            let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    0, rusqlite::types::Type::Text, Box::new(e),
-                ))?;
+            let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             Ok((date, row.get::<_, f64>(1)?))
         })?;
         let mut out = Vec::new();
@@ -347,8 +352,12 @@ impl Database {
 
     /// 某标的价格历史的 (最早日, 最新日)。无记录返回 None——C4 就绪进度用。
     /// MIN/MAX 在零行时返回 NULL（聚合恒有一行），故列按可空读取。
-    pub fn price_history_span(&self, code: &str) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>> {
-        let row: (Option<String>, Option<String>) = self.conn
+    pub fn price_history_span(
+        &self,
+        code: &str,
+    ) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>> {
+        let row: (Option<String>, Option<String>) = self
+            .conn
             .query_row(
                 "SELECT MIN(price_date), MAX(price_date) FROM price_history WHERE asset_code = ?",
                 params![code],
@@ -431,7 +440,13 @@ impl Database {
         }
     }
 
-    pub fn buy_position(&self, code: &str, shares: f64, price: f64, note: Option<&str>) -> Result<()> {
+    pub fn buy_position(
+        &self,
+        code: &str,
+        shares: f64,
+        price: f64,
+        note: Option<&str>,
+    ) -> Result<()> {
         if shares <= 0.0 {
             anyhow::bail!("买入份额必须为正数");
         }
@@ -623,16 +638,18 @@ impl Database {
             "SELECT snapshot_date, score FROM fear_greed_snapshots
              WHERE snapshot_date > ? ORDER BY snapshot_date ASC",
         )?;
-        let rows = stmt
-            .query_map(params![cutoff], |row| {
-                let date_str: String = row.get(0)?;
-                let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                        0, rusqlite::types::Type::Text, Box::new(e),
-                    ))?;
-                let score: f64 = row.get(1)?;
-                Ok((date, score))
+        let rows = stmt.query_map(params![cutoff], |row| {
+            let date_str: String = row.get(0)?;
+            let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
+            let score: f64 = row.get(1)?;
+            Ok((date, score))
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -650,10 +667,13 @@ impl Database {
         )?;
         let mut rows = stmt.query_map(params![], |row| {
             let date_str: String = row.get(0)?;
-            let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    0, rusqlite::types::Type::Text, Box::new(e),
-                ))?;
+            let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             Ok(FearGreedSnapshot {
                 date,
                 score: row.get(1)?,
@@ -771,10 +791,7 @@ mod tests {
         assert_eq!(review.out_of_plan, 1);
         assert_eq!(review.hot_calm, 1);
         assert_eq!(review.unmarked, 2);
-        assert_eq!(
-            review.last_trade,
-            NaiveDate::from_ymd_opt(2026, 11, 11)
-        );
+        assert_eq!(review.last_trade, NaiveDate::from_ymd_opt(2026, 11, 11));
     }
 
     /// 文件库的测试脚手架：`open()` 绑定真实账户路径，测试必须落临时目录
@@ -859,7 +876,8 @@ mod tests {
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .expect("读者连接");
-            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             start.wait();
             for _ in 0..50 {
                 let count: i64 = conn

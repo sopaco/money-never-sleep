@@ -271,8 +271,10 @@ fn butler_line(butler: Option<&Path>) -> String {
              `task done <id>`",
             quoted(path)
         ),
-        None => "- 未检测到随应用安装的 mns-butler。无法查询或创建到点任务，请如实告知用户，不要猜测。"
-            .to_owned(),
+        None => {
+            "- 未检测到随应用安装的 mns-butler。无法查询或创建到点任务，请如实告知用户，不要猜测。"
+                .to_owned()
+        }
     }
 }
 

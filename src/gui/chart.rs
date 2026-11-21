@@ -203,8 +203,8 @@ mod layout_tests {
     // `#[test]` with gpui-kit's macro inside the expansion and recurse forever.
     use gpui_kit::base::StyledExt;
     use gpui_kit::{
-        AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
-        StatefulInteractiveElement, Styled, TestAppContext, Window, div, px, size,
+        AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
+        Render, StatefulInteractiveElement, Styled, TestAppContext, Window, div, px, size,
     };
 
     /// Renders the chart inside the same flex chain as the real dashboard.

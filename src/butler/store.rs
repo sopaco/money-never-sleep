@@ -13,7 +13,7 @@
 //!    而不是拿自己启动时的旧快照整体覆盖。
 
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -97,8 +97,13 @@ pub struct WriterLock {
 /// 返回 `None` 表示超时（另一个写者卡住了）或锁文件打不开：调用方降级
 /// 为无锁写入并继续，与历史行为一致。
 pub fn lock_writers(lock_path: &Path, timeout: Duration) -> Option<WriterLock> {
-    if let Some(parent) = lock_path.parent() && let Err(error) = fs::create_dir_all(parent) {
-        eprintln!("管家状态写锁: 创建锁目录 {} 失败（{error}），本轮无锁写入", lock_path.display());
+    if let Some(parent) = lock_path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "管家状态写锁: 创建锁目录 {} 失败（{error}），本轮无锁写入",
+            lock_path.display()
+        );
         return None;
     }
     let file = match fs::OpenOptions::new()
@@ -109,7 +114,10 @@ pub fn lock_writers(lock_path: &Path, timeout: Duration) -> Option<WriterLock> {
     {
         Ok(file) => file,
         Err(error) => {
-            eprintln!("管家状态写锁: 打开写锁 {} 失败（{error}），本轮无锁写入", lock_path.display());
+            eprintln!(
+                "管家状态写锁: 打开写锁 {} 失败（{error}），本轮无锁写入",
+                lock_path.display()
+            );
             return None;
         }
     };
@@ -143,7 +151,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mns-butler-store-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mns-butler-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -154,12 +163,7 @@ mod tests {
             .map(|entries| {
                 entries
                     .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .ends_with(".tmp")
-                    })
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     .collect()
             })
@@ -170,7 +174,10 @@ mod tests {
     fn 写入后能读回且不留临时文件() {
         let dir = scratch("roundtrip");
         let path = dir.join("state.json");
-        assert!(read_json::<Sample>(&path).unwrap().is_none(), "缺失文件应返回 None");
+        assert!(
+            read_json::<Sample>(&path).unwrap().is_none(),
+            "缺失文件应返回 None"
+        );
 
         write_json(&path, &Sample { value: 7 }).unwrap();
         let loaded: Sample = read_json(&path).unwrap().unwrap();
@@ -213,7 +220,13 @@ mod tests {
             let path = path.clone();
             handles.push(std::thread::spawn(move || {
                 for seq in 0..25u32 {
-                    write_json(&path, &Sample { value: writer * 100 + seq }).unwrap();
+                    write_json(
+                        &path,
+                        &Sample {
+                            value: writer * 100 + seq,
+                        },
+                    )
+                    .unwrap();
                 }
             }));
         }

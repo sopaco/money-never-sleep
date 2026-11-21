@@ -13,7 +13,7 @@ use gpui_kit::*;
 
 use crate::agent::{EntryKind, PermissionPolicy, RunState, TimelineEntry};
 use crate::gui::components::*;
-use crate::gui::conversations::{strip_decision_block, ConversationSummary};
+use crate::gui::conversations::{ConversationSummary, strip_decision_block};
 use crate::gui::theme::*;
 use crate::gui::{AgentPanel, AppShell, CloseAgentPanel, ViewedConversation};
 

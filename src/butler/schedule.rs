@@ -32,7 +32,9 @@ pub enum WakeSource {
 pub enum WakeVerdict {
     Wake,
     /// 距上次定时巡检不足最小间隔。
-    TooSoon { next_allowed: DateTime<Local> },
+    TooSoon {
+        next_allowed: DateTime<Local>,
+    },
     /// 同一事件重复到达（GUI 补写日志、重试）。
     Duplicate,
 }
@@ -81,7 +83,8 @@ impl WakeScheduler {
     pub fn request(&mut self, source: &WakeSource, now: DateTime<Local>) -> WakeVerdict {
         match source {
             WakeSource::Scheduled => {
-                let gap = chrono::Duration::hours(self.min_interval_hours.max(MIN_SCHEDULED_GAP_HOURS));
+                let gap =
+                    chrono::Duration::hours(self.min_interval_hours.max(MIN_SCHEDULED_GAP_HOURS));
                 if let Some(last) = self.last_scheduled
                     && now < last + gap
                 {
@@ -251,7 +254,10 @@ impl SpeakLedger {
     }
 
     fn spoken_since(&self, cutoff: DateTime<Local>) -> usize {
-        self.records.iter().filter(|record| record.at >= cutoff).count()
+        self.records
+            .iter()
+            .filter(|record| record.at >= cutoff)
+            .count()
     }
 
     fn spoke_about(&self, trigger: &str, cutoff: DateTime<Local>) -> bool {
@@ -491,7 +497,10 @@ pub fn is_decision_day(now: DateTime<Local>, decision_weekday: u32) -> bool {
 /// 本地日期偏移，测试里构造时间用。
 pub fn local_midnight(day: NaiveDate) -> DateTime<Local> {
     let naive = day.and_hms_opt(9, 0, 0).expect("合法时间");
-    Local.from_local_datetime(&naive).single().expect("本地时间唯一")
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .expect("本地时间唯一")
 }
 
 #[cfg(test)]
@@ -518,11 +527,20 @@ mod tests {
     fn 定时巡检间隔夹到至少四小时() {
         let mut scheduler = WakeScheduler::with_interval(1);
         assert_eq!(scheduler.min_interval_hours, MIN_SCHEDULED_GAP_HOURS);
-        assert_eq!(scheduler.request(&WakeSource::Scheduled, at(16, 9)), WakeVerdict::Wake);
-        assert_eq!(scheduler.request(&WakeSource::Scheduled, at(16, 12)), WakeVerdict::TooSoon {
-            next_allowed: at(16, 13)
-        });
-        assert_eq!(scheduler.request(&WakeSource::Scheduled, at(16, 13)), WakeVerdict::Wake);
+        assert_eq!(
+            scheduler.request(&WakeSource::Scheduled, at(16, 9)),
+            WakeVerdict::Wake
+        );
+        assert_eq!(
+            scheduler.request(&WakeSource::Scheduled, at(16, 12)),
+            WakeVerdict::TooSoon {
+                next_allowed: at(16, 13)
+            }
+        );
+        assert_eq!(
+            scheduler.request(&WakeSource::Scheduled, at(16, 13)),
+            WakeVerdict::Wake
+        );
     }
 
     #[test]
@@ -532,7 +550,10 @@ mod tests {
             id: "flow-42".to_owned(),
         };
         assert_eq!(scheduler.request(&event, at(16, 10)), WakeVerdict::Wake);
-        assert_eq!(scheduler.request(&event, at(16, 10)), WakeVerdict::Duplicate);
+        assert_eq!(
+            scheduler.request(&event, at(16, 10)),
+            WakeVerdict::Duplicate
+        );
         let other = WakeSource::Ledger {
             id: "flow-43".to_owned(),
         };
@@ -562,11 +583,13 @@ mod tests {
 
     #[test]
     fn 没有候选时保持沉默() {
-        let decision = decide(&[], at(16, 10), &SpeakPolicy::default(), &SpeakLedger::default());
-        assert_eq!(
-            decision,
-            SpeakDecision::Silent(SilentBecause::NothingToSay)
+        let decision = decide(
+            &[],
+            at(16, 10),
+            &SpeakPolicy::default(),
+            &SpeakLedger::default(),
         );
+        assert_eq!(decision, SpeakDecision::Silent(SilentBecause::NothingToSay));
     }
 
     #[test]
@@ -577,7 +600,12 @@ mod tests {
         };
         let row = candidate(SpeakReason::ActionableStep, "2026-11-20:us_stocks");
         assert_eq!(
-            decide(std::slice::from_ref(&row), at(16, 10), &policy, &SpeakLedger::default()),
+            decide(
+                std::slice::from_ref(&row),
+                at(16, 10),
+                &policy,
+                &SpeakLedger::default()
+            ),
             SpeakDecision::Silent(SilentBecause::Paused)
         );
     }
@@ -647,17 +675,30 @@ mod tests {
         // 当天已经说过一次 → 每日上限。
         ledger.record(at(16, 9), &row);
         assert_eq!(
-            decide(&[candidate(SpeakReason::OffPlanBehavior, "trade-7")], at(16, 14), &policy, &ledger),
+            decide(
+                &[candidate(SpeakReason::OffPlanBehavior, "trade-7")],
+                at(16, 14),
+                &policy,
+                &ledger
+            ),
             SpeakDecision::Silent(SilentBecause::DailyCap)
         );
 
         // 换一天可以再说，但 7 天内不超过 3 次。
         let mut ledger = SpeakLedger::default();
         for (day, trigger) in [(10, "a"), (11, "b"), (12, "c")] {
-            ledger.record(at(day, 10), &candidate(SpeakReason::ActionableStep, trigger));
+            ledger.record(
+                at(day, 10),
+                &candidate(SpeakReason::ActionableStep, trigger),
+            );
         }
         assert_eq!(
-            decide(&[candidate(SpeakReason::PromiseDue, "d")], at(13, 10), &policy, &ledger),
+            decide(
+                &[candidate(SpeakReason::PromiseDue, "d")],
+                at(13, 10),
+                &policy,
+                &ledger
+            ),
             SpeakDecision::Silent(SilentBecause::WeeklyCap)
         );
     }
@@ -716,7 +757,9 @@ mod tests {
 
     #[test]
     fn 通知文案超过六十字或两行要被拒() {
-        assert!(validate_notification("今天决策日，美股低配 6.2pp，补 ¥1,180？点开有逐腿明细").is_ok());
+        assert!(
+            validate_notification("今天决策日，美股低配 6.2pp，补 ¥1,180？点开有逐腿明细").is_ok()
+        );
         let long = "啊".repeat(61);
         assert!(validate_notification(&long).is_err());
         assert!(validate_notification("第一行\n第二行\n第三行").is_err());
@@ -735,7 +778,10 @@ mod tests {
         assert!(validate_dialogue("目标价能到 45%，预计年化 8%").is_ok());
         assert!(validate_notification("现在是买点，我的看法是可以加仓").is_err());
         let long = "话".repeat(301);
-        assert!(validate_dialogue(&long).is_err(), "长度上限仍然守住模板 bug");
+        assert!(
+            validate_dialogue(&long).is_err(),
+            "长度上限仍然守住模板 bug"
+        );
     }
 
     #[test]

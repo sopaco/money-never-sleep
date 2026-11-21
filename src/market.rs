@@ -1,9 +1,9 @@
 // src/market.rs - 市场数据获取模块
 
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
-use comfy_table::{Table, Cell, Color};
 use crate::quote;
+use anyhow::{Result, bail};
+use comfy_table::{Cell, Color, Table};
+use serde::{Deserialize, Serialize};
 
 /// 市场报价数据
 #[derive(Debug, Clone, Serialize, Deserialize)]

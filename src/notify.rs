@@ -172,10 +172,8 @@ mod macos {
                 _notification: &UNNotification,
                 completion_handler: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
             ) {
-                completion_handler.call((
-                    UNNotificationPresentationOptions::Banner
-                        | UNNotificationPresentationOptions::Sound,
-                ));
+                completion_handler.call((UNNotificationPresentationOptions::Banner
+                    | UNNotificationPresentationOptions::Sound,));
             }
 
             #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
@@ -385,8 +383,8 @@ mod windows {
     }
 
     fn register() -> Result<(), String> {
-        let exe = std::env::current_exe()
-            .map_err(|error| format!("定位 mns-gui.exe 失败：{error}"))?;
+        let exe =
+            std::env::current_exe().map_err(|error| format!("定位 mns-gui.exe 失败：{error}"))?;
         ensure_shortcut(&exe)?;
         ensure_uri_scheme(&exe)?;
         REGISTERED.store(true, Ordering::Relaxed);
@@ -419,14 +417,12 @@ mod windows {
             xml_escape(&launch),
             xml_escape(text)
         );
-        let document = XmlDocument::new()
-            .map_err(|error| format!("创建通知内容失败：{error}"))?;
+        let document = XmlDocument::new().map_err(|error| format!("创建通知内容失败：{error}"))?;
         document
             .LoadXml(&HSTRING::from(xml))
             .map_err(|error| format!("通知内容无效：{error}"))?;
-        let notifier =
-            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
-                .map_err(|error| format!("注册通知通道失败：{error}"))?;
+        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
+            .map_err(|error| format!("注册通知通道失败：{error}"))?;
         let toast = ToastNotification::CreateToastNotification(&document)
             .map_err(|error| format!("构造通知失败：{error}"))?;
         notifier
@@ -483,12 +479,9 @@ mod windows {
         let path_wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
         let value = prop_variant_string(AUMID)?;
         unsafe {
-            let store: IPropertyStore = SHGetPropertyStoreFromParsingName(
-                &path_wide,
-                None::<&IBindCtx>,
-                GPS_READWRITE,
-            )
-            .map_err(|error| format!("打开快捷方式属性失败：{error}"))?;
+            let store: IPropertyStore =
+                SHGetPropertyStoreFromParsingName(&path_wide, None::<&IBindCtx>, GPS_READWRITE)
+                    .map_err(|error| format!("打开快捷方式属性失败：{error}"))?;
             store
                 .SetValue(&PKEY_AppUserModel_ID, &value)
                 .map_err(|error| format!("写入 AppUserModelID 失败：{error}"))?;
@@ -524,7 +517,11 @@ mod windows {
     /// 注册 `mns:` 协议：点击 Toast 时由系统拉起 `mns-gui --toast <uri>`。
     fn ensure_uri_scheme(exe: &Path) -> Result<(), String> {
         let command = format!("\"{}\" --toast \"%1\"", exe.display());
-        write_reg_string(&format!(r"Software\Classes\{URI_SCHEME}"), None, "URL:MNS Protocol")?;
+        write_reg_string(
+            &format!(r"Software\Classes\{URI_SCHEME}"),
+            None,
+            "URL:MNS Protocol",
+        )?;
         write_reg_string(
             &format!(r"Software\Classes\{URI_SCHEME}"),
             Some("URL Protocol"),

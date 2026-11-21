@@ -292,7 +292,7 @@ impl Default for ChannelCosts {
                 buy_fee_pct: 0.12,
                 sell_fee_pct: 0.0,
                 redemption_tiers: feed_tiers.clone(),
-                settlement_days: 7,      // QDII 赎回款 T+5~T+7
+                settlement_days: 7,            // QDII 赎回款 T+5~T+7
                 daily_subscription_cap: 520.0, // 部分平台纳指100 每日总限额
                 slippage_pct: 0.0,
                 proxy_tracking_error_pct: 1.2,
@@ -610,7 +610,11 @@ fn interp_target(score: f64, pts: &[(f64, f64); 4], tail: f64) -> f64 {
         let (x0, y0) = w[0];
         let (x1, y1) = w[1];
         if score < x1 {
-            let t = if x1 > x0 { (score - x0) / (x1 - x0) } else { 0.0 };
+            let t = if x1 > x0 {
+                (score - x0) / (x1 - x0)
+            } else {
+                0.0
+            };
             return y0 + t * (y1 - y0);
         }
     }
@@ -622,9 +626,9 @@ impl AppConfig {
         // 防御配置 - 低回撤优先，逆向策略
         Self {
             settings: Settings {
-                annualized_target_high: 15.0, // 年化15%在持仓表中绿色标记
-                min_holding_days: 45,          // 年化收益需至少持仓这么多天才显示
-                max_contrarian_weight: 2.0,    // 逆向加仓时单标的最大相对权重
+                annualized_target_high: 15.0,               // 年化15%在持仓表中绿色标记
+                min_holding_days: 45,                       // 年化收益需至少持仓这么多天才显示
+                max_contrarian_weight: 2.0,                 // 逆向加仓时单标的最大相对权重
                 report_output_dir: "./reports".to_string(), // 相对 app_data_dir()，见 resolve_data_path
             },
             allocation: Allocation {
@@ -740,7 +744,11 @@ impl AppConfig {
         {
             anyhow::bail!(
                 "target_weight 必须随情绪升高而单调不增（逆向策略）: 极度恐慌{} ≥ 恐慌{} ≥ 中性{} ≥ 贪婪{} ≥ 极度贪婪{}",
-                w.extreme_fear, w.fear, w.neutral, w.greed, w.extreme_greed
+                w.extreme_fear,
+                w.fear,
+                w.neutral,
+                w.greed,
+                w.extreme_greed
             );
         }
         if self.rebalance.band_pp < 0.0 {
@@ -837,7 +845,10 @@ impl AppConfig {
             anyhow::bail!("butler.dedupe_days 至少为 1");
         }
         if k.quiet_start_hour > 23 {
-            anyhow::bail!("butler.quiet_start_hour 应在 0-23 之间: {}", k.quiet_start_hour);
+            anyhow::bail!(
+                "butler.quiet_start_hour 应在 0-23 之间: {}",
+                k.quiet_start_hour
+            );
         }
         if k.quiet_end_hour > 24 {
             anyhow::bail!("butler.quiet_end_hour 应在 0-24 之间: {}", k.quiet_end_hour);
@@ -1133,16 +1144,12 @@ impl AppConfig {
                 self.backtest.annual_trade_budget_max = value.parse()?;
             }
             "backtest.decision_interval" => {
-                self.backtest.decision_interval =
-                    match value.trim().to_ascii_lowercase().as_str() {
-                        "daily" | "每日" => DecisionInterval::Daily,
-                        "weekly" | "每周" => DecisionInterval::Weekly,
-                        "monthly" | "每月" => DecisionInterval::Monthly,
-                        other => anyhow::bail!(
-                            "未知决策周期: {}（可选 daily/weekly/monthly）",
-                            other
-                        ),
-                    };
+                self.backtest.decision_interval = match value.trim().to_ascii_lowercase().as_str() {
+                    "daily" | "每日" => DecisionInterval::Daily,
+                    "weekly" | "每周" => DecisionInterval::Weekly,
+                    "monthly" | "每月" => DecisionInterval::Monthly,
+                    other => anyhow::bail!("未知决策周期: {}（可选 daily/weekly/monthly）", other),
+                };
             }
             "backtest.execution_lag_days" => self.backtest.execution_lag_days = value.parse()?,
             "backtest.permutation_iterations" => {
@@ -1218,8 +1225,14 @@ mod tests {
     #[test]
     fn 路径解析处理常见前缀与空值() {
         assert_eq!(resolve_data_path("reports"), app_data_dir().join("reports"));
-        assert_eq!(resolve_data_path(".\\reports"), app_data_dir().join("reports"));
-        assert_eq!(resolve_data_path("./reports/"), app_data_dir().join("reports/"));
+        assert_eq!(
+            resolve_data_path(".\\reports"),
+            app_data_dir().join("reports")
+        );
+        assert_eq!(
+            resolve_data_path("./reports/"),
+            app_data_dir().join("reports/")
+        );
         assert_eq!(resolve_data_path(""), app_data_dir());
     }
 
@@ -1315,7 +1328,10 @@ mod tests {
         assert!((c.redemption_rate(3) - 0.015).abs() < 1e-9, "<7天 1.5%");
         assert!((c.redemption_rate(20) - 0.0075).abs() < 1e-9, "<30天 0.75%");
         assert!((c.redemption_rate(200) - 0.005).abs() < 1e-9, "<365天 0.5%");
-        assert!((c.redemption_rate(500) - 0.0025).abs() < 1e-9, "<730天 0.25%");
+        assert!(
+            (c.redemption_rate(500) - 0.0025).abs() < 1e-9,
+            "<730天 0.25%"
+        );
         assert_eq!(c.redemption_rate(1000), 0.0, "长期持有免赎回费");
     }
 
@@ -1325,7 +1341,10 @@ mod tests {
         // 旧默认多出的「7–30 日 0.75%」一档无对应基金，已删除。
         let c = Costs::default();
         assert!((c.redemption_rate(3) - 0.015).abs() < 1e-9);
-        assert!((c.redemption_rate(20) - 0.005).abs() < 1e-9, "7-30日应为 0.5%，不再是 0.75%");
+        assert!(
+            (c.redemption_rate(20) - 0.005).abs() < 1e-9,
+            "7-30日应为 0.5%，不再是 0.75%"
+        );
         assert!((c.redemption_rate(200) - 0.005).abs() < 1e-9);
         assert!((c.redemption_rate(500) - 0.0025).abs() < 1e-9);
         assert_eq!(c.redemption_rate(1000), 0.0);
@@ -1355,7 +1374,10 @@ mod tests {
         assert_eq!(RiskProfile::parse("steady"), Some(RiskProfile::Steady));
         assert_eq!(RiskProfile::parse("平衡"), Some(RiskProfile::Balanced));
         assert_eq!(RiskProfile::parse("进取"), Some(RiskProfile::Aggressive));
-        assert_eq!(RiskProfile::parse("aggressive"), Some(RiskProfile::Aggressive));
+        assert_eq!(
+            RiskProfile::parse("aggressive"),
+            Some(RiskProfile::Aggressive)
+        );
         assert_eq!(RiskProfile::parse("none"), Some(RiskProfile::Base));
         assert_eq!(RiskProfile::parse("无档位"), Some(RiskProfile::Base));
         assert_eq!(RiskProfile::parse("raw"), Some(RiskProfile::Base));
@@ -1372,9 +1394,12 @@ mod tests {
         // 曲线原样：中性锚 = target_weight.neutral，而非向满仓收缩后的值
         assert!((c.target_weight_for(50.0) - c.target_weight.neutral).abs() < 1e-9);
         // 摆幅 = 极端区间权重差，无档位时最大
-        let swing =
-            c.target_weight_for(0.0) - c.target_weight_for(100.0);
-        assert!((swing - (85.0 - 35.0)).abs() < 1e-9, "无档位摆幅应为曲线原样: {}", swing);
+        let swing = c.target_weight_for(0.0) - c.target_weight_for(100.0);
+        assert!(
+            (swing - (85.0 - 35.0)).abs() < 1e-9,
+            "无档位摆幅应为曲线原样: {}",
+            swing
+        );
         assert!(c.validate().is_ok());
     }
 
@@ -1400,7 +1425,10 @@ mod tests {
         c.set_value("profile", "custom").unwrap();
         assert_eq!(c.profile_label(), "自定义");
         assert_eq!(c.profile.core_blend, 0.0);
-        assert!(c.target_weight_for(50.0) < before, "取消档位后应回到原始曲线");
+        assert!(
+            c.target_weight_for(50.0) < before,
+            "取消档位后应回到原始曲线"
+        );
     }
 
     #[test]
@@ -1447,7 +1475,11 @@ mod tests {
         assert!((c.target_weight_for(90.0) - 74.0).abs() < 1e-9);
         // 中段落在恐慌/中性两档之间
         let mid = c.target_weight_for(50.0);
-        assert!(mid < 90.0 && mid > 84.0, "50 分应落在恐慌/中性之间: {}", mid);
+        assert!(
+            mid < 90.0 && mid > 84.0,
+            "50 分应落在恐慌/中性之间: {}",
+            mid
+        );
     }
 
     #[test]
@@ -1459,7 +1491,12 @@ mod tests {
         c.target_weight.mode = WeightMode::Linear;
         let lo = c.target_weight_for(39.9);
         let hi = c.target_weight_for(40.1);
-        assert!((lo - hi).abs() < 0.5, "39.9 vs 40.1 应连续: {} vs {}", lo, hi);
+        assert!(
+            (lo - hi).abs() < 0.5,
+            "39.9 vs 40.1 应连续: {} vs {}",
+            lo,
+            hi
+        );
     }
 
     #[test]
@@ -1502,11 +1539,24 @@ fear_greed_url = "https://example.com"
         assert!(c.validate().is_ok());
         assert_eq!(c.target_weight.neutral, 60.0, "应回落到默认曲线");
         assert_eq!(c.costs.cash_annual_yield, 1.3);
-        assert_eq!(c.rebalance.signal_smooth_days, 7, "旧配置回落到默认平滑窗口");
+        assert_eq!(
+            c.rebalance.signal_smooth_days, 7,
+            "旧配置回落到默认平滑窗口"
+        );
         assert_eq!(c.rebalance.zone_confirm_days, 3, "旧配置回落到默认确认天数");
-        assert_eq!(c.rebalance.decision_weekday, 5, "旧配置回落到默认决策日(周五)");
-        assert_eq!(c.target_weight.mode, WeightMode::Step, "旧配置回落到阶梯模式");
-        assert!(c.profile.core_blend.abs() < 1e-9, "旧配置缺字段应等价旧行为");
+        assert_eq!(
+            c.rebalance.decision_weekday, 5,
+            "旧配置回落到默认决策日(周五)"
+        );
+        assert_eq!(
+            c.target_weight.mode,
+            WeightMode::Step,
+            "旧配置回落到阶梯模式"
+        );
+        assert!(
+            c.profile.core_blend.abs() < 1e-9,
+            "旧配置缺字段应等价旧行为"
+        );
         assert_eq!(c.profile.name, "custom");
         assert_eq!(c.profile_label(), "自定义");
     }

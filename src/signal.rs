@@ -54,17 +54,18 @@ pub struct DecisionSignal {
 /// 按"缺失即跳过"处理，避免节假日清空信号）。
 fn smoothed_at(series: &[(NaiveDate, f64)], window: usize) -> f64 {
     if window <= 1 {
-        return series
-            .last()
-            .map(|(_, s)| *s)
-            .unwrap_or(0.0);
+        return series.last().map(|(_, s)| *s).unwrap_or(0.0);
     }
     let lo = series.len().saturating_sub(window);
     let slice = &series[lo..];
     // 窗口跨日历缺口时只取最近 window 天内（含缺口跳过）
     if let Some(&(last_date, _)) = series.last() {
         let cutoff = last_date - chrono::Duration::days(window as i64 - 1);
-        let slice: ScoreHistory = slice.iter().filter(|(d, _)| *d >= cutoff).cloned().collect();
+        let slice: ScoreHistory = slice
+            .iter()
+            .filter(|(d, _)| *d >= cutoff)
+            .cloned()
+            .collect();
         if !slice.is_empty() {
             return slice.iter().map(|(_, s)| s).sum::<f64>() / slice.len() as f64;
         }
@@ -222,7 +223,8 @@ pub fn compute(
             6 => "周六",
             _ => "周日",
         };
-        note.push_str(&format!("；今天是{}，非决策日（决策日=每周{}），只出观察报告",
+        note.push_str(&format!(
+            "；今天是{}，非决策日（决策日=每周{}），只出观察报告",
             name,
             match r.decision_weekday {
                 1 => "一",
@@ -232,7 +234,8 @@ pub fn compute(
                 5 => "五",
                 6 => "六",
                 _ => "日",
-            }));
+            }
+        ));
     }
 
     DecisionSignal {
@@ -323,7 +326,12 @@ mod tests {
         assert!((s2.effective_score - 20.0).abs() < 1e-6);
 
         // 场景3：连续 2 天 → 仍未确认，且旧区间稳定可持续
-        let s3 = dsi(&c, 20.0, &[25.0, 20.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0], today);
+        let s3 = dsi(
+            &c,
+            20.0,
+            &[25.0, 20.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0],
+            today,
+        );
         assert!(!s3.confirmed);
         assert_eq!(s3.effective_zone, "中性");
     }
@@ -337,7 +345,10 @@ mod tests {
         // 原始值 50↔30 交替，无任何连续 2 天的区间
         let s = dsi(&c, 35.0, &[50.0, 30.0, 50.0, 30.0], today);
         assert!(!s.confirmed);
-        assert_eq!(s.effective_zone, "恐慌", "无稳定区间时按平滑值(=当日35)执行");
+        assert_eq!(
+            s.effective_zone, "恐慌",
+            "无稳定区间时按平滑值(=当日35)执行"
+        );
         assert!(s.note.contains("无连续"));
     }
 
@@ -362,9 +373,7 @@ mod tests {
         // 削弱平滑；修复后替换为最新值 → [50×6, 20]，均值 45.71（与单日毛刺测试一致）。
         let c = cfg(); // smooth=7
         let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
-        let mut history: ScoreHistory = (1..=6)
-            .map(|i| (day(today, i), 50.0))
-            .collect();
+        let mut history: ScoreHistory = (1..=6).map(|i| (day(today, i), 50.0)).collect();
         history.push((today, 20.0)); // 今天已落库
         let s = compute(&c, 20.0, &history, today);
         assert_eq!(s.samples_used, 7, "今天只应计一次");
@@ -376,9 +385,7 @@ mod tests {
         // 早上 report 落库 30，下午 CNN 更新为 20 → 以 20 为准（替换而非并存）
         let c = cfg();
         let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
-        let mut history: ScoreHistory = (1..=6)
-            .map(|i| (day(today, i), 50.0))
-            .collect();
+        let mut history: ScoreHistory = (1..=6).map(|i| (day(today, i), 50.0)).collect();
         history.push((today, 30.0));
         let s = compute(&c, 20.0, &history, today);
         assert!((s.smoothed_score - (20.0 + 50.0 * 6.0) / 7.0).abs() < 1e-6);

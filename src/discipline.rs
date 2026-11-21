@@ -207,9 +207,7 @@ mod tests {
 
     #[test]
     fn 预算上限边界_eq_不超_gt_才超() {
-        let at_limit = (0..20)
-            .map(|_| tx(2026, 1, 1, None))
-            .collect::<Vec<_>>();
+        let at_limit = (0..20).map(|_| tx(2026, 1, 1, None)).collect::<Vec<_>>();
         let r = review(2026, 10, 20, at_limit);
         assert_eq!(r.total, 20);
         assert!(!r.over_budget(), "正好用满 20 次仍在内");

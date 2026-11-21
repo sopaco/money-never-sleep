@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn 今天就是那个工作日时周X指今天() {
+    fn 今天就是那个工作日时周x指今天() {
         // 2026-11-18 是周三：「周三」不该被算到下周去。
         let intent = parse_intent("记住周三核账", day(18)).unwrap_or_else(|| unreachable!());
         match intent {

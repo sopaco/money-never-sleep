@@ -31,12 +31,7 @@ const DECISION_SCHEMA: &str = r#"{
 const MAX_REPORT_CHARS: usize = 12_000;
 
 /// Daily review prompt: holdings from the last close, environment today.
-pub fn daily_review_prompt(
-    date: &str,
-    weekday: &str,
-    report: &str,
-    cli: Option<&Path>,
-) -> String {
+pub fn daily_review_prompt(date: &str, weekday: &str, report: &str, cli: Option<&Path>) -> String {
     let report = trim_report(report);
     let cli_note = match cli {
         Some(cli) => {
@@ -52,7 +47,9 @@ pub fn daily_review_prompt(
                  不要用 find / ls 搜索 mns，也不要直接读 ~/.mns 下的数据库或配置。"
             )
         }
-        None => "本次未提供 mns CLI，只能依据下面的报告判断；数据不足时直接说明，不要推测。".to_owned(),
+        None => {
+            "本次未提供 mns CLI，只能依据下面的报告判断；数据不足时直接说明，不要推测。".to_owned()
+        }
     };
 
     format!(
@@ -109,9 +106,15 @@ mod tests {
             Some(Path::new("/Applications/MNS.app/Contents/MacOS/mns")),
         );
         assert!(prompt.contains("2026-11-09"));
-        assert!(prompt.contains("现金余额 ¥2919.40"), "the report is the data source");
+        assert!(
+            prompt.contains("现金余额 ¥2919.40"),
+            "the report is the data source"
+        );
         assert!(prompt.contains("/Applications/MNS.app/Contents/MacOS/mns"));
-        assert!(prompt.contains("mns-decision"), "the schema block must be demanded");
+        assert!(
+            prompt.contains("mns-decision"),
+            "the schema block must be demanded"
+        );
         assert!(prompt.contains("\"verdict\""));
         assert!(prompt.contains("不要写任何文件"));
     }

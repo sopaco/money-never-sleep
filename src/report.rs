@@ -182,7 +182,11 @@ pub fn generate_report(
                 "先卖出 ¥{:.2}，再买入 ¥{:.2}（净{} ¥{:.2}）",
                 plan.total_sell,
                 plan.total_buy,
-                if plan.total_buy >= plan.total_sell { "买入" } else { "卖出" },
+                if plan.total_buy >= plan.total_sell {
+                    "买入"
+                } else {
+                    "卖出"
+                },
                 (plan.total_buy - plan.total_sell).abs()
             )
         } else if plan.total_buy > 0.0 {
@@ -199,10 +203,12 @@ pub fn generate_report(
         }
     };
 
-    let worst_leg = plan
-        .legs
-        .iter()
-        .max_by(|a, b| a.drift_pp.abs().partial_cmp(&b.drift_pp.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    let worst_leg = plan.legs.iter().max_by(|a, b| {
+        a.drift_pp
+            .abs()
+            .partial_cmp(&b.drift_pp.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let why_line = if no_executable_buy {
         format!(
             "情绪 {}（{:.0} 分），目标风险仓位 {:.0}%——暂无可执行标的，建池后下个决策日即可执行",
@@ -258,7 +264,9 @@ pub fn generate_report(
     };
 
     let drift_line = match &no_action {
-        NoAction::EmptyAccount => "账户未注资，暂无偏离可言；先 `mns cash set <金额>` 注资".to_string(),
+        NoAction::EmptyAccount => {
+            "账户未注资，暂无偏离可言；先 `mns cash set <金额>` 注资".to_string()
+        }
         _ => match worst_leg {
             Some(l) => format!(
                 "本月已操作 {} 笔，累计估算费用 {}；偏离最大：{} {:+.1}pp",
@@ -287,7 +295,11 @@ pub fn generate_report(
         activity.year_trades,
         budget.annual_trade_budget_min,
         budget.annual_trade_budget_max,
-        if over { "（已超预算，建议仅执行决策日建议）" } else { "" }
+        if over {
+            "（已超预算，建议仅执行决策日建议）"
+        } else {
+            ""
+        }
     ));
 
     // 市场情绪（决策分数 = 平滑/确认后的信号，见 src/signal.rs；
@@ -525,7 +537,9 @@ pub fn generate_report(
             report.push_str("  注: 可用资金不足以补足全部缺口，已按缺口比例分配\n");
         }
         if plan.total_sell > 0.0 {
-            report.push_str("  注: 赎回费按各标的最早买入日估算会偏低（近期定投份额可能仍在费率档内）\n");
+            report.push_str(
+                "  注: 赎回费按各标的最早买入日估算会偏低（近期定投份额可能仍在费率档内）\n",
+            );
         }
         // 补齐“总偏离 vs 逐腿带宽”的口径差：不写明的话，「目标 83%、只买 ¥691」
         // 看起来像算错了——差额来自未超带宽的腿，它们按设计不参与调仓。
@@ -545,10 +559,10 @@ pub fn generate_report(
     } else {
         match &no_action {
             NoAction::EmptyAccount => {
+                report.push_str("  今日无需调仓 —— 账户暂无资金（现金 + 持仓市值 = ¥0）。\n");
                 report.push_str(
-                    "  今日无需调仓 —— 账户暂无资金（现金 + 持仓市值 = ¥0）。\n",
+                    "  先 `mns cash deposit <金额>` 记外部入金，再运行 `mns report` 看目标仓位。\n",
                 );
-                report.push_str("  先 `mns cash deposit <金额>` 记外部入金，再运行 `mns report` 看目标仓位。\n");
             }
             NoAction::InBand => {
                 report.push_str("  今日无需调仓 —— 各类别偏离均在带宽内，持有即可。\n");
@@ -665,7 +679,9 @@ pub fn generate_report(
         "  · 决策信号 = CNN 恐贪指数（{}天平滑 + {}天区间确认），为情绪锚\n",
         config.rebalance.signal_smooth_days, config.rebalance.zone_confirm_days
     ));
-    report.push_str("  · 趋势锚在长周期代理回测中优于情绪锚，但需≥12个月本地价格历史，实盘暂不可用\n");
+    report.push_str(
+        "  · 趋势锚在长周期代理回测中优于情绪锚，但需≥12个月本地价格历史，实盘暂不可用\n",
+    );
     report.push_str("  · 长周期样本 2016-2026 覆盖 2018Q4/2020/2022/2026 回调，但不含 2000-2002 与 2008 型多年期熊市\n\n");
     report.push_str(&disclosure(config));
 
@@ -768,7 +784,11 @@ pub fn generate_observation_report(
     ));
     report.push_str(&format!(
         "  决策分数(平滑{}天, 样本{}/{}): {:.2} ({})\n",
-        config.rebalance.signal_smooth_days, signal.samples_used, config.rebalance.signal_smooth_days, signal.smoothed_score, signal.smoothed_zone
+        config.rebalance.signal_smooth_days,
+        signal.samples_used,
+        config.rebalance.signal_smooth_days,
+        signal.smoothed_score,
+        signal.smoothed_zone
     ));
     report.push_str(&format!("  信号说明: {}\n", signal.note));
     if !signal.confirmed {
@@ -796,9 +816,17 @@ pub fn generate_observation_report(
     report.push('\n');
 
     // 账户概览（简版，只展示不动手）
-    let total_mv: f64 = positions.iter().map(|p| p.market_value_or_cost()).sum::<f64>() + 0.0;
+    let total_mv: f64 = positions
+        .iter()
+        .map(|p| p.market_value_or_cost())
+        .sum::<f64>()
+        + 0.0;
     let total = cash_balance + total_mv;
-    let risk_weight = if total > 0.0 { total_mv / total * 100.0 } else { 0.0 };
+    let risk_weight = if total > 0.0 {
+        total_mv / total * 100.0
+    } else {
+        0.0
+    };
     report.push_str("【账户概览】\n");
     report.push_str(&format!("  现金余额: ¥{:.2}\n", cash_balance));
     report.push_str(&format!("  持仓市值: ¥{:.2}\n", total_mv));
@@ -822,7 +850,8 @@ pub fn generate_observation_report(
         }
         report.push_str(&format!(
             "提示: 决策日为每周{}，{} 天后出决策版报告；非决策日的建议一律忽略。\n",
-            names[dw as usize - 1], gap
+            names[dw as usize - 1],
+            gap
         ));
     }
     report.push_str(&disclosure(config));
@@ -951,7 +980,10 @@ mod tests {
             s.effective_score,
             c.target_weight_for(s.effective_score)
         );
-        assert!(r.contains(&want), "观察版应并排给出两个档位目标，实际：\n{r}");
+        assert!(
+            r.contains(&want),
+            "观察版应并排给出两个档位目标，实际：\n{r}"
+        );
     }
 
     #[test]
@@ -1204,7 +1236,8 @@ mod tests {
             updated_at: "2020-01-01".into(),
         }];
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
-        let p = crate::strategy::calculate_rebalance_plan(&config, 22.0, 100_000.0, &positions, today);
+        let p =
+            crate::strategy::calculate_rebalance_plan(&config, 22.0, 100_000.0, &positions, today);
         let blocked: Vec<&str> = p
             .legs
             .iter()
@@ -1304,15 +1337,8 @@ mod tests {
             samples_used: 3,
             note: String::new(),
         };
-        let obs = generate_observation_report(
-            &config,
-            &signal,
-            100_000.0,
-            &[],
-            None,
-            Some(since),
-        )
-        .unwrap();
+        let obs = generate_observation_report(&config, &signal, 100_000.0, &[], None, Some(since))
+            .unwrap();
         assert!(
             obs.contains("资产曲线自 2026-01-05 起每日追踪"),
             "观察报告的账户概览应披露追踪起点"
@@ -1389,7 +1415,13 @@ mod tests {
         match no_action_reason(&p) {
             NoAction::Blocked(legs) => {
                 assert_eq!(legs.len(), 1);
-                assert!(legs[0].hold_reason.as_deref().unwrap().contains("最小交易额"));
+                assert!(
+                    legs[0]
+                        .hold_reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("最小交易额")
+                );
             }
             _ => panic!("应识别为规则阻塞"),
         }
