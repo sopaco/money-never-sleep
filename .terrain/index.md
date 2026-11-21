@@ -53,11 +53,11 @@ source: .
     - cli-butler.md
     - cli-quickstart.md
     - cli-reference.md
-    - desktop-agent.md
     - desktop-butler.md
     - desktop-overview.md
     - desktop-plan.md
     - desktop-portfolio.md
+    - desktop-review.md
     - desktop-settings.md
     - diagrams/
     - finance-alternatives.md
