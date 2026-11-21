@@ -62,7 +62,7 @@ pub const CHAPTERS: &[Chapter] = &[
             page!("desktop-overview", "总览与导航"),
             page!("desktop-portfolio", "持仓与账本"),
             page!("desktop-plan", "计划页"),
-            page!("desktop-agent", "AI 助手"),
+            page!("desktop-review", "巡检"),
             page!("desktop-butler", "管家"),
             page!("desktop-settings", "托盘、自启动与设置"),
         ],

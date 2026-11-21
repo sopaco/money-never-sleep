@@ -12,7 +12,9 @@
 - **GUI process model**（P2 起）: `mns-gui` 本身是**常驻宿主**（无 AppShell 窗口，
   `QuitMode::Explicit`）。macOS 上宿主是 `Regular`，**独占唯一的 MNS Dock 图标**，
   并负责菜单栏、托盘界面、系统通知投递、管家守护进程启停，以及拉起短命窗口子进程：
-  - `mns-gui --window [--page <slug>] [--about] [--refresh]` —— 主窗口；
+  - `mns-gui --window [--page <slug>] [--about] [--refresh]` —— 主窗口
+    （`<slug>`：`dashboard` / `portfolio` / `plan` / `performance` / `review` /
+    `settings`，巡检页是 `review`）；
   - `mns-gui --window --butler`（或 `--window butler`）—— 管家窗口。
   两个窗口都跑 `QuitMode::LastWindowClosed`，关窗即进程退出（内存随进程回收），
   并以 `Accessory` 策略运行（不产生第二个 Dock 图标）。Accessory 应用没有自己的
@@ -44,7 +46,8 @@
   Stop it with the tray item 「停止管家进程」 or `pkill -f mns-butlerd` before testing
   butler state by hand, or your `mns-butler wake` will race with it. It is
   event-driven, not a poller: it sleeps until the next computed deadline
-  (scheduled sweep, due task, due commitment, agent-init failure retry) and is
+  (scheduled sweep, due task, due commitment, daily review, agent-init failure
+  retry) and is
   woken by pokes from the GUI/CLI over the local channel (Unix socket, or
   `\\.\pipe\mns-<app>-<user>` on Windows) — no launchd/cron/Task Scheduler
   entry is involved.
@@ -57,9 +60,20 @@
   `agent/butler/initlog.jsonl` (`mns-butler status` shows the last attempts and
   why they failed). The runtime shuts down after every turn, so it never leaves
   an orphan agent process behind.
+  Daily review (`WakeSource::DailyReview`) is the other recurring wake source: at
+  the configured time it runs `mns today --quiet`, then one ACP turn for the
+  discipline conclusion, writes `~/.mns/agent/reviews/<id>.json`, appends one
+  message to the butler conversation, and leaves the banner to the GUI (its copy
+  never quotes the conclusion). It is the same pipeline as「立即巡检」in the
+  review page, only headless (permission requests denied). `agent/last-review`
+  (just a date) is written before the run starts, so a failed run is not retried
+  that day — no second, possibly conflicting conclusion.
+  The butler window's chat input supports `@` to reference recent review reports:
+  IPC carries only `{id,title}`, and the daemon reads each body by id (at most 3
+  reports, each truncated) before handing them to the model as context.
   When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
-- **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/` and `agent/runs/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd.
+- **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/`, `agent/runs/` and `agent/reviews/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd. `agent/reviews/` is the only store for review reports: both the review page history and the butler window's `@` picker read it. The legacy `agent/conversations/` archive is no longer read; existing files are left in place (no migration, no deletion).
 - **Stack**: Rust edition 2024, SQLite (rusqlite), reqwest, clap, chrono, comfy-table
 
 ## Standard Workflow
@@ -94,9 +108,9 @@ mns backtest legacy   # 已降级，结论不可迁移到实盘
 
 使用 mns 辅助实盘决策前，先读 mns-advisor 的 `references/buy-sell-playbook.md` 与
 `references/evidence-boundary.md`：情绪信号已被证伪为择时依据，不得据新闻或 FGI 给出买卖点。
-该约束适用于 mns 助手、报告与买卖决策编排；管家（butler）是自主人格，按双人格边界
-执行——会话可给倾向性观点（自我标注、数字同源、不谎称下单），通知 banner 仍走最严
-话术口径。
+该约束适用于 mns 巡检页（自由追问去管家窗口）、报告与买卖决策编排；管家（butler）
+是自主人格，按双人格边界执行——会话可给倾向性观点（自我标注、数字同源、不谎称下单），
+通知 banner 仍走最严话术口径。
 
 ### Package (Windows)
 ```powershell

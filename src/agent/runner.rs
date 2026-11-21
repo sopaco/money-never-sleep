@@ -704,7 +704,7 @@ fn cli_rule(cli: Option<&Path>, managed: bool) -> String {
 /// Fenced blocks are the only channel the agent has back to MNS. Requiring a
 /// labelled fence — rather than "any JSON in the prose" — keeps ordinary
 /// examples and tool output from being mistaken for a conclusion.
-fn extract_decision(text: &str) -> Option<DecisionReport> {
+pub fn extract_decision(text: &str) -> Option<DecisionReport> {
     const FENCE: &str = "```mns-decision";
     let mut found = None;
     let mut rest = text;

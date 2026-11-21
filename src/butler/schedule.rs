@@ -25,6 +25,8 @@ pub enum WakeSource {
     /// agent-init 失败后的重试到点。`id` 唯一定位一次重试（上次尝试时间
     /// + 退避），避免同一条重试被重复叫醒。
     AgentInitRetry { id: String },
+    /// 每日巡检到点。`id` = `review:<日期>`，同一天只叫醒一次。
+    DailyReview { id: String },
 }
 
 /// 唤醒判定结果。不唤醒也要说明原因——否则「今天怎么没动静」无从回答。
@@ -55,6 +57,8 @@ pub struct WakeScheduler {
     /// 已消费的 agent-init 重试 id。重试没跑成新一轮尝试（比如用户刚聊
     /// 过天）时，防止同一个到点时刻把主循环打成空转。
     pub seen_agent_retries: BTreeSet<String>,
+    /// 已消费的每日巡检 id（`review:<日期>`）。
+    pub seen_reviews: BTreeSet<String>,
 }
 
 impl Default for WakeScheduler {
@@ -66,6 +70,7 @@ impl Default for WakeScheduler {
             seen_tasks: BTreeSet::new(),
             seen_commitments: BTreeSet::new(),
             seen_agent_retries: BTreeSet::new(),
+            seen_reviews: BTreeSet::new(),
         }
     }
 }
@@ -122,6 +127,13 @@ impl WakeScheduler {
                 }
                 WakeVerdict::Wake
             }
+            // 巡检同样不占用 4 小时巡检节奏：它有自己的每日时刻。
+            WakeSource::DailyReview { id } => {
+                if !self.seen_reviews.insert(id.clone()) {
+                    return WakeVerdict::Duplicate;
+                }
+                WakeVerdict::Wake
+            }
         }
     }
 
@@ -137,6 +149,7 @@ impl WakeScheduler {
         trim_set(&mut self.seen_tasks, keep);
         trim_set(&mut self.seen_commitments, keep);
         trim_set(&mut self.seen_agent_retries, keep);
+        trim_set(&mut self.seen_reviews, keep);
     }
 }
 
@@ -164,6 +177,8 @@ pub enum SpeakReason {
     OffPlanBehavior,
     /// 用户预设的承诺到期（「等发工资补仓」）。
     PromiseDue,
+    /// 每日巡检完成。
+    DailyReview,
     /// 没有确定性由头，但 agent 认为此刻有话可说（主动开口）。
     AgentInit,
 }
@@ -175,6 +190,7 @@ impl SpeakReason {
             Self::ActionableStep => "有可执行的下一步",
             Self::OffPlanBehavior => "计划外行为",
             Self::PromiseDue => "承诺到期",
+            Self::DailyReview => "每日巡检",
             Self::AgentInit => "自主开口",
         }
     }
@@ -362,7 +378,11 @@ pub fn decide(
     fresh.sort_by_key(|candidate| candidate.reason);
 
     let chosen = fresh[0].clone();
-    if chosen.reason == SpeakReason::TaskDue {
+    // 到点任务与每日巡检都是用户亲口设的闹钟，不是管家自己找话说。
+    if matches!(
+        chosen.reason,
+        SpeakReason::TaskDue | SpeakReason::DailyReview
+    ) {
         return SpeakDecision::Speak(chosen);
     }
 
@@ -645,6 +665,36 @@ mod tests {
             ),
             SpeakDecision::Silent(SilentBecause::Paused)
         );
+    }
+
+    #[test]
+    fn 每日巡检不受静音额度与总开关影响() {
+        let policy = SpeakPolicy {
+            enabled: false,
+            quiet_start_hour: 23,
+            quiet_end_hour: 6,
+            ..SpeakPolicy::default()
+        };
+        match decide(
+            &[candidate(SpeakReason::DailyReview, "review:2026-11-21")],
+            at(16, 23),
+            &policy,
+            &SpeakLedger::default(),
+        ) {
+            SpeakDecision::Speak(row) => assert_eq!(row.reason, SpeakReason::DailyReview),
+            other => panic!("巡检是用户设的闹钟，不该被吞掉，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 同一天的巡检只叫醒一次() {
+        let mut scheduler = WakeScheduler::default();
+        let event = WakeSource::DailyReview {
+            id: "review:2026-11-21".to_owned(),
+        };
+        assert_eq!(scheduler.request(&event, at(21, 8)), WakeVerdict::Wake);
+        assert_eq!(scheduler.request(&event, at(21, 9)), WakeVerdict::Duplicate);
+        assert_eq!(scheduler.next_scheduled(), None, "巡检不推进 4 小时节奏");
     }
 
     #[test]

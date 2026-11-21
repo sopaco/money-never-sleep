@@ -5,7 +5,8 @@
 //!
 //! 它是一个**事件驱动的常驻进程**，不是一个定时器：
 //!
-//! - 唤醒源只有三类——定时巡检、账本事件、自设任务/承诺到期；
+//! - 唤醒源——定时巡检、每日巡检、账本事件、自设任务/承诺到期、agent-init
+//!   重试；
 //! - 循环里没有 tick：它算出「下一次该在什么时候想事情」，然后一直睡到那个
 //!   时刻；账本事件与状态变更由 GUI / CLI 通过本地 socket 直接叫醒它；
 //! - 没有系统计划任务（launchd / cron / 计划任务）参与：那些每次都要拉起
@@ -43,13 +44,16 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use money_never_sleep::agent::{AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource};
+use money_never_sleep::agent::{
+    AgentCommand, AgentEvent, AgentHandle, EntryKind, GoalSource, routine,
+};
 use money_never_sleep::butler::agenda;
-use money_never_sleep::butler::chat::{self, ChatEffect};
+use money_never_sleep::butler::chat::{self, ChatEffect, ChatReference};
 use money_never_sleep::butler::orchestrator::{
     self, AGENT_INIT_MIN_IDLE_HOURS, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice,
     agent_init_backoff, append_init_record,
 };
+use money_never_sleep::butler::review::{self, ReviewRef, ReviewReport};
 use money_never_sleep::butler::schedule;
 use money_never_sleep::butler::talk;
 use money_never_sleep::butler::{
@@ -70,6 +74,17 @@ const MAX_SLEEP: Duration = Duration::from_secs(30 * 60);
 /// 一次 agent-init 的硬超时。超时即本轮沉默——主动开口没有模板兜底，
 /// 不说比说一半好，更不能卡住主循环。
 const AGENT_INIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 一次每日巡检的硬超时。它比闲聊长：先刷价（网络），再跑一轮只看不写的
+/// 复盘。超时按失败记录，当天不再重试。
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `mns today --quiet` 自己的超时。网络卡住时不能把 300 秒全耗在第一步。
+const REVIEW_CLI_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 一句提问最多引用几份巡检报告，以及每份塞进上下文的上限。
+const MAX_REFERENCES: usize = 3;
+const MAX_REFERENCE_CHARS: usize = 6_000;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -98,6 +113,11 @@ async fn run() -> Result<()> {
     let (init_tx, mut init_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let init_busy = Arc::new(AtomicBool::new(false));
 
+    // 每日巡检与 agent-init 分开：巡检要刷价 + 跑一轮只读复盘，最长 5 分钟。
+    // 结果回主线程再并进会话、保存报告、投递通知。
+    let (review_tx, mut review_rx) = tokio::sync::mpsc::unbounded_channel::<ReviewOutcome>();
+    let review_busy = Arc::new(AtomicBool::new(false));
+
     // P4：管家会话归本进程。窗口只是投影——挂上拿快照、断开即 detach，
     // 广播没人收就丢弃，回合照常收完落盘。
     let mut chat = ChatState::new(listener);
@@ -116,8 +136,18 @@ async fn run() -> Result<()> {
 
     loop {
         let now = Local::now();
+        // 巡检时刻来自设置；`last-review` 只回答「今天跑过没有」。两者都是
+        // 小文件读取，与下面 `Butler::load()` 同量级。
+        let settings = money_never_sleep::agent::load_settings();
+        let last = review::read_last();
+        let review = review::schedule(
+            now,
+            settings.daily_review,
+            &settings.daily_review_time,
+            last.as_deref(),
+        );
         let agenda = match Butler::load() {
-            Ok(butler) => agenda::next(now, &butler),
+            Ok(butler) => agenda::next(now, &butler, review.as_ref()),
             Err(error) => {
                 eprintln!("mns-butlerd: 管家状态读取失败：{error:#}");
                 None
@@ -142,7 +172,18 @@ async fn run() -> Result<()> {
                     finish(&mut chat, &runtime, agent_events).await;
                     return Ok(());
                 };
-                if handle_event(event, &mut chat, &mut link, &runtime, &init_busy, &init_tx).await {
+                if handle_event(
+                    event,
+                    &mut chat,
+                    &mut link,
+                    &runtime,
+                    &init_busy,
+                    &init_tx,
+                    &review_busy,
+                    &review_tx,
+                )
+                .await
+                {
                     finish(&mut chat, &runtime, agent_events).await;
                     return Ok(());
                 }
@@ -168,6 +209,10 @@ async fn run() -> Result<()> {
             Some(()) = init_rx.recv() => {
                 chat.drain_pending(&mut link, &runtime).await;
             }
+            // 每日巡检跑完：保存报告、并进会话、投递一条安全口径的通知。
+            Some(outcome) = review_rx.recv() => {
+                deliver_review(outcome, &mut chat, &mut link, &runtime).await;
+            }
             _ = shutdown_requested() => {
                 // 主动告别：GUI 立刻知道判定权回到自己手里，不用等连接 EOF。
                 link.send(&Signal::Bye);
@@ -186,7 +231,17 @@ async fn run() -> Result<()> {
                 if let Some(due) = due
                     && Local::now() >= due.at
                 {
-                    wake(&mut chat, &mut link, &runtime, due.source, &init_busy, &init_tx).await;
+                    wake(
+                        &mut chat,
+                        &mut link,
+                        &runtime,
+                        due.source,
+                        &init_busy,
+                        &init_tx,
+                        &review_busy,
+                        &review_tx,
+                    )
+                    .await;
                 }
             }
         }
@@ -211,6 +266,8 @@ async fn handle_event(
     runtime: &ChatRuntime,
     init_busy: &Arc<AtomicBool>,
     init_tx: &UnboundedSender<()>,
+    review_busy: &Arc<AtomicBool>,
+    review_tx: &UnboundedSender<ReviewOutcome>,
 ) -> bool {
     match event {
         ipc::Event::Signal(_, Signal::Wake { ledger }) => {
@@ -218,7 +275,17 @@ async fn handle_event(
                 Some(id) => WakeSource::Ledger { id },
                 None => WakeSource::Scheduled,
             };
-            wake(chat, link, runtime, source, init_busy, init_tx).await;
+            wake(
+                chat,
+                link,
+                runtime,
+                source,
+                init_busy,
+                init_tx,
+                review_busy,
+                review_tx,
+            )
+            .await;
         }
         ipc::Event::Signal(_, Signal::RequestBrief) => {
             // 宿主不在本进程里跑，托盘数字只能问这里要。读快照是阻塞调用，
@@ -279,8 +346,20 @@ async fn handle_event(
             chat.drain_pending(link, runtime).await;
         }
         // 用户发话：账户事实是整段阻塞调用（只读连接全库读取），放阻塞
-        // 线程池算完再进会话服务。
-        ipc::Event::Signal(_, Signal::ChatSend { text }) => {
+        // 线程池算完再进会话服务。引用的巡检报告同样在阻塞线程池里读，
+        // 正文最多 3 × 6,000 字。
+        ipc::Event::Signal(_, Signal::ChatSend { text, attachments }) => {
+            let references = if attachments.is_empty() {
+                Vec::new()
+            } else {
+                match tokio::task::spawn_blocking(move || load_references(&attachments)).await {
+                    Ok(references) => references,
+                    Err(error) => {
+                        eprintln!("mns-butlerd: 巡检引用读取任务失败：{error}");
+                        Vec::new()
+                    }
+                }
+            };
             let facts = match tokio::task::spawn_blocking(move || chat::current_facts(Local::now()))
                 .await
             {
@@ -290,7 +369,7 @@ async fn handle_event(
                     AccountFacts::default()
                 }
             };
-            let effects = chat.service.send(text, &facts);
+            let effects = chat.service.send_with_context(text, &facts, &references);
             chat.apply(effects, runtime);
         }
         ipc::Event::Signal(_, Signal::ChatClear) => {
@@ -325,7 +404,18 @@ async fn wake(
     source: WakeSource,
     init_busy: &Arc<AtomicBool>,
     init_tx: &UnboundedSender<()>,
+    review_busy: &Arc<AtomicBool>,
+    review_tx: &UnboundedSender<ReviewOutcome>,
 ) {
+    // 每日巡检不是「确定性判定」：它要主动跑一遍复盘，有自己的结果投递。
+    // 拦住它，别让下面的内核把「今天是巡检日」误当成一句可说的话。
+    if let WakeSource::DailyReview { id } = &source {
+        let date = id.strip_prefix("review:").unwrap_or_default().to_owned();
+        if !date.is_empty() {
+            spawn_daily_review(date, review_busy, review_tx);
+        }
+        return;
+    }
     // GUI 可能在我们上次发送之后重启过：先确认连接，既是重连也是 Hello。
     link.ensure();
     let now = Local::now();
@@ -419,6 +509,221 @@ fn spawn_agent_init(busy: &Arc<AtomicBool>, done: &UnboundedSender<()>) {
             let _ = done.send(());
         }
     });
+}
+
+/// 一轮巡检的结果。失败也要回主线程：用户有权知道今天没跑成。
+struct ReviewOutcome {
+    date: String,
+    result: Result<ReviewReport, String>,
+}
+
+/// 起一次每日巡检。`busy` 保证同一时刻最多一轮：巡检要跑几分钟，
+/// 期间每半小时的 agenda 重算不该再叠一轮。
+fn spawn_daily_review(date: String, busy: &Arc<AtomicBool>, done: &UnboundedSender<ReviewOutcome>) {
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // 起跑前就记账：失败当天不重试，与旧 GUI 语义一致——宁可漏跑，
+    // 也不在一天里生成两份可能冲突的结论。
+    if let Err(error) = review::write_last(&date) {
+        eprintln!("mns-butlerd: 写入 last-review 失败：{error}");
+    }
+    let busy = busy.clone();
+    let done = done.clone();
+    tokio::spawn(async move {
+        let result = run_daily_review(&date).await;
+        busy.store(false, Ordering::SeqCst);
+        let _ = done.send(ReviewOutcome { date, result });
+    });
+}
+
+/// 刷价 + 一轮只读复盘。
+///
+/// 与 GUI 手动巡检同一条流水线：`mns today --quiet` 刷新数据并由 CLI 自己
+/// 写报告，然后让 ACP agent 按 `routine::daily_review_prompt` 复盘。区别只有
+/// 授权：无人值守，所有权限请求一律拒绝。
+async fn run_daily_review(date: &str) -> Result<ReviewReport, String> {
+    let cli = money_never_sleep::agent::mns_bin().ok_or_else(|| "找不到 mns CLI".to_owned())?;
+    let prompt_cli = cli.clone();
+    let task = tokio::task::spawn_blocking(move || run_today_cli(&cli));
+    let today_report = tokio::time::timeout(REVIEW_CLI_TIMEOUT, task)
+        .await
+        .map_err(|_| format!("mns today 超过 {} 秒没结束", REVIEW_CLI_TIMEOUT.as_secs()))?
+        .map_err(|error| format!("巡检 CLI 任务失败：{error}"))??;
+
+    let weekday = review::weekday_text(date);
+    let goal = routine::daily_review_prompt(date, &weekday, &today_report, Some(&prompt_cli));
+
+    let (handle, mut events) = money_never_sleep::agent::start_runtime();
+    if handle
+        .send(AgentCommand::Start {
+            goal,
+            settings: review_settings(),
+            source: GoalSource::DailyReview,
+        })
+        .is_err()
+    {
+        let _ = handle.send(AgentCommand::Shutdown);
+        return Err("巡检 agent 会话没能启动".to_owned());
+    }
+    let raw = collect_message(&handle, &mut events, REVIEW_TIMEOUT).await;
+    // 每轮收掉 runtime：butlerd 是长寿进程，别攒空闲 ACP 线程。
+    let _ = handle.send(AgentCommand::Shutdown);
+
+    let raw = raw.ok_or_else(|| {
+        format!(
+            "巡检 agent {} 秒内没答完或会话中断",
+            REVIEW_TIMEOUT.as_secs()
+        )
+    })?;
+    // 先取结构化结论，再清洗正文：`validate_talk` 会把围栏剥掉。
+    let decision = money_never_sleep::agent::extract_decision(&raw);
+    let cleaned = talk::validate_talk(&raw).map_err(|error| format!("回答没过校验：{error}"))?;
+    let cleaned = cleaned.trim().to_owned();
+    if cleaned.is_empty() || cleaned == "无" || cleaned == "无。" {
+        return Err("巡检没有给出结论".to_owned());
+    }
+
+    let mut report = ReviewReport::new("每日巡检", date);
+    report.finish("finished", cleaned, decision.map(|decision| decision.raw));
+    if let Err(error) = review::save(&report) {
+        eprintln!("mns-butlerd: 巡检报告保存失败：{error}");
+    }
+    Ok(report)
+}
+
+/// 同步跑 `mns today --quiet`。CLI 自己负责刷新数据与落盘报告，我们只关心
+/// 它的输出（给 agent 当事实底稿）与退出码。
+fn run_today_cli(cli: &std::path::Path) -> Result<String, String> {
+    let mut command = std::process::Command::new(cli);
+    command
+        .args(["today", "--quiet"])
+        .current_dir(money_never_sleep::config::app_data_dir());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("mns today 启动失败：{error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("mns today 退出码 {:?}", output.status.code())
+        } else {
+            stderr.to_owned()
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if stdout.is_empty() {
+        return Err("mns today 没有输出报告".to_owned());
+    }
+    Ok(stdout)
+}
+
+/// 巡检用的 agent 设置。工作目录为空时落到 `agent/workspace`：Finder 拉起
+/// 的进程 cwd 是 `/`（macOS 上只读），不能让工具往那里写。
+fn review_settings() -> money_never_sleep::agent::AgentSettings {
+    let mut settings = money_never_sleep::agent::load_settings();
+    if settings.working_dir.trim().is_empty() {
+        let dir = money_never_sleep::config::app_data_dir()
+            .join("agent")
+            .join("workspace");
+        let _ = std::fs::create_dir_all(&dir);
+        settings.working_dir = dir.to_string_lossy().into_owned();
+    }
+    settings
+}
+
+/// 把窗口传来的引用解析成正文。报告已被删除或读不出来就跳过；最多 3 份，
+/// 每份截断到 6,000 字，避免一条消息把 ACP 会话撑爆。
+fn load_references(attachments: &[ReviewRef]) -> Vec<ChatReference> {
+    let mut out = Vec::new();
+    for item in attachments.iter().take(MAX_REFERENCES) {
+        let Ok(report) = review::load(&item.id) else {
+            continue;
+        };
+        let body = report.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let title = if report.title.trim().is_empty() {
+            item.title.clone()
+        } else {
+            report.title.clone()
+        };
+        out.push(ChatReference {
+            title,
+            body: clip_text(body, MAX_REFERENCE_CHARS),
+        });
+    }
+    out
+}
+
+fn clip_text(text: &str, limit: usize) -> String {
+    let mut out: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        out.push_str("\n…（报告过长，已截断）");
+    }
+    out
+}
+
+/// 巡检结果落地：保存报告（成功时）、并进会话、投递一条通知、记频控账。
+async fn deliver_review(
+    outcome: ReviewOutcome,
+    chat: &mut ChatState,
+    link: &mut GuiLink,
+    runtime: &ChatRuntime,
+) {
+    let now = Local::now();
+    let trigger = format!("review:{}", outcome.date);
+    let notice_id = orchestrator::notice_id_for(now, &trigger);
+    match outcome.result {
+        Ok(report) => {
+            let effects =
+                chat.service
+                    .push_butler(now, report.body.clone(), trigger.clone(), notice_id);
+            chat.apply(effects, runtime);
+
+            // banner 用固定安全口径：不引用模型结论，避免买卖点禁词与
+            // 60 字限制；完整结论在管家会话里。
+            let candidate = SpeakCandidate {
+                reason: SpeakReason::DailyReview,
+                trigger,
+                draft: "今日巡检已完成，点开管家窗口看结论。".to_owned(),
+            };
+            if let Err(error) = orchestrator::enqueue_notice(now, &candidate) {
+                eprintln!("mns-butlerd: 巡检通知写入失败：{error:#}");
+            }
+            if let Err(error) = orchestrator::enqueue_pending(now, &candidate) {
+                eprintln!("mns-butlerd: 巡检待投递写入失败：{error:#}");
+            }
+            // 与其它开口同一本账：审计与托盘频控都看得到这次巡检。
+            {
+                let _guard = writer_lock();
+                if let Ok(mut butler) = Butler::load() {
+                    butler.state.ledger.record(now, &candidate);
+                    butler.state.ledger.trim(now, 30);
+                    if let Err(error) = butler.save_state() {
+                        eprintln!("mns-butlerd: 巡检账本保存失败：{error:#}");
+                    }
+                }
+            }
+            chat.drain_pending(link, runtime).await;
+        }
+        Err(error) => {
+            eprintln!("mns-butlerd: 每日巡检失败：{error}");
+            let effects = chat.service.push_butler(
+                now,
+                format!("今日巡检没跑成：{error}"),
+                trigger,
+                notice_id,
+            );
+            chat.apply(effects, runtime);
+        }
+    }
 }
 
 /// 一轮完整的主动开口。
@@ -584,7 +889,17 @@ async fn collect_reply(
     handle: &AgentHandle,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
 ) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + AGENT_INIT_TIMEOUT;
+    collect_message(handle, events, AGENT_INIT_TIMEOUT).await
+}
+
+/// 收一轮 agent 的正文，直到回合结束或超时。权限请求一律拒绝：butlerd
+/// 没有授权界面，也没人在旁边点确认。
+async fn collect_message(
+    handle: &AgentHandle,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut buffer = String::new();
     loop {
         let event = match tokio::time::timeout_at(deadline, events.recv()).await {
@@ -597,7 +912,6 @@ async fn collect_reply(
                 text,
             } => buffer.push_str(&text),
             AgentEvent::Permission(prompt) => {
-                // 守护进程没有授权界面，也无人在旁边点确认：拒绝，别卡住。
                 let _ = handle.send(AgentCommand::Deny { id: prompt.id });
             }
             AgentEvent::TurnFinished { .. } => return Some(buffer),
@@ -609,7 +923,7 @@ async fn collect_reply(
                 };
             }
             AgentEvent::Failed { message } => {
-                eprintln!("mns-butlerd: agent-init 报错：{message}");
+                eprintln!("mns-butlerd: agent 会话报错：{message}");
                 return None;
             }
             _ => {}

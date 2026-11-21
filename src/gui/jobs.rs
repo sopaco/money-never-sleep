@@ -8,7 +8,7 @@
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::app::{self, RefreshOutcome, Snapshot};
-use crate::gui::conversations::{self, ConversationRecord, ConversationSummary};
+use crate::butler::review::{self, ReviewReport, ReviewSummary};
 
 pub enum Request {
     Load,
@@ -59,9 +59,9 @@ pub enum Request {
         shares: f64,
         price: f64,
     },
-    /// Produce the brief that opens a daily review. `refresh` maps to
+    /// Produce the brief that opens a review. `refresh` maps to
     /// `mns today`, otherwise `mns report` reuses the latest snapshot.
-    AgentBrief {
+    ReviewBrief {
         refresh: bool,
     },
     /// Persist a structured conclusion. The agent never writes files; the shell
@@ -69,14 +69,14 @@ pub enum Request {
     SaveDecision {
         body: String,
     },
-    /// Assistant conversation archive. One file per conversation; a running
-    /// session overwrites its own file as turns finish.
-    LoadConversations,
-    SaveConversation(Box<ConversationRecord>),
-    LoadConversation {
+    /// 巡检报告历史。与管家守护进程写的是同一个目录
+    /// （`~/.mns/agent/reviews`），巡检页与管家窗口因此看到同一份历史。
+    LoadReviews,
+    SaveReview(Box<ReviewReport>),
+    LoadReview {
         id: String,
     },
-    DeleteConversation {
+    DeleteReview {
         id: String,
     },
 }
@@ -98,13 +98,12 @@ pub enum Event {
         keyword: String,
         result: Result<Vec<crate::quote::FundCandidate>, String>,
     },
-    /// Refreshed archive index, sent after load / save / delete.
-    Conversations(Result<Vec<ConversationSummary>, String>),
-    /// Full transcript for a read-only replay.
-    ConversationOpened(Result<Box<ConversationRecord>, String>),
-    /// A write outcome that is not a failure of the conversation itself:
-    /// archive loss must never interrupt a live agent run.
-    ConversationNotice(Result<String, String>),
+    /// 刷新后的巡检报告列表，加载 / 保存 / 删除后发送。
+    Reviews(Result<Vec<ReviewSummary>, String>),
+    /// 完整报告，供只读回放。
+    ReviewOpened(Result<Box<ReviewReport>, String>),
+    /// 不影响本轮巡检的写入结果：历史落盘失败不能打断正在进行的巡检。
+    ReviewNotice(Result<String, String>),
 }
 
 #[derive(Clone)]
@@ -351,8 +350,8 @@ impl Jobs {
                                 let _ = event_tx.send(Event::LedgerRecorded(at));
                             }
                         }
-                        Request::AgentBrief { refresh } => {
-                            let _ = event_tx.send(Event::Brief(agent_brief(refresh)));
+                        Request::ReviewBrief { refresh } => {
+                            let _ = event_tx.send(Event::Brief(review_brief(refresh)));
                             let _ = event_tx.send(Event::Loaded(load()));
                         }
                         Request::SaveDecision { body } => match save_decision(&body) {
@@ -364,30 +363,30 @@ impl Jobs {
                                 let _ = event_tx.send(Event::Failed(error));
                             }
                         },
-                        Request::LoadConversations => {
-                            let _ = event_tx.send(Event::Conversations(conversations::list()));
+                        Request::LoadReviews => {
+                            let _ = event_tx.send(Event::Reviews(review::list(50)));
                         }
-                        Request::SaveConversation(record) => match conversations::save(&record) {
+                        Request::SaveReview(report) => match review::save(&report) {
                             Ok(()) => {
-                                let _ = event_tx.send(Event::Conversations(conversations::list()));
+                                let _ = event_tx.send(Event::Reviews(review::list(50)));
                             }
                             Err(error) => {
-                                let _ = event_tx.send(Event::ConversationNotice(Err(error)));
+                                let _ = event_tx.send(Event::ReviewNotice(Err(error)));
                             }
                         },
-                        Request::LoadConversation { id } => {
-                            let result = conversations::load(&id).map(Box::new);
-                            let _ = event_tx.send(Event::ConversationOpened(result));
+                        Request::LoadReview { id } => {
+                            let result = review::load(&id).map(Box::new);
+                            let _ = event_tx.send(Event::ReviewOpened(result));
                         }
-                        Request::DeleteConversation { id } => match conversations::delete(&id) {
+                        Request::DeleteReview { id } => match review::delete(&id) {
                             Ok(()) => {
-                                let _ = event_tx.send(Event::ConversationNotice(Ok(
-                                    "已删除这条会话记录".to_owned(),
+                                let _ = event_tx.send(Event::ReviewNotice(Ok(
+                                    "已删除这份巡检报告".to_owned(),
                                 )));
-                                let _ = event_tx.send(Event::Conversations(conversations::list()));
+                                let _ = event_tx.send(Event::Reviews(review::list(50)));
                             }
                             Err(error) => {
-                                let _ = event_tx.send(Event::ConversationNotice(Err(error)));
+                                let _ = event_tx.send(Event::ReviewNotice(Err(error)));
                             }
                         },
                     }
@@ -465,7 +464,7 @@ fn save_decision(body: &str) -> Result<std::path::PathBuf, String> {
 ///
 /// The shell deliberately does not re-implement report generation: the text the
 /// agent judges must be byte-identical to what the user sees in a terminal.
-fn agent_brief(refresh: bool) -> Result<String, String> {
+fn review_brief(refresh: bool) -> Result<String, String> {
     let cli = crate::agent::mns_bin().ok_or_else(|| {
         "未找到 mns CLI：请安装 MNS.app，或设置 MNS_BIN 指向可执行文件".to_owned()
     })?;

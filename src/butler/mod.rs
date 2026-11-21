@@ -13,6 +13,7 @@ pub mod events;
 pub mod expression;
 pub mod memory;
 pub mod orchestrator;
+pub mod review;
 pub mod schedule;
 pub mod session;
 pub mod store;
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 
 pub use memory::Memory;
 pub use orchestrator::{AccountFacts, Butler, ButlerState, DriftRow, WakeReport};
+pub use review::{DailyReview, ReviewRef, ReviewReport, ReviewSummary};
 pub use schedule::{SilentBecause, SpeakCandidate, SpeakDecision, SpeakPolicy, SpeakReason};
 pub use schedule::{WakeScheduler, WakeSource, WakeVerdict};
 pub use session::{Message, Role, Session};

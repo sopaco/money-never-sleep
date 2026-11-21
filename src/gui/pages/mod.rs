@@ -1,10 +1,10 @@
 //! Page composition helpers and the six top-level pages.
 
-pub mod agent;
 pub mod dashboard;
 pub mod performance;
 pub mod plan;
 pub mod portfolio;
+pub mod review;
 pub mod settings;
 
 use gpui_kit::base::StyledExt;

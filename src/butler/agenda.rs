@@ -1,9 +1,10 @@
 //! 下一次唤醒的时刻表。
 //!
 //! 守护进程不轮询：它把「下一次该在什么时候想事情」算出来，然后一直睡到
-//! 那个时刻。四个来源取最早的一个：
+//! 那个时刻。五个来源取最早的一个：
 //!
 //! - 定时巡检：`last_scheduled + 最小间隔`（从未巡检过就是现在）；
+//! - 每日巡检：设置里的 `daily_review_time`（今天已跑过就是明天）；
 //! - 自设任务：最早一条还没被唤醒过的待办；
 //! - 承诺到期：到期日当天早上（静音时段之后）；
 //! - agent-init 失败重试：上次尝试 + 退避时长。
@@ -19,6 +20,7 @@
 use chrono::{DateTime, Local};
 
 use super::orchestrator::agent_init_backoff;
+use super::review::DailyReview;
 use super::{Butler, WakeSource};
 
 /// 承诺到期在几点提。静音时段（默认 22:00–08:00）之后，早于这个点提会
@@ -36,7 +38,7 @@ pub struct Agenda {
 ///
 /// `None` 只在「连定时巡检都算不出来」时出现——实际上不会发生，保留是为了
 /// 让调用方不必假装时间一定存在。
-pub fn next(now: DateTime<Local>, butler: &Butler) -> Option<Agenda> {
+pub fn next(now: DateTime<Local>, butler: &Butler, review: Option<&DailyReview>) -> Option<Agenda> {
     let scheduler = &butler.state.scheduler;
     let mut rows: Vec<Agenda> = Vec::new();
 
@@ -44,6 +46,16 @@ pub fn next(now: DateTime<Local>, butler: &Butler) -> Option<Agenda> {
         at: scheduler.next_scheduled().unwrap_or(now),
         source: WakeSource::Scheduled,
     });
+
+    // 每日巡检有自己的固定时刻，不折算进 4 小时的定时巡检节奏。
+    if let Some(review) = review {
+        rows.push(Agenda {
+            at: review.at,
+            source: WakeSource::DailyReview {
+                id: review.id.clone(),
+            },
+        });
+    }
 
     if let Some((id, due)) = butler.tasks.next_due(now, &scheduler.seen_tasks) {
         rows.push(Agenda {
@@ -118,7 +130,7 @@ mod tests {
 
     #[test]
     fn 从未巡检过就立刻醒来() {
-        let agenda = next(at(10, 0), &butler()).unwrap();
+        let agenda = next(at(10, 0), &butler(), None).unwrap();
         assert_eq!(agenda.source, WakeSource::Scheduled);
         assert_eq!(agenda.at, at(10, 0));
     }
@@ -128,7 +140,7 @@ mod tests {
         let mut butler = butler();
         butler.state.scheduler = WakeScheduler::with_interval(4);
         butler.state.scheduler.last_scheduled = Some(at(9, 0));
-        let agenda = next(at(10, 0), &butler).unwrap();
+        let agenda = next(at(10, 0), &butler, None).unwrap();
         assert_eq!(agenda.source, WakeSource::Scheduled);
         assert_eq!(agenda.at, at(13, 0));
     }
@@ -149,7 +161,7 @@ mod tests {
             finished_at: None,
         });
         butler.tasks = board;
-        let agenda = next(at(10, 0), &butler).unwrap();
+        let agenda = next(at(10, 0), &butler, None).unwrap();
         assert_eq!(agenda.source, WakeSource::Task { id: "t1".into() });
         assert_eq!(agenda.at, at(11, 30));
     }
@@ -171,7 +183,7 @@ mod tests {
         });
         butler.tasks = board;
         butler.state.scheduler.seen_tasks.insert("t1".into());
-        let agenda = next(at(10, 0), &butler).unwrap();
+        let agenda = next(at(10, 0), &butler, None).unwrap();
         assert_eq!(
             agenda.source,
             WakeSource::Scheduled,
@@ -190,7 +202,7 @@ mod tests {
         );
         butler.memory = memory;
         // 08:30 时下一次巡检是 12:00，承诺在 09:00——承诺更早，按承诺排。
-        let agenda = next(date_at(19, 8, 30), &butler).unwrap();
+        let agenda = next(date_at(19, 8, 30), &butler, None).unwrap();
         assert_eq!(
             agenda.source,
             WakeSource::Commitment {
@@ -215,7 +227,7 @@ mod tests {
             .scheduler
             .seen_commitments
             .insert("promise:2026-11-19".into());
-        let agenda = next(date_at(19, 8, 30), &butler).unwrap();
+        let agenda = next(date_at(19, 8, 30), &butler, None).unwrap();
         assert_eq!(agenda.source, WakeSource::Scheduled);
     }
 
@@ -228,7 +240,7 @@ mod tests {
         case.state.last_agent_init = Some(at(9, 0));
         case.state.agent_init_failures = 1;
 
-        let agenda = next(at(9, 5), &case).unwrap();
+        let agenda = next(at(9, 5), &case, None).unwrap();
         assert!(
             matches!(agenda.source, WakeSource::AgentInitRetry { .. }),
             "失败重试应早于 4 小时后的巡检，实际 {agenda:?}"
@@ -240,7 +252,7 @@ mod tests {
         case.state.scheduler.last_scheduled = Some(at(9, 0));
         case.state.last_agent_init = Some(at(9, 0));
         case.state.agent_init_failures = 3;
-        let agenda = next(at(9, 5), &case).unwrap();
+        let agenda = next(at(9, 5), &case, None).unwrap();
         assert_eq!(
             agenda.source,
             WakeSource::Scheduled,
@@ -254,7 +266,7 @@ mod tests {
         case.state.agent_init_failures = 1;
         let id = format!("init-retry:{}", at(9, 0).timestamp_millis());
         case.state.scheduler.seen_agent_retries.insert(id);
-        let agenda = next(at(9, 5), &case).unwrap();
+        let agenda = next(at(9, 5), &case, None).unwrap();
         assert_eq!(agenda.source, WakeSource::Scheduled, "已消费的重试不再排");
     }
 
@@ -264,7 +276,7 @@ mod tests {
         butler.state.scheduler.last_scheduled = Some(at(9, 0));
         butler.state.last_agent_init = Some(at(9, 0));
         butler.state.agent_init_failures = 0;
-        let agenda = next(at(9, 5), &butler).unwrap();
+        let agenda = next(at(9, 5), &butler, None).unwrap();
         assert_eq!(
             agenda.source,
             WakeSource::Scheduled,
@@ -288,7 +300,51 @@ mod tests {
             finished_at: None,
         });
         butler.tasks = board;
-        let agenda = next(at(10, 0), &butler).unwrap();
+        let agenda = next(at(10, 0), &butler, None).unwrap();
         assert_eq!(agenda.at, at(10, 0));
+    }
+
+    #[test]
+    fn 每日巡检按配置时刻排而不是按四小时间隔() {
+        let mut case = butler();
+        // 定时巡检下一次在 11:00；巡检设在 08:30，应排巡检。
+        case.state.scheduler.last_scheduled = Some(at(7, 0));
+        let review = DailyReview {
+            at: at(8, 30),
+            id: "review:2026-11-17".to_owned(),
+        };
+        let agenda = next(at(8, 0), &case, Some(&review)).unwrap();
+        assert_eq!(
+            agenda.source,
+            WakeSource::DailyReview {
+                id: "review:2026-11-17".to_owned()
+            }
+        );
+        assert_eq!(agenda.at, at(8, 30));
+    }
+
+    #[test]
+    fn 巡检与任务取更早的一个() {
+        let mut case = butler();
+        case.state.scheduler.last_scheduled = Some(at(7, 0));
+        let mut board = TaskBoard::default();
+        board.tasks.push(ButlerTask {
+            id: "t1".into(),
+            intent: "检查今天有没有计划外操作".into(),
+            due_at: at(9, 0),
+            created_at: at(7, 10),
+            key: "k1".into(),
+            kind: crate::butler::tasks::TaskKind::Check,
+            state: crate::butler::tasks::TaskState::Pending,
+            finished_at: None,
+        });
+        case.tasks = board;
+        let review = DailyReview {
+            at: at(8, 30),
+            id: "review:2026-11-17".to_owned(),
+        };
+        let agenda = next(at(7, 30), &case, Some(&review)).unwrap();
+        assert!(matches!(agenda.source, WakeSource::DailyReview { .. }));
+        assert_eq!(agenda.at, at(8, 30));
     }
 }

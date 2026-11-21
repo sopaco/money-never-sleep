@@ -43,7 +43,7 @@ mns-butler mute | unmute     # 关闭 / 恢复主动开口
 agent 回答（默认 `opencode acp`），provider、模型与密钥都在 agent 自己的
 配置里，MNS 这边不保存。
 
-要换 CLI 或模型，在桌面端设置页「AI 助手」里改，写到 `~/.mns/gui.toml`。
+要换 CLI 或模型，在桌面端设置页「外部 Agent」里改，写到 `~/.mns/gui.toml`。
 agent 没装、没登录、超时，或回答超长不像话，这一条退回本地模板——判定、
 开口与通知始终在本机，和对话走哪条路无关。
 

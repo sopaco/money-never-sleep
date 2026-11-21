@@ -9,7 +9,6 @@ mod butler;
 mod chart;
 // Theme and small building blocks are shared with the mns-help viewer.
 pub(crate) mod components;
-pub(crate) mod conversations;
 pub(crate) mod help_links;
 mod jobs;
 mod mood;
@@ -19,7 +18,7 @@ pub(crate) mod theme;
 use chrono::Datelike;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt;
-use gpui_kit::component::input::{Input, InputState, TextareaState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
@@ -29,6 +28,7 @@ use crate::agent::{
     save_settings, start_runtime,
 };
 use crate::app::{BuyGuardrail, Snapshot};
+use crate::butler::review::{self, ReviewReport, ReviewSummary};
 use crate::notify;
 use crate::quote::FundCandidate;
 
@@ -47,7 +47,6 @@ pub(crate) fn hold_reason_text(reason: &str) -> String {
 }
 
 use components::*;
-use conversations::{ConversationMeta, ConversationRecord, ConversationSummary};
 use jobs::{Event as JobEvent, Jobs, Request};
 use theme::*;
 
@@ -73,34 +72,31 @@ actions!(
     mns_gui,
     [
         ShowMainWindow,
-        RunDefaultGoal,
-        StopCurrentTask,
+        StopReview,
         QuitApplication,
         StopButlerDaemon,
         StartButlerDaemon,
         RestartButlerDaemon,
-        CloseAgentPanel,
+        CloseReviewPanel,
         CloseMainWindow,
         ShowAbout,
         RefreshData,
         OpenPlanPage,
-        OpenAgentPage,
+        OpenReviewPage,
         OpenButlerWindow,
         RunTodayReview,
         OpenHelpCenter
     ]
 );
 
-const DEFAULT_GOAL: &str = "今天需要操作吗？帮我看一眼持仓和市场风险。";
-
-/// Secondary surfaces on the assistant page. Both used to be inline cards
-/// below the conversation, which forced a second scroll region and pushed the
-/// composer off screen. One panel at a time keeps the page a single surface.
+/// Secondary surfaces on the review page. Both used to be inline cards
+/// below the timeline, which forced a second scroll region and pushed the
+/// action bar off screen. One panel at a time keeps the page a single surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentPanel {
+pub(crate) enum ReviewPanel {
     Trace,
     Settings,
-    /// Archive of past conversations: open for a read-only replay, or delete.
+    /// 历史巡检报告：只读回放或删除。
     History,
 }
 
@@ -115,7 +111,7 @@ pub(crate) enum Page {
     Portfolio,
     Plan,
     Performance,
-    Agent,
+    Review,
     Settings,
 }
 
@@ -125,7 +121,7 @@ impl Page {
         Page::Portfolio,
         Page::Plan,
         Page::Performance,
-        Page::Agent,
+        Page::Review,
         Page::Settings,
     ];
 
@@ -135,7 +131,7 @@ impl Page {
             Page::Portfolio => "持仓",
             Page::Plan => "计划",
             Page::Performance => "复盘",
-            Page::Agent => "助手",
+            Page::Review => "巡检",
             Page::Settings => "设置",
         }
     }
@@ -147,7 +143,7 @@ impl Page {
             Page::Portfolio => "portfolio",
             Page::Plan => "plan",
             Page::Performance => "performance",
-            Page::Agent => "agent",
+            Page::Review => "review",
             Page::Settings => "settings",
         }
     }
@@ -174,7 +170,7 @@ impl Page {
             Page::Portfolio => IconName::Wallet,
             Page::Plan => IconName::CalendarCheck,
             Page::Performance => IconName::ChartLine,
-            Page::Agent => IconName::Sparkles,
+            Page::Review => IconName::Sparkles,
             Page::Settings => IconName::Settings,
         }
     }
@@ -189,7 +185,7 @@ impl Page {
             Page::Portfolio => help_links::PORTFOLIO,
             Page::Plan => help_links::PLAN,
             Page::Performance => help_links::REVIEW,
-            Page::Agent => help_links::AGENT,
+            Page::Review => help_links::REVIEW_PAGE,
             Page::Settings => help_links::SETTINGS,
         }
     }
@@ -298,9 +294,8 @@ pub(crate) struct Toast {
     pub tone: ToastTone,
 }
 
-/// Agent panel state. Kept separate from the account data so an agent run can
-/// stream while the user browses positions without clobbering either.
-pub(crate) struct AgentState {
+/// 巡检页状态。与账本数据分开存放，巡检流式输出时用户仍可浏览持仓。
+pub(crate) struct ReviewState {
     pub state: RunState,
     pub detail: String,
     pub timeline: Vec<TimelineEntry>,
@@ -315,11 +310,11 @@ pub(crate) struct AgentState {
     pub open: bool,
 }
 
-impl AgentState {
+impl ReviewState {
     fn new() -> Self {
         Self {
             state: RunState::default(),
-            detail: "尚未提交目标".to_owned(),
+            detail: "尚未开始巡检".to_owned(),
             timeline: Vec::new(),
             streaming: None,
             pending: None,
@@ -434,35 +429,50 @@ fn valid_clock_time(raw: &str) -> bool {
     )
 }
 
-/// Marker for the last scheduled review, stored next to the decision archive so
-/// a restart cannot trigger the same day twice.
-fn last_daily_path() -> std::path::PathBuf {
-    crate::agent::settings_dir()
-        .join("agent")
-        .join("last-review")
+/// 一次巡检的元数据。报告本体由 `butler::review` 负责落盘，这里只把它
+/// 挂在正在进行的时间线旁边，结束时补写正文与结论。
+struct ReviewMeta {
+    report: ReviewReport,
 }
 
-fn read_last_daily() -> Option<String> {
-    let text = std::fs::read_to_string(last_daily_path()).ok()?;
-    let text = text.trim().to_owned();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-fn write_last_daily(date: &str) {
-    let path = last_daily_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+impl ReviewMeta {
+    /// 新报告的来源固定为「手动巡检」：GUI 里唯一能发起巡检的入口是
+    /// 「立即巡检」，定时巡检归管家守护进程。
+    fn new() -> Self {
+        Self {
+            report: ReviewReport::new("手动巡检", review::today_text()),
+        }
     }
-    let _ = std::fs::write(path, date);
 }
 
-/// A past conversation shown in place of the live one. The ACP context lives
-/// in the external agent, which MNS never re-opens, so a replay is explicitly
-/// read-only rather than pretending the model remembers the thread.
+/// 只读回放的一份巡检报告。现场状态不去还原：报告只保存正文与结论，
+/// 没有执行轨迹，硬造一条时间线反而会骗人。
 #[derive(Clone, Debug)]
-pub(crate) struct ViewedConversation {
-    pub id: String,
-    pub title: String,
+pub(crate) struct ViewedReview {
+    pub report: ReviewReport,
+    /// 结论卡片的解析结果；`decision` 缺失或 JSON 坏掉时为 `None`，退化为
+    /// 只显示正文。
+    pub decision: Option<DecisionReport>,
+}
+
+/// 报告里的状态串 → 时间线状态标签。旧字段认不出来时按「已结束」处理。
+fn review_state_tag(state: RunState) -> &'static str {
+    match state {
+        RunState::Running | RunState::Idle | RunState::Starting => "running",
+        RunState::WaitingPermission | RunState::Finished | RunState::Stopping => "finished",
+        RunState::Failed => "failed",
+        RunState::Cancelled => "cancelled",
+    }
+}
+
+/// 把存档里的原始 JSON 还原成结论卡片。解析失败只意味着这张卡片不显示，
+/// 不能让整份历史打不开。
+fn decision_from_raw(raw: &str) -> Option<DecisionReport> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    Some(DecisionReport {
+        raw: raw.to_owned(),
+        value,
+    })
 }
 
 struct GuiState {
@@ -509,11 +519,9 @@ pub(crate) struct AppShell {
     /// Incremented for every message; see `Toast::id`.
     toast_seq: u64,
     pub(crate) dialog: Option<Dialog>,
-    pub(crate) agent: AgentState,
+    pub(crate) review: ReviewState,
     pub(crate) agent_settings: AgentSettings,
     pub(crate) jobs: Jobs,
-    pub(crate) goal: Entity<TextareaState>,
-    pub(crate) followup: Entity<TextareaState>,
     pub(crate) cli: Entity<InputState>,
     pub(crate) cwd: Entity<InputState>,
     /// Free-text model id. Empty defers to the external agent's own default.
@@ -532,45 +540,33 @@ pub(crate) struct AppShell {
     pub(crate) butler_quiet_end: Entity<InputState>,
     /// 记账成功后等新快照到达再唤醒管家；记的是那条行为日志的毫秒时间戳。
     pending_ledger_wake: Option<String>,
-    /// Date (`YYYY-MM-DD`) of the last scheduled review this process started.
-    /// Set when the run is dispatched, not when it finishes: a failing review
-    /// must not retry every minute for the rest of the day.
-    pub(crate) last_daily: Option<String>,
     /// The one open secondary surface (execution trace or advanced setup).
-    /// `None` means the conversation owns the whole page.
-    pub(crate) agent_panel: Option<AgentPanel>,
-    /// Tracks the single scrollable conversation surface so a new answer can
+    /// `None` means the timeline owns the whole page.
+    pub(crate) review_panel: Option<ReviewPanel>,
+    /// Tracks the single scrollable timeline surface so a new answer can
     /// follow the tail without the user fighting a nested scrollbar.
     pub(crate) conversation_scroll: ScrollHandle,
     /// The drawer takes focus while open: its own key context then owns Esc
-    /// instead of the composer input behind it.
-    pub(crate) agent_panel_focus: FocusHandle,
+    /// instead of whatever is behind it.
+    pub(crate) review_panel_focus: FocusHandle,
     /// The "About MNS" panel is reachable from the macOS app menu, so it has
     /// to work even when the window was hidden rather than closed.
     about_open: bool,
-    /// Archive index shown in the history drawer. Only summaries are held in
-    /// memory; full transcripts are read on demand.
-    pub(crate) history: Vec<ConversationSummary>,
-    pub(crate) history_loaded: bool,
-    pub(crate) history_error: Option<String>,
+    /// 历史抽屉里的巡检报告索引。内存只留摘要，正文按需读取。
+    pub(crate) reviews: Vec<ReviewSummary>,
+    pub(crate) reviews_loaded: bool,
+    pub(crate) reviews_error: Option<String>,
     /// Row awaiting a second click before its file is removed.
-    pub(crate) history_pending_delete: Option<String>,
-    /// Metadata for the live session, `None` before the first goal and after
+    pub(crate) reviews_pending_delete: Option<String>,
+    /// Metadata for the live session, `None` before the first review and after
     /// the user deletes the record of the session they are still in.
-    current_conversation: Option<ConversationMeta>,
-    /// True when the transcript changed since the last archive write. The
-    /// minute tick uses it to flush a still-streaming answer without writing
-    /// the same file on every token or when nothing happened at all.
-    conversation_dirty: bool,
-    /// `Some` while a past conversation is being replayed in the chat surface.
-    pub(crate) viewing_history: Option<ViewedConversation>,
+    current_report: Option<ReviewMeta>,
+    /// `Some` 时时间线区域被只读的历史报告占据。
+    pub(crate) viewing_review: Option<ViewedReview>,
     /// Whether the dashboard's "最近报告" card shows the full archived text.
     /// Collapsed by default: the card previews the header; the full weekly
     /// ritual text is one click away.
     pub(crate) report_expanded: bool,
-    /// Live agent state parked while the chat surface shows a replay. Incoming
-    /// runtime events are folded into this, never into the replay.
-    live_agent: Option<Box<AgentState>>,
 }
 
 impl AppShell {
@@ -582,18 +578,10 @@ impl AppShell {
         about: bool,
     ) -> Self {
         let agent_settings = load_settings();
-        let goal = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .placeholder("想问什么？例如「今天需要操作吗」")
-                .default_value(DEFAULT_GOAL)
-        });
         let cli = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("opencode 可执行文件路径")
                 .default_value(agent_settings.agent_cli.clone())
-        });
-        let followup = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("接着问，例如：黄金这一腿为什么不动？")
         });
         let cwd = cx.new(|cx| {
             InputState::new(window, cx)
@@ -667,11 +655,9 @@ impl AppShell {
             toast: None,
             toast_seq: 0,
             dialog: None,
-            agent: AgentState::new(),
+            review: ReviewState::new(),
             agent_settings,
             jobs,
-            goal,
-            followup,
             cli,
             cwd,
             model,
@@ -687,20 +673,17 @@ impl AppShell {
                 .map(|butler| butler.state.policy.enabled)
                 .unwrap_or(true),
             pending_ledger_wake: None,
-            last_daily: read_last_daily(),
-            agent_panel: None,
+            review_panel: None,
             conversation_scroll: ScrollHandle::new(),
-            agent_panel_focus: cx.focus_handle(),
+            review_panel_focus: cx.focus_handle(),
             about_open: about,
-            history: Vec::new(),
-            history_loaded: false,
-            history_error: None,
-            history_pending_delete: None,
-            current_conversation: None,
-            conversation_dirty: false,
-            viewing_history: None,
+            reviews: Vec::new(),
+            reviews_loaded: false,
+            reviews_error: None,
+            reviews_pending_delete: None,
+            current_report: None,
+            viewing_review: None,
             report_expanded: false,
-            live_agent: None,
         };
         // 启动即记一条：管家要能区分「今天开过应用」和「今天完全没看」。
         // 开关关闭时 `append` 自己会跳过，这里不必再判一次。窗口重建也属于
@@ -750,7 +733,7 @@ impl AppShell {
     /// Keep the newest answer in view, but never yank the page away from
     /// someone who scrolled up to re-read an earlier turn. `force` is for a
     /// turn the user just started themselves.
-    fn follow_conversation(&self, force: bool) {
+    fn follow_review(&self, force: bool) {
         let handle = &self.conversation_scroll;
         let near_bottom = handle.max_offset().y + handle.offset().y <= px(96.);
         if force || near_bottom {
@@ -767,7 +750,7 @@ impl AppShell {
         self.page = page;
         // A drawer belongs to the page that opened it; leaving must not leave
         // it hanging around when the user comes back.
-        self.agent_panel = None;
+        self.review_panel = None;
         cx.notify();
     }
 
@@ -792,148 +775,129 @@ impl AppShell {
         let _ = self.jobs.send(Request::Load);
     }
 
-    // ── Conversation archive ───────────────────────────────────────────
+    // ── 巡检报告历史 ───────────────────────────────────────────────────
 
-    /// Ask the worker for the archive index: on startup and whenever the
-    /// history drawer is raised, so an unattended daily review shows up too.
-    pub(crate) fn load_history(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self.jobs.send(Request::LoadConversations) {
-            self.history_error = Some(error.clone());
+    /// 拉取报告索引：启动时、打开历史抽屉时各一次，管家写的定时巡检也能出现。
+    pub(crate) fn load_reviews(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.jobs.send(Request::LoadReviews) {
+            self.reviews_error = Some(error.clone());
             self.show_toast(error, ToastTone::Error, cx);
         }
     }
 
-    /// Upsert the live session. Deliberately called at low-frequency
-    /// boundaries only — writing on every streamed delta would rewrite the
-    /// whole transcript for each token.
-    fn archive_current(&mut self, cx: &mut Context<Self>) {
-        if self.viewing_history.is_some() {
+    /// 用当前时间线组装并覆盖写入本次巡检报告。只在低频边界调用——
+    /// 每个 token 都写会把整份正文重写一遍。
+    fn save_current_review(&mut self, cx: &mut Context<Self>) {
+        if self.viewing_review.is_some() {
             return;
         }
-        let Some(meta) = self.current_conversation.clone() else {
-            return;
-        };
-        let Some(record) = conversations::build_record(
-            &meta,
-            &self.agent.timeline,
-            self.agent.decision.as_ref(),
-            self.agent.state,
-        ) else {
+        let Some(meta) = self.current_report.as_mut() else {
             return;
         };
-        match self.jobs.send(Request::SaveConversation(Box::new(record))) {
-            Ok(()) => self.conversation_dirty = false,
-            Err(error) => self.show_toast(error, ToastTone::Error, cx),
-        }
-    }
-
-    pub(crate) fn open_history_conversation(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.agent.is_running() || self.agent.pending.is_some() {
-            self.show_toast(
-                "助手正在工作，结束后再查看历史记录。".to_owned(),
-                ToastTone::Error,
-                cx,
-            );
-            cx.notify();
+        // 没有内容就不落盘：一次点开又立刻关掉的空白巡检不该成为历史。
+        if !self.review.timeline.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::User | EntryKind::Message | EntryKind::Error
+            )
+        }) {
             return;
         }
-        // Switching between replays must not bump the live session's
-        // `updated_at` and reorder the list underneath the user.
-        if self.viewing_history.is_none() {
-            self.archive_current(cx);
-        }
-        if let Err(error) = self.jobs.send(Request::LoadConversation { id }) {
-            self.show_toast(error, ToastTone::Error, cx);
-        }
-        cx.notify();
-    }
-
-    fn show_history_record(&mut self, record: ConversationRecord, cx: &mut Context<Self>) {
-        if self.live_agent.is_none() {
-            let live = std::mem::replace(&mut self.agent, AgentState::new());
-            self.live_agent = Some(Box::new(live));
-        }
-        self.agent.timeline = conversations::restore_entries(&record.entries);
-        self.agent.decision = record
+        let body = self
+            .review
+            .timeline
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Message)
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let decision = self
+            .review
             .decision
-            .as_deref()
-            .and_then(conversations::decision_from_raw);
-        self.agent.state = conversations::state_from_tag(&record.state);
-        self.agent.detail = "历史会话（只读）".to_owned();
-        self.agent.open = false;
-        self.agent.streaming = None;
-        self.agent.pending = None;
-        self.agent.error = None;
-        self.viewing_history = Some(ViewedConversation {
-            id: record.id.clone(),
-            title: record.title.clone(),
-        });
-        self.agent_panel = None;
-        self.history_pending_delete = None;
-        self.follow_conversation(true);
-        cx.notify();
-    }
-
-    pub(crate) fn exit_history_view(&mut self, cx: &mut Context<Self>) {
-        if self.viewing_history.take().is_none() {
-            return;
-        }
-        if let Some(live) = self.live_agent.take() {
-            self.agent = *live;
-        }
-        // Turns that arrived while the replay was on screen were folded into
-        // the parked state; flush them now that the live session is visible.
-        self.archive_current(cx);
-        self.follow_conversation(false);
-        cx.notify();
-    }
-
-    pub(crate) fn request_delete_history(&mut self, id: String, cx: &mut Context<Self>) {
-        self.history_pending_delete = Some(id);
-        cx.notify();
-    }
-
-    pub(crate) fn cancel_delete_history(&mut self, cx: &mut Context<Self>) {
-        self.history_pending_delete = None;
-        cx.notify();
-    }
-
-    pub(crate) fn confirm_delete_history(&mut self, id: String, cx: &mut Context<Self>) {
-        self.history_pending_delete = None;
-        // Deleting the record of the live session must not let the next turn
-        // silently recreate it; a new goal opens a fresh archive entry.
-        if self
-            .current_conversation
             .as_ref()
-            .is_some_and(|meta| meta.id == id)
-        {
-            self.current_conversation = None;
-        }
-        if self
-            .viewing_history
-            .as_ref()
-            .is_some_and(|view| view.id == id)
-        {
-            self.exit_history_view(cx);
-        }
-        if let Err(error) = self.jobs.send(Request::DeleteConversation { id }) {
+            .map(|report| report.raw.clone());
+        meta.report
+            .finish(review_state_tag(self.review.state), body, decision);
+        let report = meta.report.clone();
+        if let Err(error) = self.jobs.send(Request::SaveReview(Box::new(report))) {
             self.show_toast(error, ToastTone::Error, cx);
         }
-        cx.notify();
     }
 
-    pub(crate) fn start_agent(&mut self, cx: &mut Context<Self>) {
-        let goal = self.goal.read(cx).value().trim().to_string();
-        if goal.is_empty() {
+    pub(crate) fn open_review(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.review.is_running() || self.review.pending.is_some() {
             self.show_toast(
-                "先写一句目标，再启动 Agent。".to_owned(),
+                "巡检正在运行，结束后再查看历史。".to_owned(),
                 ToastTone::Error,
                 cx,
             );
             cx.notify();
             return;
         }
-        self.begin_session(goal.clone(), goal, GoalSource::Manual, cx);
+        // 切换回放不能刷新当前报告的 `updated_at`，否则列表会在用户脚下重排。
+        if self.viewing_review.is_none() {
+            self.save_current_review(cx);
+        }
+        if let Err(error) = self.jobs.send(Request::LoadReview { id }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
+    }
+
+    /// 只读回放：正文 + 结论卡片，不还原执行轨迹。
+    fn show_review(&mut self, report: ReviewReport, cx: &mut Context<Self>) {
+        self.viewing_review = Some(ViewedReview {
+            decision: report.decision.as_deref().and_then(decision_from_raw),
+            report,
+        });
+        self.review_panel = None;
+        self.reviews_pending_delete = None;
+        self.follow_review(true);
+        cx.notify();
+    }
+
+    pub(crate) fn exit_review_view(&mut self, cx: &mut Context<Self>) {
+        if self.viewing_review.take().is_none() {
+            return;
+        }
+        // 回放期间到达的输出仍写进当前时间线；退出时补一次落盘。
+        self.save_current_review(cx);
+        self.follow_review(false);
+        cx.notify();
+    }
+
+    pub(crate) fn request_delete_review(&mut self, id: String, cx: &mut Context<Self>) {
+        self.reviews_pending_delete = Some(id);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_review(&mut self, cx: &mut Context<Self>) {
+        self.reviews_pending_delete = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_delete_review(&mut self, id: String, cx: &mut Context<Self>) {
+        self.reviews_pending_delete = None;
+        // 删除当前报告后，下一轮巡检会得到一份新 id；旧文件不能借下一轮复活。
+        if self
+            .current_report
+            .as_ref()
+            .is_some_and(|meta| meta.report.id == id)
+        {
+            self.current_report = None;
+        }
+        if self
+            .viewing_review
+            .as_ref()
+            .is_some_and(|view| view.report.id == id)
+        {
+            self.viewing_review = None;
+            self.follow_review(false);
+        }
+        if let Err(error) = self.jobs.send(Request::DeleteReview { id }) {
+            self.show_toast(error, ToastTone::Error, cx);
+        }
+        cx.notify();
     }
 
     /// Open one ACP session. `display` is what the user sees (a short label for
@@ -946,104 +910,62 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         self.persist_agent_settings(cx);
-        // A menu action or an unattended review can arrive while a replay is
-        // on screen: restore the live session before archiving and replacing it.
-        if self.viewing_history.is_some() {
-            self.exit_history_view(cx);
+        // 菜单或托盘也能在回放时发起巡检：先退出回放，再归档上一份。
+        if self.viewing_review.is_some() {
+            self.exit_review_view(cx);
         }
-        self.archive_current(cx);
-        self.current_conversation = Some(ConversationMeta::new(match source {
-            GoalSource::Manual => "手动",
-            GoalSource::DailyReview => "每日巡检",
-            // Not reached from this shell today (the butler window owns its
-            // own session), but the enum is exhaustive on purpose: a new
-            // source must decide what the archive calls it.
-            GoalSource::Conversation => "管家对话",
-        }));
-        self.agent.timeline.clear();
-        self.agent.streaming = None;
-        self.agent.pending = None;
-        self.agent.error = None;
-        self.agent.decision = None;
-        self.agent.started = true;
-        self.agent.open = true;
-        self.agent.state = RunState::Starting;
-        self.agent.detail = match source {
-            GoalSource::Manual => "目标已提交，正在连接外部 Agent".to_owned(),
+        self.save_current_review(cx);
+        self.current_report = Some(ReviewMeta::new());
+        self.review.timeline.clear();
+        self.review.streaming = None;
+        self.review.pending = None;
+        self.review.error = None;
+        self.review.decision = None;
+        self.review.started = true;
+        self.review.open = true;
+        self.review.state = RunState::Starting;
+        self.review.detail = match source {
+            GoalSource::Manual => "巡检已提交，正在连接外部 Agent".to_owned(),
             GoalSource::DailyReview => "正在准备今日巡检".to_owned(),
             GoalSource::Conversation => "正在连接管家 Agent".to_owned(),
         };
-        // The user's own words stay in the transcript; a scheduled run shows a
-        // label instead of dumping a several-thousand-character prompt.
-        self.agent.push(EntryKind::User, display);
+        // 首条 User 行是报告标题；定时巡检显示短标签而不是整段提示词。
+        self.review.push(EntryKind::User, display);
         if let Err(error) = self.agent_send(AgentCommand::Start {
             goal: prompt,
             settings: self.agent_settings.clone(),
             source,
         }) {
-            self.agent.state = RunState::Failed;
-            self.agent.open = false;
-            self.agent.error = Some(error.clone());
-            self.agent.push(EntryKind::Error, error);
+            self.review.state = RunState::Failed;
+            self.review.open = false;
+            self.review.error = Some(error.clone());
+            self.review.push(EntryKind::Error, error);
         }
         // Persist the opening line immediately: a crash mid-run should still
-        // leave a dated, titled conversation rather than nothing at all.
-        self.archive_current(cx);
-        self.follow_conversation(true);
-        cx.notify();
-    }
-
-    /// Answer a follow-up inside the live session.
-    pub(crate) fn ask_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.is_running() {
-            return;
-        }
-        if !self.agent.open {
-            self.show_toast(
-                "会话已结束，请重新开始一个任务。".to_owned(),
-                ToastTone::Error,
-                cx,
-            );
-            cx.notify();
-            return;
-        }
-        let question = self.followup.read(cx).value().trim().to_string();
-        if question.is_empty() {
-            return;
-        }
-
-        self.agent.push(EntryKind::User, question.clone());
-        self.agent.error = None;
-        self.agent.streaming = None;
-        self.agent.state = RunState::Running;
-        self.agent.detail = "Agent 正在回答追问…".to_owned();
-        if let Err(error) = self.agent_send(AgentCommand::Ask {
-            text: routine::followup_prompt(&question),
-        }) {
-            self.agent.state = RunState::Failed;
-            self.agent.error = Some(error.clone());
-            self.agent.push(EntryKind::Error, error);
-        }
-        self.follow_conversation(true);
-        self.archive_current(cx);
-        // Rebuilding the state is the only reset that does not depend on an
-        // editor-specific clear() API; the old value would otherwise linger in
-        // the box and be re-sent by a second click.
-        self.followup = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("接着问，例如：黄金这一腿为什么不动？")
-        });
+        // leave a dated, titled report rather than nothing at all.
+        self.save_current_review(cx);
+        self.follow_review(true);
         cx.notify();
     }
 
     /// Kick off the daily review: the CLI produces the brief, then the session
     /// opens with it. Nothing is written by the agent.
     pub(crate) fn start_daily_review(&mut self, refresh: bool, cx: &mut Context<Self>) {
-        if self.agent.is_running() {
+        if self.review.is_running() {
             return;
         }
-        self.agent.detail = "正在生成今日报告…".to_owned();
-        self.agent.state = RunState::Starting;
-        self.agent.push(
+        // 与管家守护进程共用「今天已巡检」标记：同一天只落一份结论。
+        if let Err(error) = review::write_last(&review::today_text()) {
+            self.show_toast(format!("无法记录巡检日期：{error}"), ToastTone::Error, cx);
+            cx.notify();
+            return;
+        }
+        if self.viewing_review.is_some() {
+            self.exit_review_view(cx);
+        }
+        self.review.detail = "正在生成今日报告…".to_owned();
+        self.review.state = RunState::Starting;
+        self.review.push(
             EntryKind::System,
             if refresh {
                 "正在运行 mns today，生成今日数据…"
@@ -1051,40 +973,17 @@ impl AppShell {
                 "正在读取最近一次报告…"
             },
         );
-        if let Err(error) = self.jobs.send(Request::AgentBrief { refresh }) {
-            self.agent.state = RunState::Failed;
-            self.agent.error = Some(error.clone());
-            self.agent.push(EntryKind::Error, error);
+        if let Err(error) = self.jobs.send(Request::ReviewBrief { refresh }) {
+            self.review.state = RunState::Failed;
+            self.review.error = Some(error.clone());
+            self.review.push(EntryKind::Error, error);
         }
         cx.notify();
     }
 
-    /// Scheduled entry point. Dispatches at most once per calendar day, and
-    /// only when a review is enabled.
-    pub(crate) fn maybe_start_daily(&mut self, cx: &mut Context<Self>) {
-        if !self.agent_settings.daily_review || self.agent.is_running() {
-            return;
-        }
-        let now = chrono::Local::now();
-        let today = now.format("%Y-%m-%d").to_string();
-        if self.last_daily.as_deref() == Some(today.as_str()) {
-            return;
-        }
-        let target = self.agent_settings.daily_review_time.trim();
-        if target.is_empty() || now.format("%H:%M").to_string().as_str() < target {
-            return;
-        }
-        self.last_daily = Some(today.clone());
-        // Persisted so restarting the app mid-day does not fire the review a
-        // second time. A duplicate run means duplicate trade suggestions, which
-        // is worse than a missed one.
-        write_last_daily(&today);
-        self.start_daily_review(true, cx);
-    }
-
-    pub(crate) fn stop_agent(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn stop_review(&mut self, cx: &mut Context<Self>) {
         let _ = self.agent_send(AgentCommand::Stop);
-        self.agent
+        self.review
             .push(EntryKind::System, "已请求停止，等待协议确认");
         cx.notify();
     }
@@ -1167,46 +1066,33 @@ impl AppShell {
         self.agent_settings.working_dir = self.cwd.read(cx).value().trim().to_owned();
         self.agent_settings.model = self.model.read(cx).value().trim().to_owned();
         if let Err(error) = save_settings(&self.agent_settings) {
-            self.agent.error = Some(error);
+            self.review.error = Some(error);
         }
     }
 
     /// One drawer at a time. Clicking the same trigger again closes it, so the
     /// user never has to hunt for a close button.
-    pub(crate) fn toggle_agent_panel(
+    pub(crate) fn toggle_review_panel(
         &mut self,
-        panel: AgentPanel,
+        panel: ReviewPanel,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_panel == Some(panel) {
-            self.close_agent_panel(window, cx);
+        if self.review_panel == Some(panel) {
+            self.close_review_panel(window, cx);
             return;
         }
-        self.agent_panel = Some(panel);
-        self.history_pending_delete = None;
-        if panel == AgentPanel::History {
-            self.load_history(cx);
+        self.review_panel = Some(panel);
+        self.reviews_pending_delete = None;
+        if panel == ReviewPanel::History {
+            self.load_reviews(cx);
         }
-        window.focus(&self.agent_panel_focus, cx);
+        window.focus(&self.review_panel_focus, cx);
         cx.notify();
     }
 
-    /// Give the composer its caret back after a drawer or a history replay
-    /// owned the window. Without this the input is visible but cannot be typed
-    /// into until the user clicks it first.
-    pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = if self.agent.open {
-            self.followup.read(cx).focus_handle(cx)
-        } else {
-            self.goal.read(cx).focus_handle(cx)
-        };
-        window.focus(&handle, cx);
-    }
-
-    pub(crate) fn close_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent_panel.take().is_some() {
-            self.focus_composer(window, cx);
+    pub(crate) fn close_review_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_panel.take().is_some() {
             cx.notify();
         }
     }
@@ -1323,7 +1209,7 @@ impl AppShell {
         cx.notify();
     }
 
-    /// 清除行为记录。只删 `agent/events.jsonl`，不碰账本、报告与助手存档。
+    /// 清除行为记录。只删 `agent/events.jsonl`，不碰账本、报告与巡检存档。
     pub(crate) fn clear_behavior_log(&mut self, cx: &mut Context<Self>) {
         match crate::butler::events::clear() {
             Ok(()) => self.show_toast("已清除本地行为记录".to_owned(), ToastTone::Success, cx),
@@ -1332,9 +1218,8 @@ impl AppShell {
         cx.notify();
     }
 
-    /// 启动补更新。定时任务只在进程存活期间触发；如果当天已过设定时间、
-    /// 且今天还没有任何更新，就趁启动补一次，避免开机较晚时一整天都停在
-    /// 昨天的价格。
+    /// 启动补更新。定时巡检已归管家守护进程；窗口关闭后价格仍需要一次
+    /// 补齐，避免开机较晚时一整天都停在昨天的价格。
     fn startup_catch_up(&mut self, cx: &mut Context<Self>) {
         let now = chrono::Local::now();
         let target = self.agent_settings.daily_review_time.trim().to_owned();
@@ -1342,20 +1227,37 @@ impl AppShell {
             return;
         }
         let today = now.format("%Y-%m-%d").to_string();
-        // 今天的巡检已经跑过：它内部执行 `mns today`，价格已是最新。
-        if self.last_daily.as_deref() == Some(today.as_str()) {
+        // 今天已经巡检过：巡检链路内部执行过 `mns today`，价格已是最新。
+        if review::read_last().as_deref() == Some(today.as_str()) {
             return;
         }
-        if self.agent_settings.daily_review {
-            // 巡检链路会先更新价格再生成报告，这里直接补跑，不必等下一次
-            // 分钟轮询。
-            self.maybe_start_daily(cx);
-            return;
-        }
-        // 没有开启巡检时，只补价格与情绪数据（不生成报告、不调用 Agent）。
         if let Err(error) = self.jobs.send(Request::CatchUpRefresh { target }) {
             self.show_toast(error, ToastTone::Error, cx);
         }
+    }
+
+    /// 长流式回答的兜底存档：每 60 秒把正在跑的巡检写一次。决策、权限、
+    /// 回合结束这些边界已经会立即落盘；这条循环只兜住「一直没有边界」的
+    /// 情况，崩一次最多丢一分钟正文。
+    fn start_review_flush(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |weak, async_cx| {
+            loop {
+                async_cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+                let alive = weak.update(async_cx, |shell, cx| {
+                    if shell.review.is_running() {
+                        shell.save_current_review(cx);
+                    }
+                });
+                if alive.is_err() {
+                    // 窗口关了：别留一个空转任务。
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn save_daily_time(&mut self, cx: &mut Context<Self>) {
@@ -1402,7 +1304,7 @@ impl AppShell {
         if let Err(error) = save_settings(&self.agent_settings) {
             self.show_toast(error, ToastTone::Error, cx);
         }
-        self.agent.push(
+        self.review.push(
             EntryKind::System,
             format!("权限策略：{} — {}", policy.label(), policy.hint()),
         );
@@ -1433,26 +1335,22 @@ impl AppShell {
 
     pub(crate) fn grant(&mut self, id: u64, option_id: String, cx: &mut Context<Self>) {
         let _ = self.agent_send(AgentCommand::Grant { id, option_id });
-        self.agent.push(EntryKind::Permission, "已批准该操作");
+        self.review.push(EntryKind::Permission, "已批准该操作");
         cx.notify();
     }
 
     pub(crate) fn deny(&mut self, id: u64, cx: &mut Context<Self>) {
         let _ = self.agent_send(AgentCommand::Deny { id });
-        self.agent.push(EntryKind::Permission, "已拒绝该操作");
+        self.review.push(EntryKind::Permission, "已拒绝该操作");
         cx.notify();
     }
 
     pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
         // Best-effort final flush: the worker is still alive at this point, so
-        // the last (possibly streamed) turn survives an ordinary quit. Put the
-        // live session back first — a replay must never be what gets saved.
-        if self.viewing_history.take().is_some() {
-            if let Some(live) = self.live_agent.take() {
-                self.agent = *live;
-            }
-        }
-        self.archive_current(cx);
+        // the last (possibly streamed) turn survives an ordinary quit. 回放
+        // 历史时退出也必须先恢复当前巡检，不能把历史当成正在写的那份。
+        self.viewing_review = None;
+        self.save_current_review(cx);
         let _ = self.agent_send(AgentCommand::Shutdown);
     }
 
@@ -1526,17 +1424,17 @@ impl AppShell {
                 let cli = crate::agent::mns_bin();
                 let prompt = routine::daily_review_prompt(&date, weekday, &report, cli.as_deref());
                 self.begin_session(
-                    format!("每日巡检 · {date}"),
+                    format!("巡检 · {date}"),
                     prompt,
                     GoalSource::DailyReview,
                     cx,
                 );
             }
             JobEvent::Brief(Err(error)) => {
-                self.agent.state = RunState::Failed;
-                self.agent.open = false;
-                self.agent.error = Some(error.clone());
-                self.agent
+                self.review.state = RunState::Failed;
+                self.review.open = false;
+                self.review.error = Some(error.clone());
+                self.review
                     .push(EntryKind::Error, format!("无法生成今日报告：{error}"));
             }
             JobEvent::FundSearch { keyword, result } => {
@@ -1557,26 +1455,26 @@ impl AppShell {
                     }
                 }
             }
-            JobEvent::Conversations(Ok(rows)) => {
-                self.history = rows;
-                self.history_loaded = true;
-                self.history_error = None;
+            JobEvent::Reviews(Ok(rows)) => {
+                self.reviews = rows;
+                self.reviews_loaded = true;
+                self.reviews_error = None;
             }
-            JobEvent::Conversations(Err(error)) => {
-                self.history_loaded = true;
-                self.history_error = Some(error.clone());
+            JobEvent::Reviews(Err(error)) => {
+                self.reviews_loaded = true;
+                self.reviews_error = Some(error.clone());
                 self.show_toast(error, ToastTone::Error, cx);
             }
-            JobEvent::ConversationOpened(Ok(record)) => {
-                self.show_history_record(*record, cx);
+            JobEvent::ReviewOpened(Ok(report)) => {
+                self.show_review(*report, cx);
             }
-            JobEvent::ConversationOpened(Err(error)) => {
+            JobEvent::ReviewOpened(Err(error)) => {
                 self.show_toast(error, ToastTone::Error, cx);
             }
-            JobEvent::ConversationNotice(Ok(message)) => {
+            JobEvent::ReviewNotice(Ok(message)) => {
                 self.show_toast(message, ToastTone::Success, cx);
             }
-            JobEvent::ConversationNotice(Err(error)) => {
+            JobEvent::ReviewNotice(Err(error)) => {
                 self.show_toast(error, ToastTone::Error, cx);
             }
         }
@@ -1612,24 +1510,12 @@ impl AppShell {
                 | AgentEvent::Decision(_)
                 | AgentEvent::Permission(_)
         );
-        if let Some(live) = self.live_agent.as_mut() {
-            // The replay owns the visible chat surface. Runtime events keep
-            // updating the parked live session instead of corrupting the
-            // archived transcript the user is reading.
-            live.apply(event);
-            self.conversation_dirty = self.conversation_dirty || grows || archive;
-            cx.notify();
-            return;
-        }
-        self.agent.apply(event);
-        if grows || archive {
-            self.conversation_dirty = true;
-        }
-        if grows {
-            self.follow_conversation(false);
+        self.review.apply(event);
+        if grows && self.viewing_review.is_none() {
+            self.follow_review(false);
         }
         if archive {
-            self.archive_current(cx);
+            self.save_current_review(cx);
         }
         cx.notify();
     }
@@ -2249,7 +2135,6 @@ fn run_main_window(page: Option<Page>, about: bool, refresh: bool) {
 
             spawn_job_bridge(cx, job_events);
             spawn_agent_bridge(cx, agent_events);
-            spawn_daily_scheduler(cx);
             spawn_window_bridge(cx, events);
         });
 }
@@ -2375,39 +2260,6 @@ fn spawn_window(args: &[&str]) {
         }
         Err(error) => eprintln!("[mns-gui] 无法启动窗口进程：{error}"),
     }
-}
-
-/// Minute-resolution scheduler for the unattended review, inside the main
-/// window process only. With no window there is no place to show a review, so
-/// the host does not run it; butler notifications are still delivered by the
-/// daemon.
-///
-/// A real timer loop beats a launch hook: the window may stay open for days, and
-/// the machine may sleep through the target minute. The check is idempotent —
-/// `maybe_start_daily` keeps one date stamp per process — so a coarse poll is
-/// safer than a precise one-shot that a sleep/wake cycle can swallow.
-fn spawn_daily_scheduler(cx: &mut App) {
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(60))
-                .await;
-            let _ = cx.update(|cx| {
-                let view = cx.global::<GuiState>().view.clone();
-                if let Some(view) = view {
-                    view.update(cx, |shell, cx| {
-                        shell.maybe_start_daily(cx);
-                        // Coarse safety net for a long streamed answer: an
-                        // interrupted turn never had a TurnFinished boundary.
-                        if shell.conversation_dirty {
-                            shell.archive_current(cx);
-                        }
-                    });
-                }
-            });
-        }
-    })
-    .detach();
 }
 
 /// Host ticker: refresh the tray once a minute and ask butlerd for a fresh
@@ -2882,7 +2734,9 @@ fn register_host_actions(cx: &mut App) {
     cx.on_action(|_: &ShowAbout, cx| open_main_from_host(cx, None, true, false));
     cx.on_action(|_: &RefreshData, cx| open_main_from_host(cx, None, false, true));
     cx.on_action(|_: &OpenPlanPage, cx| open_main_from_host(cx, Some(Page::Plan), false, false));
-    cx.on_action(|_: &OpenAgentPage, cx| open_main_from_host(cx, Some(Page::Agent), false, false));
+    cx.on_action(|_: &OpenReviewPage, cx| {
+        open_main_from_host(cx, Some(Page::Review), false, false)
+    });
     cx.on_action(|_: &OpenButlerWindow, cx| open_butler_from_host(cx));
     cx.on_action(|_: &OpenHelpCenter, _| {
         if let Err(error) = open_help_center(None) {
@@ -2899,10 +2753,9 @@ fn register_host_actions(cx: &mut App) {
     cx.on_action(|_: &CloseMainWindow, _| {
         let _ = crate::ipc::poke("mns-gui-window", &crate::ipc::Signal::Shutdown);
     });
-    cx.on_action(|_: &CloseAgentPanel, _| {});
+    cx.on_action(|_: &CloseReviewPanel, _| {});
     cx.on_action(|_: &RunTodayReview, _| {});
-    cx.on_action(|_: &RunDefaultGoal, _| {});
-    cx.on_action(|_: &StopCurrentTask, _| {});
+    cx.on_action(|_: &StopReview, _| {});
 }
 
 /// 窗口进程的动作：操作自己进程里的唯一窗口与 AppShell。
@@ -2911,8 +2764,8 @@ fn register_window_actions(cx: &mut App, with_menu: bool) {
     // GPUI Kit deliberately leaves cmd-q / cmd-w / alt-f4 to the application.
     let mut bindings = vec![KeyBinding::new(
         "escape",
-        CloseAgentPanel,
-        Some("agent-panel"),
+        CloseReviewPanel,
+        Some("review-panel"),
     )];
     #[cfg(target_os = "macos")]
     bindings.extend([
@@ -2953,7 +2806,7 @@ fn register_window_actions(cx: &mut App, with_menu: bool) {
         }
     });
     cx.on_action(|_: &OpenPlanPage, cx| navigate_window(cx, Page::Plan));
-    cx.on_action(|_: &OpenAgentPage, cx| navigate_window(cx, Page::Agent));
+    cx.on_action(|_: &OpenReviewPage, cx| navigate_window(cx, Page::Review));
     cx.on_action(|_: &OpenButlerWindow, _| {
         // 管家窗口由宿主拉起；窗口进程只发请求，不自己开第二个。
         let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::OpenButler);
@@ -2961,19 +2814,14 @@ fn register_window_actions(cx: &mut App, with_menu: bool) {
     cx.on_action(|_: &RunTodayReview, cx| {
         if let Some(view) = cx.global::<GuiState>().view.clone() {
             view.update(cx, |shell, cx| {
-                shell.navigate(Page::Agent, cx);
+                shell.navigate(Page::Review, cx);
                 shell.start_daily_review(true, cx);
             });
         }
     });
-    cx.on_action(|_: &RunDefaultGoal, cx| {
+    cx.on_action(|_: &StopReview, cx| {
         if let Some(view) = cx.global::<GuiState>().view.clone() {
-            view.update(cx, |shell, cx| shell.start_agent(cx));
-        }
-    });
-    cx.on_action(|_: &StopCurrentTask, cx| {
-        if let Some(view) = cx.global::<GuiState>().view.clone() {
-            view.update(cx, |shell, cx| shell.stop_agent(cx));
+            view.update(cx, |shell, cx| shell.stop_review(cx));
         }
     });
     cx.on_action(|_: &OpenHelpCenter, _| {
@@ -3181,7 +3029,7 @@ fn quit_host(cx: &mut App) {
 /// 窗口子进程是 `Accessory`，macOS 不显示它的菜单栏；宿主是 `Regular`，
 /// 窗口活着时菜单栏仍停在宿主这一份上（系统保留最后一个 Regular 应用的
 /// 菜单），所以这里放的是「不依赖 AppShell 也能做」的动作：打开/关闭窗口、
-/// 更新数据、翻页、管家、帮助、退出。窗口内的今日巡检/自主任务仍有按钮。
+/// 更新数据、翻页、管家、帮助、退出。窗口内的巡检仍有按钮。
 #[cfg(target_os = "macos")]
 fn host_menus() -> Vec<Menu> {
     vec![
@@ -3201,7 +3049,7 @@ fn host_menus() -> Vec<Menu> {
             MenuItem::action("更新数据", RefreshData),
             MenuItem::separator(),
             MenuItem::action("本月计划", OpenPlanPage),
-            MenuItem::action("助手结论", OpenAgentPage),
+            MenuItem::action("巡检结论", OpenReviewPage),
             MenuItem::action("管家", OpenButlerWindow),
             MenuItem::separator(),
             MenuItem::action("帮助中心", OpenHelpCenter),
@@ -3229,10 +3077,9 @@ fn app_menus() -> Vec<Menu> {
         Menu::new("操作").items([
             MenuItem::action("更新数据", RefreshData),
             MenuItem::action("今日巡检", RunTodayReview),
-            MenuItem::action("开始自主任务", RunDefaultGoal),
             MenuItem::separator(),
             MenuItem::action("本月计划", OpenPlanPage),
-            MenuItem::action("助手结论", OpenAgentPage),
+            MenuItem::action("巡检结论", OpenReviewPage),
             MenuItem::action("管家", OpenButlerWindow),
             MenuItem::separator(),
             MenuItem::action("帮助中心", OpenHelpCenter),
@@ -3489,19 +3336,19 @@ fn tray_line(text: &str, max: usize) -> String {
 }
 
 fn tray_review_line(
-    agent: Option<&AgentState>,
+    review: Option<&ReviewState>,
     settings: &AgentSettings,
-    last_daily: Option<&str>,
+    last: Option<&str>,
     today: &str,
 ) -> String {
-    if let Some(agent) = agent {
-        if agent.is_running() {
-            return format!("巡检中：{}", tray_line(&agent.detail, 36));
+    if let Some(review) = review {
+        if review.is_running() {
+            return format!("巡检中：{}", tray_line(&review.detail, 36));
         }
-        if agent.state == RunState::Failed {
+        if review.state == RunState::Failed {
             return format!(
-                "上次任务失败：{}",
-                tray_line(agent.error.as_deref().unwrap_or("未知错误"), 36)
+                "上次巡检失败：{}",
+                tray_line(review.error.as_deref().unwrap_or("未知错误"), 36)
             );
         }
     }
@@ -3509,7 +3356,7 @@ fn tray_review_line(
         return "每日巡检：未开启".to_owned();
     }
     let time = settings.daily_review_time.trim();
-    if last_daily == Some(today) {
+    if last == Some(today) {
         format!("每日巡检 {} · 今日已触发", time)
     } else {
         format!("每日巡检 {} · 今日待触发", time)
@@ -3639,9 +3486,14 @@ fn current_tray_brief(cx: &mut App) -> TrayBrief {
         (true, None) => ("管家进程：运行中".to_owned(), true),
     };
 
-    let review = tray_review_line(None, &load_settings(), read_last_daily().as_deref(), &today);
+    let review_line = tray_review_line(
+        None,
+        &load_settings(),
+        review::read_last().as_deref(),
+        &today,
+    );
     let mut brief = tray_brief_from(state.brief.as_ref(), &day_label);
-    brief.review = review;
+    brief.review = review_line;
     brief.butler = butler;
     brief.butler_ok = butler_ok;
     brief
@@ -3951,9 +3803,11 @@ fn open_main_window(cx: &mut App, page: Option<Page>, about: bool) -> Result<()>
             // the worker answers, never a fabricated zero balance. The archive
             // index is a separate, small directory read on the same worker.
             shell.reload();
-            shell.load_history(cx);
+            shell.load_reviews(cx);
             // 当天错过了定时更新且还没更新过时，启动即补一次。
             shell.startup_catch_up(cx);
+            // 流式正文的分钟级兜底存档（边界事件另有立即落盘）。
+            shell.start_review_flush(cx);
             shell
         })
     })?;
@@ -4121,8 +3975,8 @@ impl AppShell {
             items.push(item);
         }
 
-        let agent_running = self.agent.is_running();
-        let agent_state = self.agent.state;
+        let review_running = self.review.is_running();
+        let review_state = self.review.state;
 
         div()
             .v_flex()
@@ -4151,7 +4005,7 @@ impl AppShell {
             .children(items)
             .child(div().flex_1())
             .child({
-                let (pill_fg, pill_bg) = match agent_state {
+                let (pill_fg, pill_bg) = match review_state {
                     RunState::Failed | RunState::Cancelled => (DANGER, DANGER_SOFT),
                     RunState::Finished => (SUCCESS, SUCCESS_SOFT),
                     RunState::Idle => (TEXT_TERTIARY, NEUTRAL_SOFT),
@@ -4178,13 +4032,13 @@ impl AppShell {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child("自主 Agent"),
+                            .child("巡检"),
                     )
                     .child(status_pill(
-                        if agent_running {
-                            "执行中"
+                        if review_running {
+                            "巡检中"
                         } else {
-                            agent_state.label()
+                            review_state.label()
                         },
                         pill_fg,
                         pill_bg,
@@ -4198,7 +4052,7 @@ impl AppShell {
             Page::Portfolio => pages::portfolio::render(self, cx),
             Page::Plan => pages::plan::render(self, cx),
             Page::Performance => pages::performance::render(self, cx),
-            Page::Agent => pages::agent::render(self, cx),
+            Page::Review => pages::review::render(self, cx),
             Page::Settings => pages::settings::render(self, cx),
         }
     }
@@ -5070,7 +4924,7 @@ mod tray_tests {
     // Explicit imports, not `use super::*`: gpui_kit re-exports an attribute
     // macro also named `test`, which would shadow the built-in `#[test]`.
     use super::{
-        AdviceKind, AgentSettings, AgentState, tray_advice_copy, tray_advice_kind, tray_line,
+        AdviceKind, AgentSettings, ReviewState, tray_advice_copy, tray_advice_kind, tray_line,
         tray_review_line,
     };
     use crate::brief::PlanBrief;
@@ -5140,21 +4994,21 @@ mod tray_tests {
 
     #[test]
     fn review_state_reflects_the_schedule() {
-        let agent = AgentState::new();
+        let review = ReviewState::new();
         let mut settings = AgentSettings::default();
         settings.daily_review = true;
         settings.daily_review_time = "08:30".to_owned();
         assert_eq!(
-            tray_review_line(Some(&agent), &settings, None, "2026-11-09"),
+            tray_review_line(Some(&review), &settings, None, "2026-11-09"),
             "每日巡检 08:30 · 今日待触发"
         );
         assert_eq!(
-            tray_review_line(Some(&agent), &settings, Some("2026-11-09"), "2026-11-09"),
+            tray_review_line(Some(&review), &settings, Some("2026-11-09"), "2026-11-09"),
             "每日巡检 08:30 · 今日已触发"
         );
         settings.daily_review = false;
         assert_eq!(
-            tray_review_line(Some(&agent), &settings, None, "2026-11-09"),
+            tray_review_line(Some(&review), &settings, None, "2026-11-09"),
             "每日巡检：未开启"
         );
     }

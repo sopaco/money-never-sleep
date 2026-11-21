@@ -94,7 +94,13 @@ pub enum Signal {
     ChatAttach,
     /// 管家窗口 → butlerd：用户发了一句话。回合进行中会被明确拒绝（快照带
     /// `restore` 让窗口把话放回输入框），不排队。
-    ChatSend { text: String },
+    ChatSend {
+        text: String,
+        /// 这句提问引用的巡检报告。只传 `{id,title}`，正文由 butlerd 按 id
+        /// 读取——IPC 只负责说「引用了哪几份」。
+        #[serde(default)]
+        attachments: Vec<crate::butler::review::ReviewRef>,
+    },
     /// 管家窗口 → butlerd：用户确认清空会话。
     ChatClear,
     /// 管家窗口 → butlerd：窗口已打开，标记会话已读。
@@ -1306,8 +1312,9 @@ mod tests {
             (
                 Signal::ChatSend {
                     text: "hi".to_owned(),
+                    attachments: Vec::new(),
                 },
-                r#"{"kind":"chat-send","text":"hi"}"#,
+                r#"{"kind":"chat-send","text":"hi","attachments":[]}"#,
             ),
             (Signal::ChatClear, r#"{"kind":"chat-clear"}"#),
             (Signal::ChatSeen, r#"{"kind":"chat-seen"}"#),
@@ -1413,8 +1420,19 @@ mod tests {
 
         let send = Signal::ChatSend {
             text: "现在偏离多少".to_owned(),
+            attachments: Vec::new(),
         };
         assert_eq!(decode(&encode(&send)), Some(send));
+
+        // 旧窗口发来的帧没有 attachments 字段：必须还能解码成空引用。
+        let legacy = decode(r#"{"kind":"chat-send","text":"旧帧"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Signal::ChatSend {
+                text: "旧帧".to_owned(),
+                attachments: Vec::new(),
+            }
+        );
 
         let delta = Signal::ChatDelta {
             text: "美股偏离".to_owned(),

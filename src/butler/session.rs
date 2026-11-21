@@ -175,14 +175,20 @@ mod tests {
 
     #[test]
     fn 存储路径与助手存档互不重叠() {
-        let path = Session::path().to_string_lossy().into_owned();
+        let path = Session::path();
+        let expected = std::path::Path::new(".mns")
+            .join("agent")
+            .join("butler")
+            .join("conversation.json");
         assert!(
-            path.ends_with(".mns/agent/butler/conversation.json"),
-            "管家会话应落在自己的目录，实际 {path}"
+            path.ends_with(&expected),
+            "管家会话应落在自己的目录，实际 {}",
+            path.display()
         );
+        let text = path.to_string_lossy();
         assert!(
-            !path.contains("/agent/conversations/"),
-            "不能写进助手存档目录，实际 {path}"
+            !text.contains("conversations"),
+            "不能写进旧的助手存档目录，实际 {text}"
         );
     }
 

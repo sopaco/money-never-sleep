@@ -30,7 +30,7 @@ mod workspace;
 
 /// Absolute paths of the binaries that ship beside the GUI. Callers use these
 /// instead of searching `PATH`, which may resolve to a stale copy.
-pub use runner::{butler_bin, mns_bin};
+pub use runner::{butler_bin, extract_decision, mns_bin};
 
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};

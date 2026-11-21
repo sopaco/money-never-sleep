@@ -733,7 +733,7 @@ fn activity_card(data: &Snapshot, cx: &mut Context<AppShell>) -> Div {
 
 /// F4 最近报告卡：`reports/` 最新一份存档的只读回看。
 ///
-/// 展开后由页面自身的滚动条承接全文——不做嵌套滚动区（与助手页
+/// 展开后由页面自身的滚动条承接全文——不做嵌套滚动区（与巡检页
 /// "一页只有一条滚动条"的约定一致）。等宽字体是必须的：报告里的
 /// 分节线和对齐按固定宽度排版，比例字体会把它们排歪。
 fn report_card(shell: &AppShell, cx: &mut Context<AppShell>) -> Div {

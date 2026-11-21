@@ -1,4 +1,4 @@
-//! 管家独立窗口：人设化文本会话，与助手页互不共享存档。
+//! 管家独立窗口：人设化文本会话，与巡检页互不共享存档。
 //!
 //! P4 起这是一层**薄客户端**：会话的真相（存档、回合、事件流）全在
 //! `mns-butlerd` 的 `butler::chat` 服务里。窗口只做三件事：把快照摆出来、
@@ -21,6 +21,7 @@ use gpui_kit::*;
 use crate::butler::chat::{self, ChatSnapshotData};
 use crate::butler::expression;
 use crate::butler::orchestrator;
+use crate::butler::review::{self, ReviewRef, ReviewSummary};
 use crate::butler::talk;
 use crate::butler::{AccountFacts, Message, Role, Session};
 use crate::ipc::{self, Signal};
@@ -46,6 +47,13 @@ fn host_alive() -> bool {
 /// 账本数字的重算节奏。管家窗口常开，用户不该为了「几点了、偏离多少」去
 /// 点一个按钮：每 60 秒重算一次事实，没有变化就不重绘。
 const FACTS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 一次提问最多引用 3 份巡检报告：butlerd 侧每份截断 6,000 字，再多就挤掉
+/// 用户自己的话。
+const MAX_REFS: usize = 3;
+
+/// `@` 面板一屏最多列 6 条：更多要看历史去巡检页。
+const MAX_PICKER: usize = 6;
 
 /// 点系统通知进来时要落到的那一条。
 ///
@@ -89,6 +97,18 @@ pub(crate) struct ButlerView {
     hint: Option<String>,
     /// 从系统通知点进来的那一条。窗口开着时再点一次会换到这里，不重开。
     notice_focus: Option<NoticeFocus>,
+    /// 随下一句话递出去的巡检报告引用。只存 `{id,title}`，正文由 butlerd
+    /// 按 id 读取——窗口不读报告文件，也不把正文塞进 IPC。
+    attached: Vec<ReviewRef>,
+    /// `@` 选择器是否展开。
+    picker_open: bool,
+    /// 面板展示用的近期报告（已过滤成成功且有正文的）。
+    picker_items: Vec<ReviewSummary>,
+    /// 后台加载中：面板先画一行「正在读取」，不假装没有报告。
+    picker_loading: bool,
+    /// 上一次渲染看到的输入值。输入框没有 `on_change` 回调，靠前后两帧
+    /// 对比来发现「刚打了一个 `@`」。
+    last_input: String,
 }
 
 impl ButlerView {
@@ -137,6 +157,11 @@ impl ButlerView {
             snapshot_instance: None,
             hint: None,
             notice_focus: None,
+            attached: Vec::new(),
+            picker_open: false,
+            picker_items: Vec::new(),
+            picker_loading: false,
+            last_input: String::new(),
         }
     }
 
@@ -505,6 +530,200 @@ impl ButlerView {
         self.send(window, cx);
     }
 
+    // ---- 巡检报告引用（`@` 选择器） --------------------------------------
+    //
+    // 输入框没有变更回调，弹层靠渲染时对比输入值：新值以 `@` 结尾就打开
+    // 面板。报告列表在后台线程读，渲染帧只负责画。
+
+    /// 打开面板并在后台加载近期报告。调用方是 render：此刻正在出帧，
+    /// 不必再 notify。
+    fn open_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker_open = true;
+        self.picker_loading = true;
+        self.picker_items.clear();
+        cx.spawn(async move |weak, async_cx| {
+            let items = async_cx
+                .background_executor()
+                .spawn(async {
+                    // 与 `recent_refs` 同一口径：只列成功且有正文的报告。
+                    review::list(12)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|row| row.state == "finished" && !row.preview.is_empty())
+                        .take(MAX_PICKER)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = weak.update(async_cx, |view, cx| {
+                view.picker_items = items;
+                view.picker_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if !self.picker_open {
+            return;
+        }
+        self.picker_open = false;
+        cx.notify();
+    }
+
+    /// 选中一份报告：关面板、加入引用（超出上限就只当选中）、去掉触发用的
+    /// 末尾 `@`，把焦点还给输入框——用户选完还想接着打字。
+    fn pick_review(&mut self, reference: ReviewRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        attach_ref(&mut self.attached, reference);
+        let value = self.input.read(cx).value().to_string();
+        let trimmed = value.trim_end();
+        if let Some(without_at) = trimmed.strip_suffix('@') {
+            let next = without_at.to_owned();
+            self.input
+                .update(cx, |input, cx| input.set_value(next, window, cx));
+        }
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn detach_ref(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.attached.retain(|reference| reference.id != id);
+        cx.notify();
+    }
+
+    /// 输入框上方的引用 pill 行：标题过长按 `clip` 截断，`×` 单独可点，
+    /// 点整条 pill 不该误删。
+    fn attached_row(&self, cx: &mut Context<Self>) -> Div {
+        let mut row = div()
+            .debug_selector(|| "butler-refs".to_owned())
+            .h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .pb(px(6.));
+        for reference in &self.attached {
+            let id = reference.id.clone();
+            row = row.child(
+                div()
+                    .debug_selector(|| "butler-ref".to_owned())
+                    .h_flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(999.))
+                    .bg(rgb(NEUTRAL_SOFT))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(11.5))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(clip(&reference.title, 18))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("butler-ref-remove-{id}")))
+                            .flex_none()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .text_color(rgb(TEXT_TERTIARY))
+                            .hover(|style| style.bg(rgb(DIVIDER)).text_color(rgb(TEXT_SECONDARY)))
+                            .child("×")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.detach_ref(&id, cx);
+                            })),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// `@` 面板：绝对定位在消息区底部、紧贴输入框上方，不挤压消息布局。
+    /// 点击面板外任意位置（`on_mouse_down_out`）或按 Esc 关闭。
+    fn review_picker(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut panel = div()
+            .id("butler-review-picker")
+            .debug_selector(|| "butler-review-picker".to_owned())
+            .absolute()
+            .left(px(14.))
+            .right(px(14.))
+            .bottom(px(6.))
+            .max_h(px(320.))
+            .v_flex()
+            .gap(px(2.))
+            .p(px(6.))
+            .rounded(px(RADIUS_LG))
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow(shadow_card())
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_picker(cx)));
+        if self.picker_loading {
+            panel = panel.child(
+                div()
+                    .px(px(10.))
+                    .py(px(9.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_TERTIARY))
+                    .child("正在读取巡检报告…"),
+            );
+        } else if self.picker_items.is_empty() {
+            panel = panel.child(
+                div()
+                    .px(px(10.))
+                    .py(px(9.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_TERTIARY))
+                    .child("还没有巡检报告；先跑一次立即巡检"),
+            );
+        } else {
+            for item in &self.picker_items {
+                let reference = ReviewRef {
+                    id: item.id.clone(),
+                    title: item.title.clone(),
+                };
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(format!("butler-pick-{}", item.id)))
+                        .h_flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .rounded(px(RADIUS_SM))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(ACCENT_TINT)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.5))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .child(item.date.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.5))
+                                .text_color(rgb(TEXT))
+                                .child(item.title.clone()),
+                        )
+                        .child(pill(item.source.as_str(), TEXT_SECONDARY, NEUTRAL_SOFT))
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.pick_review(reference.clone(), window, cx);
+                        })),
+                );
+            }
+        }
+        panel
+    }
+
     /// 空态：问候 + 三个一键提问。chips 直接用 `ask` 发送，不经过「先填进
     /// 输入框」这一步——空窗口里用户要的是最短路径，不是先学会怎么用。
     fn empty_state(&self, cx: &mut Context<Self>) -> Div {
@@ -582,16 +801,23 @@ impl ButlerView {
         }
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        if !self.send_signal(Signal::ChatSend { text: text.clone() }) {
+        if !self.send_signal(Signal::ChatSend {
+            text: text.clone(),
+            attachments: self.attached.clone(),
+        }) {
             // 递送失败：连接刚断。话不能丢——放回输入框（render 时应用），
-            // 并转离线，横幅说明怎么重连。
+            // 引用也一并留着，重连后还能直接重发；并转离线，横幅说明怎么重连。
             self.pending_restore = Some(text);
             self.go_offline(cx);
+            return;
         }
+        self.attached.clear();
+        self.picker_open = false;
+        cx.notify();
     }
 
     /// 流式期间的跟随滚动：正文在长，贴底就跟着走；用户往上翻了就不打扰。
-    /// 与主界面 `follow_conversation` 同一条规则。
+    /// 与主界面 `follow_review` 同一条规则。
     fn follow_stream(&self) {
         let near_bottom = self.scroll.max_offset().y + self.scroll.offset().y <= px(96.);
         if near_bottom {
@@ -623,6 +849,17 @@ impl Render for ButlerView {
         if let Some(text) = self.pending_restore.take() {
             self.input
                 .update(cx, |input, cx| input.set_value(text.as_str(), window, cx));
+            // 恢复的话不算「刚输入」：哪怕它正好以 `@` 结尾，也不该重新弹层。
+            self.last_input = text;
+        }
+        // 输入框没有变更回调：和上一帧对比，新值以 `@` 结尾才打开选择器。
+        // `last_input` 同时兼作去抖——输入法组合期间的重绘不会反复弹层。
+        let value = self.input.read(cx).value().to_string();
+        if value != self.last_input {
+            if value.trim_end().ends_with('@') {
+                self.open_picker(cx);
+            }
+            self.last_input = value;
         }
         let headline = expression::headline(&self.facts);
         let decision = if self.facts.decision_day {
@@ -824,7 +1061,17 @@ impl Render for ButlerView {
                     .border_color(rgb(0xffffff).opacity(0.85))
                     .shadow(shadow_card())
                     .overflow_hidden()
-                    .child(stream)
+                    // 消息区与 composer 分开：选择器绝对定位在消息区底部，
+                    // 正好浮在输入框上方，不挤占消息布局。
+                    .child(
+                        div()
+                            .relative()
+                            .v_flex()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(stream)
+                            .children(self.picker_open.then(|| self.review_picker(cx))),
+                    )
                     .child(
                         div()
                             .v_flex()
@@ -839,6 +1086,14 @@ impl Render for ButlerView {
                                     view.send(window, cx);
                                 }
                             }))
+                            // Esc 关 `@` 面板；这里只处理原始按键，不占用输入框
+                            // 的 Escape 动作，回车发送不受影响。
+                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    view.close_picker(cx);
+                                }
+                            }))
+                            .children((!self.attached.is_empty()).then(|| self.attached_row(cx)))
                             .child(
                                 div()
                                     .h_flex()
@@ -896,6 +1151,16 @@ fn clip(text: &str, limit: usize) -> String {
     let mut clipped: String = text.chars().take(limit).collect();
     clipped.push('…');
     clipped
+}
+
+/// 加入一份巡检报告引用。同一 id 只算一条，最多 `MAX_REFS` 条；返回是否
+/// 真的加入——面板和测试共用这一条规则。
+fn attach_ref(attached: &mut Vec<ReviewRef>, candidate: ReviewRef) -> bool {
+    if attached.len() >= MAX_REFS || attached.iter().any(|row| row.id == candidate.id) {
+        return false;
+    }
+    attached.push(candidate);
+    true
 }
 
 /// 空态的三个一键提问。文案与 `expression::intent_for` 的主干意图对齐：
@@ -1225,10 +1490,13 @@ mod tests {
         .expect("快照应能序列化")
     }
 
-    /// 断言上行通道里是一条 `ChatSend`，且文本相符。
+    /// 断言上行通道里是一条 `ChatSend`，且文本相符、默认不带引用。
     fn expect_chat_send(uplink: &mut tokio::sync::mpsc::UnboundedReceiver<Signal>, expected: &str) {
         match uplink.try_recv().expect("应递出 ChatSend") {
-            Signal::ChatSend { text } => assert_eq!(text, expected, "递出的话应与输入一致"),
+            Signal::ChatSend { text, attachments } => {
+                assert_eq!(text, expected, "递出的话应与输入一致");
+                assert!(attachments.is_empty(), "默认路径不该带巡检引用");
+            }
             other => panic!("应递 ChatSend，实际 {other:?}"),
         }
     }
@@ -1395,6 +1663,47 @@ mod tests {
         // 会话与越界校验全在守护进程：本地不先插消息，等快照整帧带回。
         let messages = cx.update(|_, cx| view.update(cx, |view, _| view.session.messages.clone()));
         assert!(messages.is_empty(), "本地不先落消息");
+    }
+
+    /// `@` 引用的上行：引用随 `ChatSend` 一起递出，成功之后本地清空。
+    #[gpui_kit::test]
+    fn 发送时携带巡检引用并在成功后清空(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, facts());
+        let mut uplink = view.update(cx, |view, _| fake_link(view));
+        view.update(cx, |view, _| {
+            view.attached = vec![
+                super::ReviewRef {
+                    id: "r1".to_owned(),
+                    title: "巡检 · 2026-11-21".to_owned(),
+                },
+                super::ReviewRef {
+                    id: "r2".to_owned(),
+                    title: "巡检 · 2026-11-20".to_owned(),
+                },
+            ];
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.input.update(cx, |input, cx| {
+                    input.set_value("结合这两份巡检说说", window, cx)
+                });
+                view.send(window, cx);
+            });
+        });
+
+        match uplink.try_recv().expect("应递出 ChatSend") {
+            Signal::ChatSend { text, attachments } => {
+                assert_eq!(text, "结合这两份巡检说说");
+                assert_eq!(attachments.len(), 2, "两份引用应随消息递出");
+                assert_eq!(attachments[0].id, "r1");
+                assert_eq!(attachments[1].id, "r2");
+            }
+            other => panic!("应递 ChatSend，实际 {other:?}"),
+        }
+        view.update(cx, |view, _| {
+            assert!(view.attached.is_empty(), "递送成功后应清空引用");
+        });
     }
 
     #[gpui_kit::test]
@@ -1763,5 +2072,39 @@ mod tests {
             assert_eq!(focus.index, Some(0), "应定位到带该 id 的消息");
             assert_eq!(focus.text.as_deref(), Some("要定位的那条"));
         });
+    }
+}
+
+/// `@` 引用的纯规则测试：不建窗口、不读报告目录，`--features gui` 即可跑。
+#[cfg(test)]
+mod attach_rules {
+    use super::{MAX_REFS, attach_ref};
+    use crate::butler::review::ReviewRef;
+
+    fn reference(id: &str) -> ReviewRef {
+        ReviewRef {
+            id: id.to_owned(),
+            title: format!("巡检 · {id}"),
+        }
+    }
+
+    #[test]
+    fn 引用按id去重且最多三条() {
+        let mut attached = Vec::new();
+        assert!(attach_ref(&mut attached, reference("r1")));
+        assert!(
+            !attach_ref(&mut attached, reference("r1")),
+            "同一 id 只算一条"
+        );
+        assert_eq!(attached.len(), 1, "重复 id 不该重复加入");
+
+        assert!(attach_ref(&mut attached, reference("r2")));
+        assert!(attach_ref(&mut attached, reference("r3")));
+        assert_eq!(attached.len(), MAX_REFS);
+
+        // 第 4 条被拒：上下文有上限，多选只会挤掉正文。
+        assert!(!attach_ref(&mut attached, reference("r4")));
+        assert_eq!(attached.len(), MAX_REFS);
+        assert!(!attached.iter().any(|row| row.id == "r4"));
     }
 }

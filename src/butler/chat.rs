@@ -41,6 +41,14 @@ use crate::ipc::Signal;
 /// 比给一个半截答案更糟。
 pub const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 一句提问引用的一份巡检报告。正文由调用方按 id 读取并截断，服务只负责
+/// 拼进发给模型的上下文，不碰文件。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatReference {
+    pub title: String,
+    pub body: String,
+}
+
 /// 管家会话的账户事实：与守护进程判定、CLI 审计同一条路径
 /// （`orchestrator::ledger_facts`）。窗口进程与守护进程共用它——两边的
 /// 数字永远同源，不存在「界面一套、回答一套」。
@@ -68,6 +76,23 @@ pub fn chat_settings() -> crate::agent::AgentSettings {
     let _ = std::fs::create_dir_all(&dir);
     settings.working_dir = dir.to_string_lossy().into_owned();
     settings
+}
+
+/// 把引用的巡检报告拼成给模型的上下文块。为空时返回空串，调用方不必分叉。
+#[cfg(feature = "agent")]
+fn reference_block(references: &[ChatReference]) -> String {
+    if references.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n【引用的巡检报告】\n");
+    for item in references {
+        out.push_str("· ");
+        out.push_str(item.title.trim());
+        out.push('\n');
+        out.push_str(item.body.trim());
+        out.push_str("\n\n");
+    }
+    out.trim_end().to_owned() + "\n"
 }
 
 /// 一轮问答的等待状态。抽出来是因为它能脱离真实进程测：`begin` 挡住并发
@@ -273,11 +298,39 @@ impl ChatService {
     /// 用户发了一句话。`facts` 由调用方现算（守护进程放 `spawn_blocking`），
     /// 服务不缓存数字——缓存会让「刚记完账再提问」用上旧偏离。
     pub fn send(&mut self, text: String, facts: &AccountFacts) -> Vec<ChatEffect> {
+        self.send_with_context(text, facts, &[])
+    }
+
+    /// 带巡检报告引用的一轮提问。
+    ///
+    /// 引用只影响**发给模型**的文本（首轮 goal / 续问 Ask）；用户消息里只
+    /// 多一行「引用巡检：…」，重开窗口还能看出这句话引用了什么。
+    pub fn send_with_context(
+        &mut self,
+        text: String,
+        facts: &AccountFacts,
+        references: &[ChatReference],
+    ) -> Vec<ChatEffect> {
         let now = Local::now();
         let text = text.trim().to_owned();
         if text.is_empty() {
             return Vec::new();
         }
+        // 引用块只进模型上下文；无 agent 构建的模板兜底用不上它。
+        #[cfg(feature = "agent")]
+        let context = reference_block(references);
+        let stored = if references.is_empty() {
+            text.clone()
+        } else {
+            format!(
+                "{text}\n\n> 引用巡检：{}",
+                references
+                    .iter()
+                    .map(|item| item.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        };
 
         // 记忆类命令在本地就能答：不必为一句「记住了」启一个外部 agent。
         // 等待 agent 回答期间也照常受理——丢一句「记住」比晚一秒回答更糟。
@@ -285,7 +338,7 @@ impl ChatService {
             .handle_memory(&text, now)
             .or_else(|| self.recall_memory(&text))
         {
-            self.session.push(Message::user(now, text));
+            self.session.push(Message::user(now, stored));
             self.session.push(Message::butler(now, reply));
             self.session.mark_read(now);
             self.hint = None;
@@ -321,7 +374,7 @@ impl ChatService {
         // 必须一致。
         #[cfg(not(feature = "agent"))]
         let _ = memory;
-        self.session.push(Message::user(now, text.clone()));
+        self.session.push(Message::user(now, stored.clone()));
 
         let previous = self.previous_user_text();
         let intent = expression::intent_for(&text, previous.as_deref());
@@ -334,11 +387,15 @@ impl ChatService {
         {
             self.turn.begin(template);
             let command = if self.started {
-                crate::agent::AgentCommand::Ask { text }
+                crate::agent::AgentCommand::Ask {
+                    text: format!("{text}{context}"),
+                }
             } else {
                 self.started = true;
+                let mut goal = talk::opening_goal(&text, facts, &memory_for_goal, &recent_for_goal);
+                goal.push_str(&context);
                 crate::agent::AgentCommand::Start {
-                    goal: talk::opening_goal(&text, facts, &memory_for_goal, &recent_for_goal),
+                    goal,
                     settings: chat_settings(),
                     source: crate::agent::GoalSource::Conversation,
                 }
@@ -429,6 +486,41 @@ impl ChatService {
         if seen {
             self.session.mark_read(Local::now());
         }
+        self.persist();
+        vec![self.snapshot_effect(None)]
+    }
+
+    /// 后台巡检结果并入会话：直接落成一条管家消息，**不**标已读。
+    ///
+    /// 与 `merge_notices` 分开：通知是替投递用的短句，这里放的是完整结论；
+    /// 同一 `notice_id` 幂等，宿主随后投递的同 id 通知不会重复落条。
+    pub fn push_butler(
+        &mut self,
+        at: DateTime<Local>,
+        text: String,
+        trigger: String,
+        notice_id: String,
+    ) -> Vec<ChatEffect> {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        if self
+            .session
+            .messages
+            .iter()
+            .any(|message| message.notice_id.as_deref() == Some(notice_id.as_str()))
+        {
+            return Vec::new();
+        }
+        self.session.push(Message {
+            at,
+            role: Role::Butler,
+            text,
+            reason: Some(super::schedule::SpeakReason::DailyReview),
+            trigger: Some(trigger),
+            notice_id: Some(notice_id),
+        });
         self.persist();
         vec![self.snapshot_effect(None)]
     }
@@ -1153,6 +1245,83 @@ mod tests {
         assert!(
             service.session.last_read_at.is_some(),
             "对着窗口说的不算未读"
+        );
+    }
+
+    /// 巡检结果并入会话：完整正文落一条，且不替用户标已读。
+    #[test]
+    fn 巡检结果并入会话且不标已读() {
+        let mut service = open("push-review");
+        let now = Local::now();
+        let effects = service.push_butler(
+            now,
+            "本周不操作。".to_owned(),
+            "review:2026-11-21".to_owned(),
+            "n-review-1".to_owned(),
+        );
+        let data = snapshot_of(&effects);
+        assert_eq!(data.session.messages.len(), 1);
+        assert_eq!(data.session.messages[0].role, Role::Butler);
+        assert!(data.session.last_read_at.is_none(), "没人在看，不能算已读");
+        assert!(
+            service
+                .push_butler(
+                    now,
+                    "重复投递".to_owned(),
+                    "review:2026-11-21".to_owned(),
+                    "n-review-1".to_owned(),
+                )
+                .is_empty(),
+            "同一 notice_id 幂等"
+        );
+        assert_eq!(service.session.messages.len(), 1);
+    }
+
+    /// 引用巡检报告：正文进模型上下文，用户消息只留一行引用说明。
+    #[cfg(feature = "agent")]
+    #[test]
+    fn 引用巡检报告进入首轮与续问() {
+        let mut service = open("context");
+        let references = [ChatReference {
+            title: "巡检 · 2026-11-21".to_owned(),
+            body: "美股低配 6.2pp，本周不操作。".to_owned(),
+        }];
+        let effects =
+            service.send_with_context("帮我看看要不要补".to_owned(), &facts(), &references);
+        let command = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChatEffect::Runtime(command) => Some(format!("{command:?}")),
+                _ => None,
+            })
+            .expect("应起 runtime");
+        assert!(
+            command.contains("美股低配 6.2pp"),
+            "首轮 goal 应带报告正文：{command}"
+        );
+        let data = snapshot_of(&effects);
+        assert!(
+            data.session.messages[0]
+                .text
+                .contains("引用巡检：巡检 · 2026-11-21"),
+            "用户消息应留引用说明，实际 {}",
+            data.session.messages[0].text
+        );
+
+        // 续问：把等待槽收掉、会话标记为已开，验证 Ask 也带上下文。
+        service.turn.abandon();
+        service.started = true;
+        let effects = service.send_with_context("那现在呢".to_owned(), &facts(), &references);
+        let command = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChatEffect::Runtime(command) => Some(format!("{command:?}")),
+                _ => None,
+            })
+            .expect("应发 Ask");
+        assert!(
+            command.contains("美股低配 6.2pp"),
+            "续问也要带正文：{command}"
         );
     }
 

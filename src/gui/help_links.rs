@@ -29,7 +29,7 @@ pub(crate) const OVERVIEW: HelpLink = HelpLink::new("desktop-overview", "帮助�
 pub(crate) const PORTFOLIO: HelpLink = HelpLink::new("desktop-portfolio", "帮助：持仓与账本");
 pub(crate) const PLAN: HelpLink = HelpLink::new("desktop-plan", "帮助：计划页");
 pub(crate) const REVIEW: HelpLink = HelpLink::new("finance-metrics", "帮助：收益与风险指标怎么读");
-pub(crate) const AGENT: HelpLink = HelpLink::new("desktop-agent", "帮助：AI 助手怎么用");
+pub(crate) const REVIEW_PAGE: HelpLink = HelpLink::new("desktop-review", "帮助：巡检怎么用");
 pub(crate) const SETTINGS: HelpLink = HelpLink::new("desktop-settings", "帮助：托盘、自启动与设置");
 
 // ── 概念级 ─────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ pub(crate) const ALL: &[HelpLink] = &[
     PORTFOLIO,
     PLAN,
     REVIEW,
-    AGENT,
+    REVIEW_PAGE,
     SETTINGS,
     TARGET_WEIGHT,
     BAND_PER_LEG,
