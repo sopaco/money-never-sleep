@@ -1998,11 +1998,29 @@ pub fn run() {
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::env::set_current_dir(&data_dir);
 
+    // Windows Toast 点击由系统按 `mns:` 协议拉起本程序：交给已在运行的宿主
+    // 定位那条通知，然后把这次短命进程结束掉；宿主不在时按正常启动处理。
+    #[cfg(target_os = "windows")]
+    if let Some(notice) = crate::notify::toast_notice_arg() {
+        if crate::ipc::poke(
+            "mns-gui",
+            &crate::ipc::Signal::NoticeFocus {
+                notice_id: notice.clone(),
+            },
+        )
+        .is_ok()
+        {
+            return;
+        }
+        run_host(true, false, Some(notice));
+        return;
+    }
+
     match parse_role() {
         Role::Host {
             open_butler,
             show_main,
-        } => run_host(open_butler, show_main),
+        } => run_host(open_butler, show_main, None),
         Role::MainWindow {
             page,
             about,
@@ -2018,7 +2036,7 @@ pub fn run() {
 /// 拉起短命窗口子进程。托盘上的数字向 `mns-butlerd` 要（`RequestBrief`），
 /// 不再自己读库。宿主是进程组里唯一常驻的进程，也是唯一持有 Dock 图标的
 /// 进程；窗口子进程用 `Accessory`，不会在 Dock 里多出一个 MNS。
-fn run_host(open_butler_at_start: bool, show_main: bool) {
+fn run_host(open_butler_at_start: bool, show_main: bool, notice: Option<String>) {
     // 安装位置可能在升级后变化，启动时按当前 exe 路径刷新一次登录项；
     // 关闭状态则不写入任何系统项。
     if crate::agent::load_settings().launch_at_login
@@ -2031,7 +2049,7 @@ fn run_host(open_butler_at_start: bool, show_main: bool) {
     // 早于本地通道建好也不会丢。其他平台由下面的监听本身充当实例锁。
     #[cfg(windows)]
     let instance = {
-        let intent = if open_butler_at_start {
+        let intent = if open_butler_at_start || notice.is_some() {
             crate::single_instance::Intent::OpenButler
         } else {
             crate::single_instance::Intent::Open
@@ -2046,11 +2064,14 @@ fn run_host(open_butler_at_start: bool, show_main: bool) {
     let (listener, events) = match crate::ipc::listen("mns-gui") {
         Ok(pair) => pair,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            // 已有宿主：把这次启动的意图交给它，自己退出。
-            let signal = if open_butler_at_start {
-                crate::ipc::Signal::OpenButler
-            } else {
-                crate::ipc::Signal::Open
+            // 已有宿主：把这次启动的意图交给它，自己退出。Toast 点击要带上
+            // notice id，才能落在对应那条消息上而不是只开一个空窗。
+            let signal = match &notice {
+                Some(notice_id) => crate::ipc::Signal::NoticeFocus {
+                    notice_id: notice_id.clone(),
+                },
+                None if open_butler_at_start => crate::ipc::Signal::OpenButler,
+                None => crate::ipc::Signal::Open,
             };
             let _ = crate::ipc::poke("mns-gui", &signal);
             return;
@@ -2143,7 +2164,9 @@ fn run_host(open_butler_at_start: bool, show_main: bool) {
             #[cfg(windows)]
             spawn_instance_watcher(cx, instance);
 
-            if open_butler_at_start {
+            if let Some(notice_id) = notice {
+                open_butler_notice_from_host(cx, &notice_id);
+            } else if open_butler_at_start {
                 open_butler_from_host(cx);
             } else if show_main {
                 // 首启可见：双击应用（无参数）直接开一次主窗。登录项带
@@ -2473,6 +2496,14 @@ fn spawn_ipc_bridge(
                 }
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenButler) => {
                     let _ = cx.update(|cx| open_butler_from_host(cx));
+                }
+                // Windows Toast 点击：系统拉起的新进程把 notice id 交回来，
+                // 和 macOS 的通知回调走同一条定位路径。
+                crate::ipc::Event::Signal(
+                    _,
+                    crate::ipc::Signal::NoticeFocus { notice_id },
+                ) => {
+                    let _ = cx.update(|cx| open_butler_notice_from_host(cx, &notice_id));
                 }
                 // 窗口进程里的「退出 MNS」：托盘宿主才是整个程序的拥有者。
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::Shutdown) => {

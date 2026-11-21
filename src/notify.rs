@@ -4,8 +4,12 @@
 //! 走 `UNUserNotificationCenter`：打包后的 `MNS.app` 有 bundle id，横幅会以
 //! 本应用名义出现；点击通知会通过通道唤醒 GUI 打开管家窗口。
 //!
-//! Windows / Linux 暂不弹系统通知：Windows Toast 需要 AUMID 与快捷方式注册，
-//! 属于安装包侧工作；这两个平台仍以托盘提示为准。
+//! Windows 11 走 WinRT Toast。未打包应用必须先有一个带 `AppUserModelID`
+//! 属性的开始菜单快捷方式，否则 `CreateToastNotifierWithId` 会拒绝投递；
+//! 这个快捷方式由本模块在宿主启动时按当前 exe 路径创建/补齐（与安装包创建
+//! 的快捷方式同名，升级覆盖后会自动补回属性）。点击走自定义 `mns:` 协议：
+//! 系统按注册的命令拉起一个新的 `mns-gui`，新进程把 notice id 交给已在运行
+//! 的宿主后立即退出。Windows 10 与 Linux 没有这条通道，仍以托盘提示为准。
 
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -42,6 +46,8 @@ pub fn init() -> UnboundedReceiver<Option<String>> {
     let _ = OPEN_TX.set(tx);
     #[cfg(target_os = "macos")]
     macos::install();
+    #[cfg(target_os = "windows")]
+    windows::install();
     rx
 }
 
@@ -51,17 +57,43 @@ pub fn init() -> UnboundedReceiver<Option<String>> {
 /// 时，宿主能知道用户点的是哪一条（只靠正文匹配会在两条同文案时串号）。
 ///
 /// 返回 `true` 表示已交给系统投递（不是「用户已看到」）；未打包的开发
-/// 二进制、非 macOS 平台返回 `false`，调用方据此不要把审计写成「已送达」。
+/// 二进制、非 macOS / Windows 11 平台返回 `false`，调用方据此不要把审计写成
+/// 「已送达」。
 pub fn send(text: &str, notice_id: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         macos::send(text, notice_id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::send(text, notice_id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (text, notice_id);
         false
     }
+}
+
+/// Windows Toast 点击后由系统按 `mns:` 协议拉起本程序，参数形如
+/// `--toast "mns:butler?notice=<id>"`。其他平台没有这条路径。
+#[cfg(target_os = "windows")]
+pub fn toast_notice_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw = args
+        .iter()
+        .position(|arg| arg == "--toast")
+        .and_then(|index| args.get(index + 1))
+        .or_else(|| args.iter().find(|arg| arg.starts_with("mns:")))?;
+    launch_notice(raw)
+}
+
+/// 从 `mns:butler?notice=<id>` 里取出 notice id。
+#[cfg(target_os = "windows")]
+fn launch_notice(raw: &str) -> Option<String> {
+    let (_, rest) = raw.split_once("notice=")?;
+    let id = rest.split(['&', '#']).next().unwrap_or(rest).trim();
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// 消费「这次激活是点通知来的」标记。只有一次；没点过通知就返回 false。
@@ -290,5 +322,290 @@ mod macos {
             }
         });
         center.addNotificationRequest_withCompletionHandler(&request, Some(&handler));
+    }
+}
+
+/// Windows 11 的 Toast 投递与通知身份注册。
+///
+/// 未打包应用没有包身份，系统只认「开始菜单里带 AppUserModelID 属性的
+/// 快捷方式」：没有它，`CreateToastNotifierWithId` 能创建对象但 `Show` 会被
+/// 系统丢掉，也不会有任何报错。安装包建的同名快捷方式在升级时会被重写、
+/// 丢掉属性，所以宿主每次启动都补一次 AUMID；已存在的快捷方式不动目标
+/// （便携版/开发版不该把「开始 → MNS」改指到临时构建），只有完全缺失时
+/// 才新建一条。AUMID 本身稳定不变。
+///
+/// 点击不做 COM 激活服务器（需要注册 CLSID 并实现
+/// `INotificationActivationCallback`）：Toast 声明 `activationType="protocol"`，
+/// 系统按 HKCU 里注册的 `mns:` 协议拉起一个新的 `mns-gui`，新进程把 notice
+/// id 通过本地通道交给已有宿主后退出。
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc, IBindCtx, IPersistFile,
+    };
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize};
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        GPS_READWRITE, IPropertyStore, SHGetPropertyStoreFromParsingName,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
+
+    /// 稳定的应用身份。改了它等于换一个通知来源，用户的通知设置会重来一次。
+    const AUMID: &str = "Sopaco.MNS.Investment";
+    /// 与安装包 `[Icons]` 创建的同名快捷方式，避免开始菜单出现两个 MNS。
+    const SHORTCUT_NAME: &str = "MNS 投资助手.lnk";
+    /// Toast 点击回跳用的协议。命令在 HKCU 下注册，不需要管理员。
+    const URI_SCHEME: &str = "mns";
+
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn install() {
+        // WinRT 与 Shell COM 都要求线程初始化过 COM。GPUI 在起消息循环前
+        // 已经 OleInitialize 成 STA，这里再声明一次同模式（重复初始化返回
+        // S_FALSE/RPC_E_CHANGED_MODE），失败可以忽略。不能用 MTA：那会让
+        // UI 线程的 STA 初始化失败，拖拽与文件对话框都会跟着坏。
+        unsafe {
+            let _ = RoInitialize(RO_INIT_SINGLETHREADED);
+        }
+        if let Err(error) = register() {
+            eprintln!("[mns-gui] Windows 通知注册失败：{error}");
+        }
+    }
+
+    fn register() -> Result<(), String> {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("定位 mns-gui.exe 失败：{error}"))?;
+        ensure_shortcut(&exe)?;
+        ensure_uri_scheme(&exe)?;
+        REGISTERED.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn send(text: &str, notice_id: &str) -> bool {
+        // 启动时注册失败（例如 APPDATA 一时不可写）时，投递前再补一次。
+        if !REGISTERED.load(Ordering::Relaxed)
+            && let Err(error) = register()
+        {
+            eprintln!("[mns-gui] Windows 通知注册失败：{error}");
+            return false;
+        }
+        match show(text, notice_id) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[mns-gui] Windows 通知发送失败：{error}");
+                false
+            }
+        }
+    }
+
+    fn show(text: &str, notice_id: &str) -> Result<(), String> {
+        let launch = format!("{URI_SCHEME}:butler?notice={notice_id}");
+        // `ToastGeneric` 是 Windows 11 的通用模板；Title 固定，正文是管家
+        // 已经过开口校验的一句话。点击走协议，不依赖 COM 激活服务器。
+        let xml = format!(
+            "<toast activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>MNS · 管家</text><text>{}</text></binding></visual><audio src=\"ms-winsoundevent:Notification.Default\"/></toast>",
+            xml_escape(&launch),
+            xml_escape(text)
+        );
+        let document = XmlDocument::new()
+            .map_err(|error| format!("创建通知内容失败：{error}"))?;
+        document
+            .LoadXml(&HSTRING::from(xml))
+            .map_err(|error| format!("通知内容无效：{error}"))?;
+        let notifier =
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
+                .map_err(|error| format!("注册通知通道失败：{error}"))?;
+        let toast = ToastNotification::CreateToastNotification(&document)
+            .map_err(|error| format!("构造通知失败：{error}"))?;
+        notifier
+            .Show(&toast)
+            .map_err(|error| format!("提交通知失败：{error}"))?;
+        Ok(())
+    }
+
+    /// 确保开始菜单里有带 `PKEY_AppUserModel_ID` 的快捷方式。
+    ///
+    /// 已存在时只补属性，不改目标：安装包建的快捷方式指向正式安装目录，
+    /// 便携版/开发版若把它改指自己，用户下次点「开始 → MNS」就会跑到临时
+    /// 构建上。真正缺快捷方式（例如解压即用的便携包）才新建一条。
+    fn ensure_shortcut(exe: &Path) -> Result<(), String> {
+        let path = shortcut_path().ok_or("找不到 APPDATA，无法注册通知身份")?;
+        if path.exists() {
+            return set_aumid(&path);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建开始菜单目录失败：{error}"))?;
+        }
+        let exe_wide = HSTRING::from(exe.as_os_str().to_string_lossy().as_ref());
+        let path_wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .map_err(|error| format!("创建快捷方式失败：{error}"))?;
+            link.SetPath(&exe_wide)
+                .map_err(|error| format!("设置快捷方式目标失败：{error}"))?;
+            let _ = link.SetDescription(&HSTRING::from("MNS 投资助手"));
+            let _ = link.SetIconLocation(&exe_wide, 0);
+            let file: IPersistFile = link
+                .cast()
+                .map_err(|error| format!("快捷方式不支持持久化：{error}"))?;
+            file.Save(&path_wide, true)
+                .map_err(|error| format!("写入快捷方式失败：{error}"))?;
+        }
+        set_aumid(&path)
+    }
+
+    fn shortcut_path() -> Option<PathBuf> {
+        let appdata = std::env::var_os("APPDATA")?;
+        Some(
+            PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join(SHORTCUT_NAME),
+        )
+    }
+
+    fn set_aumid(path: &Path) -> Result<(), String> {
+        let path_wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+        let value = prop_variant_string(AUMID)?;
+        unsafe {
+            let store: IPropertyStore = SHGetPropertyStoreFromParsingName(
+                &path_wide,
+                None::<&IBindCtx>,
+                GPS_READWRITE,
+            )
+            .map_err(|error| format!("打开快捷方式属性失败：{error}"))?;
+            store
+                .SetValue(&PKEY_AppUserModel_ID, &value)
+                .map_err(|error| format!("写入 AppUserModelID 失败：{error}"))?;
+            store
+                .Commit()
+                .map_err(|error| format!("保存快捷方式属性失败：{error}"))?;
+        }
+        // `PROPVARIANT` 的 Drop 会调用 `PropVariantClear` 释放我们分配的
+        // `VT_LPWSTR`，这里不要再 `CoTaskMemFree` 一次——双重释放会直接
+        // 触发 Windows 堆损坏（STATUS_HEAP_CORRUPTION）。
+        Ok(())
+    }
+
+    /// 构造 `VT_LPWSTR` 的 PROPVARIANT；生命周期结束时由它的 `Drop` 释放。
+    fn prop_variant_string(text: &str) -> Result<PROPVARIANT, String> {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let raw = unsafe { CoTaskMemAlloc(wide.len() * 2) } as *mut u16;
+        if raw.is_null() {
+            return Err("分配通知身份字符串失败".to_owned());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), raw, wide.len());
+        }
+        let mut value = PROPVARIANT::default();
+        unsafe {
+            let inner = &mut *value.Anonymous.Anonymous;
+            inner.vt = VT_LPWSTR;
+            inner.Anonymous.pwszVal = PWSTR(raw);
+        }
+        Ok(value)
+    }
+
+    /// 注册 `mns:` 协议：点击 Toast 时由系统拉起 `mns-gui --toast <uri>`。
+    fn ensure_uri_scheme(exe: &Path) -> Result<(), String> {
+        let command = format!("\"{}\" --toast \"%1\"", exe.display());
+        write_reg_string(&format!(r"Software\Classes\{URI_SCHEME}"), None, "URL:MNS Protocol")?;
+        write_reg_string(
+            &format!(r"Software\Classes\{URI_SCHEME}"),
+            Some("URL Protocol"),
+            "",
+        )?;
+        write_reg_string(
+            &format!(r"Software\Classes\{URI_SCHEME}\shell\open\command"),
+            None,
+            &command,
+        )?;
+        Ok(())
+    }
+
+    fn write_reg_string(subkey: &str, name: Option<&str>, value: &str) -> Result<(), String> {
+        let subkey = HSTRING::from(subkey);
+        let mut key = HKEY::default();
+        let created = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &subkey,
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                None,
+                &mut key,
+                None,
+            )
+        };
+        if created.0 != 0 {
+            return Err(format!("打开注册表项失败：{}", created.0));
+        }
+        let name_wide = name.map(HSTRING::from);
+        let name_ptr = match &name_wide {
+            Some(name) => PCWSTR(name.as_ptr()),
+            None => PCWSTR::null(),
+        };
+        // REG_SZ 需要把结尾的 NUL 一起写进去。
+        let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+        let written = unsafe { RegSetValueExW(key, name_ptr, None, REG_SZ, Some(bytes)) };
+        let _ = unsafe { RegCloseKey(key) };
+        if written.0 != 0 {
+            return Err(format!("写入注册表值失败：{}", written.0));
+        }
+        Ok(())
+    }
+
+    fn xml_escape(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for ch in text.chars() {
+            match ch {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::launch_notice;
+
+    #[test]
+    fn parses_notice_id_from_protocol_launch() {
+        assert_eq!(
+            launch_notice("mns:butler?notice=n1763689500000-1a2b3c4d").as_deref(),
+            Some("n1763689500000-1a2b3c4d")
+        );
+        assert_eq!(
+            launch_notice("mns:butler?notice=n1-ff&from=toast").as_deref(),
+            Some("n1-ff")
+        );
+        // 没有 notice 参数或 id 为空时不能误开一个空窗。
+        assert_eq!(launch_notice("mns:butler"), None);
+        assert_eq!(launch_notice("mns:butler?notice="), None);
     }
 }

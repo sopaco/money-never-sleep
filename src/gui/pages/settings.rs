@@ -354,7 +354,7 @@ pub fn render(shell: &AppShell, cx: &mut Context<AppShell>) -> AnyElement {
                     }))),
             )
             .child(caption(
-                "开口会弹一条系统通知（macOS）并在托盘菜单留一条，点开即进会话；只在本机，不外发。关掉后管家仍可回答问题。",
+                "开口会弹一条系统通知（macOS / Windows 11）并在托盘菜单留一条，点开即进会话；只在本机，不外发。关掉后管家仍可回答问题。",
             ))
             .child(divider())
             .child(caption("主动开口频控（改完立即生效）"))

@@ -86,6 +86,27 @@ objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
 
+# --- Windows 11 Toast --------------------------------------------------------
+# 未打包应用弹 Toast 需要开始菜单快捷方式上的 AppUserModelID：`IShellLinkW`
+# 建快捷方式，`IPropertyStore` 写 PKEY_AppUserModel_ID；点击回跳走 `mns:`
+# 协议，所以要能写 HKCU 注册表。WinRT 部分只用 `XmlDocument` 与
+# `ToastNotificationManager`。版本与 gpui 已依赖的 windows 0.62 对齐，不新增
+# 编译单元。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

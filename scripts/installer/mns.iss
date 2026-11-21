@@ -109,6 +109,13 @@ Name: "{autoprograms}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconF
 Name: "{autoprograms}\{#AppDisplayName} 帮助中心"; Filename: "{app}\{#HelpExeName}"; IconFilename: "{app}\{#HelpExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#AppDisplayName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
+[Registry]
+; Windows Toast 点击回跳：未打包应用只能靠协议把点击交回 GUI。运行时也会
+; 写同样的值（便携版没有安装器），这里让安装后立即生效，并在卸载时清掉。
+Root: HKCU; Subkey: "Software\Classes\mns"; ValueType: string; ValueName: ""; ValueData: "URL:MNS Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\mns"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\mns\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" --toast ""%1"""
+
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppDisplayName}"; Flags: nowait postinstall skipifsilent
 

@@ -725,7 +725,7 @@ mod windows_impl {
     use super::{Event, MAX_LINE, Signal, decode, encode, registry};
     use std::ffi::c_void;
     use std::fs::File;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedSender;
@@ -763,6 +763,8 @@ mod windows_impl {
     /// 232」的契约，所以非测试编译允许它无引用。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) const ERROR_NO_DATA: i32 = 232;
+    const ERROR_BROKEN_PIPE: i32 = 109;
+    const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
@@ -789,6 +791,16 @@ mod windows_impl {
             template: Handle,
         ) -> Handle;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+        /// 只看管道里有没有数据，不消费。同步管道上不能长期挂着 `ReadFile`：
+        /// 同一文件对象的 I/O 是串行的，挂起的读会把另一个线程的写一起卡住。
+        fn PeekNamedPipe(
+            pipe: Handle,
+            buffer: *mut c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            total_bytes_avail: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
         /// 取消指定句柄上挂起的 I/O。dup 出去的读句柄指向同一管道文件对象，
         /// 在任一克隆上调用都能打断另一克隆里阻塞中的 `ReadFile`。
         fn CancelIoEx(handle: Handle, overlapped: *mut c_void) -> i32;
@@ -956,25 +968,90 @@ mod windows_impl {
         None
     }
 
-    fn read_connection(id: u64, pipe: File, tx: UnboundedSender<Event>) {
-        let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                // 客户端关掉连接时 `ReadFile` 报 `ERROR_BROKEN_PIPE`，和读到
-                // EOF 一样：这条连接到此为止。
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line.len() > MAX_LINE {
-                        break;
+    /// 轮询式行读取器。先 `PeekNamedPipe` 看有没有数据，有才 `ReadFile`。
+    ///
+    /// Windows 的同步（非 OVERLAPPED）管道句柄在同一个文件对象上串行化 I/O：
+    /// 读线程挂起的 `ReadFile` 会把写线程的 `WriteFile` 一起卡住。双向连接
+    /// （管家窗口 ↔ `mns-butlerd`）只要一挂读，另一头就再也写不出去——窗口
+    /// 表现为「发消息没反应」。轮询让 `ReadFile` 只在确有数据时发出，从不
+    /// 长期挂起；20ms 的间隔对本地会话足够。
+    struct LineReader {
+        pipe: File,
+        pending: Vec<u8>,
+        chunk: Vec<u8>,
+    }
+
+    impl LineReader {
+        fn new(pipe: File) -> Self {
+            Self {
+                pipe,
+                pending: Vec::new(),
+                chunk: Vec::new(),
+            }
+        }
+
+        /// 读到一行（去掉行尾 `\r\n`）；对端关闭返回 `None`。
+        fn next_line(&mut self) -> std::io::Result<Option<String>> {
+            loop {
+                if let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+                    let mut raw: Vec<u8> = self.pending.drain(..=index).collect();
+                    if raw.last() == Some(&b'\n') {
+                        raw.pop();
                     }
+                    if raw.last() == Some(&b'\r') {
+                        raw.pop();
+                    }
+                    return Ok(Some(String::from_utf8_lossy(&raw).into_owned()));
+                }
+                if self.pending.len() > MAX_LINE {
+                    return Ok(None);
+                }
+                let mut available: u32 = 0;
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        self.pipe.as_raw_handle() as Handle,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let error = std::io::Error::last_os_error();
+                    return match error.raw_os_error() {
+                        Some(ERROR_BROKEN_PIPE) | Some(ERROR_PIPE_NOT_CONNECTED) => Ok(None),
+                        _ => Err(error),
+                    };
+                }
+                if available == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                let want = (available as usize).min(MAX_LINE);
+                self.chunk.resize(want, 0);
+                let count = self.pipe.read(&mut self.chunk)?;
+                if count == 0 {
+                    return Ok(None);
+                }
+                self.pending.extend_from_slice(&self.chunk[..count]);
+            }
+        }
+    }
+
+    fn read_connection(id: u64, pipe: File, tx: UnboundedSender<Event>) {
+        let mut reader = LineReader::new(pipe);
+        loop {
+            match reader.next_line() {
+                Ok(Some(line)) => {
                     if let Some(signal) = decode(&line)
                         && tx.send(Event::Signal(id, signal)).is_err()
                     {
                         break;
                     }
                 }
+                // 对端关闭（`ERROR_BROKEN_PIPE`）与读失败都到此为止。
+                Ok(None) | Err(_) => break,
             }
         }
         let _ = tx.send(Event::Disconnected(id));
@@ -1026,24 +1103,18 @@ mod windows_impl {
             std::thread::Builder::new()
                 .name("mns-ipc-client-read".to_owned())
                 .spawn(move || {
-                    let mut reader = BufReader::new(pipe);
-                    let mut line = String::new();
+                    let mut reader = LineReader::new(pipe);
                     loop {
-                        line.clear();
-                        match reader.read_line(&mut line) {
-                            // 客户端关掉连接时 `ReadFile` 报 `ERROR_BROKEN_PIPE`，
-                            // 和读到 EOF 一样：这条连接到此为止。
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {
-                                if line.len() > MAX_LINE {
-                                    break;
-                                }
+                        match reader.next_line() {
+                            Ok(Some(line)) => {
                                 if let Some(signal) = decode(&line)
                                     && tx.send(signal).is_err()
                                 {
                                     break;
                                 }
                             }
+                            // 对端关闭（`ERROR_BROKEN_PIPE`）与读失败都到此为止。
+                            Ok(None) | Err(_) => break,
                         }
                     }
                 })
