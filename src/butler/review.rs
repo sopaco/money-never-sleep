@@ -26,6 +26,15 @@ use super::store::{read_json, write_json};
 /// `last-review` 的文件名。内容只有一行日期（`YYYY-MM-DD`）。
 pub const REVIEW_FILE: &str = "last-review";
 
+/// 当天巡检失败后的重试记录。成功或跨天后自动失效。
+pub const REVIEW_ATTEMPT_FILE: &str = "last-review-attempt.json";
+
+/// 当天最多尝试几次巡检（首次 + 两次重试）。
+pub const MAX_REVIEW_ATTEMPTS: u32 = 3;
+
+/// 失败后隔多久再试。短到当天还有机会补救，长到不会把模型当成重试器。
+pub const REVIEW_RETRY_MINUTES: i64 = 30;
+
 /// 一次排好的巡检。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyReview {
@@ -178,15 +187,84 @@ fn write_last_at(path: &Path, date: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// 当天失败过的巡检尝试。
+///
+/// 没有它，一次超时就要么当天不再补跑（用户看到「巡检没执行」），要么被
+/// agenda 立刻重排成死循环。退避时刻落盘，守护进程重启也不会丢。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewAttempt {
+    /// `YYYY-MM-DD`。
+    pub date: String,
+    /// 当天已经失败的次数。
+    pub failures: u32,
+    /// 下一次允许重试的时刻（本地时区毫秒时间戳）。
+    pub retry_at_ms: i64,
+}
+
+impl ReviewAttempt {
+    /// 当天是否已经把次数用完。
+    pub fn exhausted(&self, today: &str) -> bool {
+        self.date == today && self.failures >= MAX_REVIEW_ATTEMPTS
+    }
+}
+
+pub fn attempt_path() -> PathBuf {
+    crate::config::app_data_dir()
+        .join("agent")
+        .join(REVIEW_ATTEMPT_FILE)
+}
+
+/// 读当天的失败记录。坏文件当没有：宁可多跑一次，也别把巡检永久停掉。
+pub fn read_attempt() -> Option<ReviewAttempt> {
+    read_json(&attempt_path()).ok().flatten()
+}
+
+/// 记一次失败并写下退避时刻。
+///
+/// 写盘失败时退化成「今天跑过」：否则 agenda 会立刻再拉起一轮，变成烧模型
+/// 的死循环。返回的计数用于决定还要不要重试、以及要不要落一份失败报告。
+pub fn record_attempt_failure(now: DateTime<Local>, date: &str) -> ReviewAttempt {
+    let mut attempt = read_attempt().unwrap_or_default();
+    if attempt.date != date {
+        attempt = ReviewAttempt {
+            date: date.to_owned(),
+            failures: 0,
+            retry_at_ms: 0,
+        };
+    }
+    attempt.failures = attempt.failures.saturating_add(1);
+    attempt.retry_at_ms =
+        (now + chrono::Duration::minutes(REVIEW_RETRY_MINUTES)).timestamp_millis();
+    if let Err(error) = write_json(&attempt_path(), &attempt) {
+        eprintln!("巡检重试记录写入失败：{error:#}");
+        let _ = write_last(date);
+    }
+    attempt
+}
+
+/// 巡检成功：清掉当天的失败记录。
+pub fn clear_attempt() {
+    let path = attempt_path();
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("巡检重试记录清理失败：{error}");
+    }
+}
+
 /// 下一次该在什么时候巡检。
 ///
 /// 规则很短：今天还没跑且已经过点，就现在补跑；还没到点就今天那个时刻；
-/// 今天跑过就明天。`None` 只表示「没开启」或「时间配置不合法」。
+/// 今天跑过就明天。当天失败过则按 `attempt.retry_at_ms` 退避重试，次数
+/// 用尽后与「今天跑过」一样排明天。`None` 只表示「没开启」或「时间配置
+/// 不合法」。
 pub fn schedule(
     now: DateTime<Local>,
     enabled: bool,
     time: &str,
     last: Option<&str>,
+    attempt: Option<&ReviewAttempt>,
 ) -> Option<DailyReview> {
     if !enabled {
         return None;
@@ -195,7 +273,9 @@ pub fn schedule(
     let today = now.date_naive();
     let today_text = today.format("%Y-%m-%d").to_string();
 
-    if last.is_some_and(|last| last.trim() == today_text) {
+    let done_today = last.is_some_and(|last| last.trim() == today_text)
+        || attempt.is_some_and(|attempt| attempt.exhausted(&today_text));
+    if done_today {
         let tomorrow = today.succ_opt()?;
         let at = local_at(tomorrow, hour, minute).unwrap_or(now);
         return Some(DailyReview {
@@ -204,7 +284,15 @@ pub fn schedule(
         });
     }
 
-    let at = local_at(today, hour, minute).unwrap_or(now).max(now);
+    let mut at = local_at(today, hour, minute).unwrap_or(now).max(now);
+    // 当天失败过：等退避时刻，别把失败立刻重排成第二轮。
+    if let Some(attempt) = attempt.filter(|attempt| attempt.date == today_text && attempt.failures > 0)
+        && let Some(retry_at) = Local
+            .timestamp_millis_opt(attempt.retry_at_ms)
+            .single()
+    {
+        at = at.max(retry_at);
+    }
     Some(DailyReview {
         at,
         id: format!("review:{today_text}"),
@@ -420,15 +508,15 @@ mod tests {
     #[test]
     fn 未开启或时间非法时不排() {
         let now = at(21, 9, 0);
-        assert_eq!(schedule(now, false, "08:30", None), None);
-        assert_eq!(schedule(now, true, "25:00", None), None);
-        assert_eq!(schedule(now, true, "08:70", None), None);
-        assert_eq!(schedule(now, true, "八点半", None), None);
+        assert_eq!(schedule(now, false, "08:30", None, None), None);
+        assert_eq!(schedule(now, true, "25:00", None, None), None);
+        assert_eq!(schedule(now, true, "08:70", None, None), None);
+        assert_eq!(schedule(now, true, "八点半", None, None), None);
     }
 
     #[test]
     fn 今天未跑且未到点时排今天那个时刻() {
-        let review = schedule(at(21, 7, 0), true, "08:30", None).unwrap();
+        let review = schedule(at(21, 7, 0), true, "08:30", None, None).unwrap();
         assert_eq!(review.at, at(21, 8, 30));
         assert_eq!(review.id, "review:2026-11-21");
     }
@@ -436,14 +524,40 @@ mod tests {
     #[test]
     fn 今天未跑且已过点时立刻补跑() {
         let now = at(21, 10, 0);
-        let review = schedule(now, true, "08:30", None).unwrap();
+        let review = schedule(now, true, "08:30", None, None).unwrap();
         assert_eq!(review.at, now);
         assert_eq!(review.id, "review:2026-11-21");
     }
 
     #[test]
     fn 今天跑过就排明天() {
-        let review = schedule(at(21, 10, 0), true, "08:30", Some("2026-11-21")).unwrap();
+        let review = schedule(at(21, 10, 0), true, "08:30", Some("2026-11-21"), None).unwrap();
+        assert_eq!(review.at, at(22, 8, 30));
+        assert_eq!(review.id, "review:2026-11-22");
+    }
+
+    #[test]
+    fn 当天失败按退避时刻重试() {
+        let now = at(21, 10, 0);
+        let attempt = ReviewAttempt {
+            date: "2026-11-21".to_owned(),
+            failures: 1,
+            retry_at_ms: at(21, 10, 30).timestamp_millis(),
+        };
+        let review = schedule(now, true, "08:30", None, Some(&attempt)).unwrap();
+        assert_eq!(review.at, at(21, 10, 30), "失败后等退避时刻，不立刻重跑");
+        assert_eq!(review.id, "review:2026-11-21");
+    }
+
+    #[test]
+    fn 重试次数用尽就排明天() {
+        let now = at(21, 10, 0);
+        let attempt = ReviewAttempt {
+            date: "2026-11-21".to_owned(),
+            failures: MAX_REVIEW_ATTEMPTS,
+            retry_at_ms: at(21, 10, 30).timestamp_millis(),
+        };
+        let review = schedule(now, true, "08:30", None, Some(&attempt)).unwrap();
         assert_eq!(review.at, at(22, 8, 30));
         assert_eq!(review.id, "review:2026-11-22");
     }

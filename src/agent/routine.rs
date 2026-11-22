@@ -90,7 +90,7 @@ fn trim_report(report: &str) -> String {
         return report.to_owned();
     }
     let head: String = report.chars().take(MAX_REPORT_CHARS).collect();
-    format!("{head}\n…（报告过长，已截断；需要细节请用上面的命令单独查）")
+    format!("{head}\n…（报告过长，已截断）")
 }
 
 #[cfg(test)]

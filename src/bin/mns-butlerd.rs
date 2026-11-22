@@ -50,8 +50,8 @@ use money_never_sleep::agent::{
 use money_never_sleep::butler::agenda;
 use money_never_sleep::butler::chat::{self, ChatEffect, ChatReference};
 use money_never_sleep::butler::orchestrator::{
-    self, AGENT_INIT_MIN_IDLE_HOURS, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice,
-    agent_init_backoff, append_init_record,
+    self, AccountFacts, AgentInitOutcome, AgentInitRecord, Notice, agent_init_backoff,
+    append_init_record,
 };
 use money_never_sleep::butler::review::{self, ReviewRef, ReviewReport};
 use money_never_sleep::butler::schedule;
@@ -76,11 +76,21 @@ const MAX_SLEEP: Duration = Duration::from_secs(30 * 60);
 const AGENT_INIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 一次每日巡检的硬超时。它比闲聊长：先刷价（网络），再跑一轮只看不写的
-/// 复盘。超时按失败记录，当天不再重试。
-const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
+/// 复盘。实测一轮手动巡检约 4 分钟，300 秒会卡在正常回合的尾巴上——超时
+/// 后按失败记一次，当天按 30 分钟退避重试，最多三次。
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `mns today --quiet` 自己的超时。网络卡住时不能把 300 秒全耗在第一步。
+/// `mns today --quiet` 自己的超时。网络卡住时不能把 10 分钟全耗在第一步。
 const REVIEW_CLI_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 用户刚说完话后多久内不自己起话头，以及管家刚提醒过后多久内不重复开口。
+///
+/// 两个窗口都不能取 12 小时：12 小时的节奏已经由 `last_agent_init` 的退避
+/// 把关，这里只回答「现在插话会不会打断用户 / 重复刚才的话」。取 12 小时
+/// 会与 4 小时节拍叠加成 20 小时以上的实际周期——非静音窗口每天只有 16
+/// 小时，巡检几乎整天轮空。
+const AGENT_INIT_CHAT_QUIET_HOURS: i64 = 2;
+const AGENT_INIT_SPEAK_QUIET_HOURS: i64 = 4;
 
 /// 一句提问最多引用几份巡检报告，以及每份塞进上下文的上限。
 const MAX_REFERENCES: usize = 3;
@@ -140,11 +150,13 @@ async fn run() -> Result<()> {
         // 小文件读取，与下面 `Butler::load()` 同量级。
         let settings = money_never_sleep::agent::load_settings();
         let last = review::read_last();
+        let attempt = review::read_attempt();
         let review = review::schedule(
             now,
             settings.daily_review,
             &settings.daily_review_time,
             last.as_deref(),
+            attempt.as_ref(),
         );
         let agenda = match Butler::load() {
             Ok(butler) => agenda::next(now, &butler, review.as_ref()),
@@ -523,11 +535,9 @@ fn spawn_daily_review(date: String, busy: &Arc<AtomicBool>, done: &UnboundedSend
     if busy.swap(true, Ordering::SeqCst) {
         return;
     }
-    // 起跑前就记账：失败当天不重试，与旧 GUI 语义一致——宁可漏跑，
-    // 也不在一天里生成两份可能冲突的结论。
-    if let Err(error) = review::write_last(&date) {
-        eprintln!("mns-butlerd: 写入 last-review 失败：{error}");
-    }
+    // `last-review` 只在成功时写：失败要留给当天的退避重试，不能一失败就
+    // 把这一天作废。重试节奏由 `ReviewAttempt` 落盘，进程重启也不会立刻
+    // 再拉起一轮。
     let busy = busy.clone();
     let done = done.clone();
     tokio::spawn(async move {
@@ -540,11 +550,14 @@ fn spawn_daily_review(date: String, busy: &Arc<AtomicBool>, done: &UnboundedSend
 /// 刷价 + 一轮只读复盘。
 ///
 /// 与 GUI 手动巡检同一条流水线：`mns today --quiet` 刷新数据并由 CLI 自己
-/// 写报告，然后让 ACP agent 按 `routine::daily_review_prompt` 复盘。区别只有
-/// 授权：无人值守，所有权限请求一律拒绝。
+/// 写报告，然后让 ACP agent 按 `routine::daily_review_prompt` 复盘。两处区别：
+///
+/// - 授权：无人值守，所有权限请求一律拒绝；
+/// - prompt 不提供 CLI 入口：`guard_writes` 下 `Execute` 需要确认，而这里
+///   没人能确认。给了命令只会让模型反复尝试并被拒，最后卡到超时。报告本身
+///   就是这次判断的唯一数据来源。
 async fn run_daily_review(date: &str) -> Result<ReviewReport, String> {
     let cli = money_never_sleep::agent::mns_bin().ok_or_else(|| "找不到 mns CLI".to_owned())?;
-    let prompt_cli = cli.clone();
     let task = tokio::task::spawn_blocking(move || run_today_cli(&cli));
     let today_report = tokio::time::timeout(REVIEW_CLI_TIMEOUT, task)
         .await
@@ -552,7 +565,7 @@ async fn run_daily_review(date: &str) -> Result<ReviewReport, String> {
         .map_err(|error| format!("巡检 CLI 任务失败：{error}"))??;
 
     let weekday = review::weekday_text(date);
-    let goal = routine::daily_review_prompt(date, &weekday, &today_report, Some(&prompt_cli));
+    let goal = routine::daily_review_prompt(date, &weekday, &today_report, None);
 
     let (handle, mut events) = money_never_sleep::agent::start_runtime();
     if handle
@@ -589,6 +602,11 @@ async fn run_daily_review(date: &str) -> Result<ReviewReport, String> {
     if let Err(error) = review::save(&report) {
         eprintln!("mns-butlerd: 巡检报告保存失败：{error}");
     }
+    // 完整跑完一轮才记账：中途失败的时间留给当天的退避重试，别把一天作废。
+    if let Err(error) = review::write_last(date) {
+        eprintln!("mns-butlerd: 写入 last-review 失败：{error}");
+    }
+    review::clear_attempt();
     Ok(report)
 }
 
@@ -715,12 +733,30 @@ async fn deliver_review(
         }
         Err(error) => {
             eprintln!("mns-butlerd: 每日巡检失败：{error}");
-            let effects = chat.service.push_butler(
-                now,
-                format!("今日巡检没跑成：{error}"),
-                trigger,
-                notice_id,
-            );
+            let attempt = review::record_attempt_failure(now, &outcome.date);
+            let retrying = !attempt.exhausted(&outcome.date);
+            // 还有重试机会：会话里说清原因与重试时间；用尽后才落一份
+            // `failed` 报告，让巡检页也看得到这一天为什么没有结论。
+            if !retrying {
+                let mut report = ReviewReport::new("每日巡检", &outcome.date);
+                report.finish(
+                    "failed",
+                    format!("今日巡检没跑成：{error}"),
+                    None,
+                );
+                if let Err(error) = review::save(&report) {
+                    eprintln!("mns-butlerd: 失败报告保存失败：{error}");
+                }
+            }
+            let note = if retrying {
+                format!(
+                    "今日巡检没跑成：{error}（{} 分钟后自动重试）",
+                    review::REVIEW_RETRY_MINUTES
+                )
+            } else {
+                format!("今日巡检没跑成：{error}（今天不再重试）")
+            };
+            let effects = chat.service.push_butler(now, note, trigger, notice_id);
             chat.apply(effects, runtime);
         }
     }
@@ -931,25 +967,30 @@ async fn collect_message(
     }
 }
 
-/// 最近 12 小时有没有任何往来（会话消息或开口记录）。
+/// 最近有没有「刚发生的往来」。
 ///
-/// 用「任何往来」而不是只看用户发言：用户刚聊完、或管家刚提醒过，都不该再
-/// 自己起话头。开口记录也算，因为 GUI 没开时会话文件不会更新。
+/// 两个窗口分开：用户刚聊完（2 小时）不该被管家插话；管家自己刚提醒过
+/// （4 小时）不该马上重复。窗口刻意远短于 12 小时——真正的慢节奏由
+/// `last_agent_init` 的退避把关；这里若也取 12 小时，会和 4 小时节拍叠加成
+/// 20 小时以上的实际周期，静音时段（23–6）再把夜间节拍全部吃掉，巡检就
+/// 整天轮空。
 fn recent_activity(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
-    let cutoff = now - chrono::Duration::hours(AGENT_INIT_MIN_IDLE_HOURS);
-    session.messages.iter().any(|message| message.at >= cutoff)
+    let chat_cutoff = now - chrono::Duration::hours(AGENT_INIT_CHAT_QUIET_HOURS);
+    let speak_cutoff = now - chrono::Duration::hours(AGENT_INIT_SPEAK_QUIET_HOURS);
+    session.messages.iter().any(|message| message.at >= chat_cutoff)
         || butler
             .state
             .ledger
             .records
             .iter()
-            .any(|record| record.at >= cutoff)
+            .any(|record| record.at >= speak_cutoff)
 }
 
 /// 此刻该不该尝试 agent-init：距上次尝试 ≥ 退避时长（无失败 = 常规 12
-/// 小时；失败 1/2/≥3 次 = 15 分钟 / 1 小时 / 6 小时），且 12 小时内没有
-/// 别的往来。两个条件分开看：管家不该在用户刚说完话时自己起话头，
-/// 也不该在模型连续失败时反复花一次会话成本，更不该一次失败就沉默半天。
+/// 小时；失败 1/2/≥3 次 = 15 分钟 / 1 小时 / 6 小时），且最近没有刚发生的
+/// 往来。两个条件分开看：管家不该在用户刚说完话时自己起话头，也不该在
+/// 模型连续失败时反复花一次会话成本；但「最近往来」只挡几小时，不会把
+/// 4 小时的定时巡检节拍一起挡掉。
 fn agent_init_due(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
     let cooldown = agent_init_backoff(butler.state.agent_init_failures);
     let attempted_recently = butler
@@ -1240,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn 最近十二小时有往来就不主动开口() {
+    fn 刚发生的往来才挡住主动开口() {
         let now = at(16, 10);
         let empty = Butler {
             state: money_never_sleep::butler::ButlerState::default(),
@@ -1249,15 +1290,26 @@ mod tests {
         };
         assert!(!recent_activity(&empty, &Session::default(), now));
 
-        // 管家刚说过话：12 小时内不再自己起话头，哪怕会话文件还没更新。
-        let spoke = butler_with(vec![(at(16, 9), "agent-init:2026-11-16:1")]);
+        // 管家刚说过话：4 小时内不再自己起话头，哪怕会话文件还没更新。
+        let spoke = butler_with(vec![(now - chrono::Duration::minutes(1), "agent-init:2026-11-16:1")]);
         assert!(recent_activity(&spoke, &Session::default(), now));
+        // 5 小时前说过：窗口已过，不能把 4 小时的巡检节拍一起挡掉。
+        let long_ago = butler_with(vec![(now - chrono::Duration::hours(5), "agent-init:2026-11-16:1")]);
+        assert!(!recent_activity(&long_ago, &Session::default(), now));
 
-        // 用户 13 小时前聊过：可以开口。
+        // 用户 1 小时前聊过：2 小时内不插话。
         let mut session = Session::default();
-        session
-            .messages
-            .push(money_never_sleep::butler::Message::user(at(15, 21), "晚安"));
+        session.messages.push(money_never_sleep::butler::Message::user(
+            now - chrono::Duration::hours(1),
+            "在吗",
+        ));
+        assert!(recent_activity(&empty, &session, now));
+        // 用户 3 小时前聊过：可以开口。
+        let mut session = Session::default();
+        session.messages.push(money_never_sleep::butler::Message::user(
+            now - chrono::Duration::hours(3),
+            "晚安",
+        ));
         assert!(!recent_activity(&empty, &session, now));
     }
 
@@ -1294,7 +1346,7 @@ mod tests {
         butler.state.last_agent_init = Some(now - chrono::Duration::minutes(70));
         butler.state.agent_init_failures = 2;
         assert!(agent_init_due(&butler, &Session::default(), now));
-        // 退避再短，用户 12 小时内聊过天就不主动开口。
+        // 退避再短，用户刚聊完天就不主动开口。
         butler.state.last_agent_init = Some(now - chrono::Duration::hours(3));
         butler.state.agent_init_failures = 3;
         let mut session = Session::default();
