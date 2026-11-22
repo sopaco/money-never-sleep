@@ -85,12 +85,13 @@ const REVIEW_CLI_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 用户刚说完话后多久内不自己起话头，以及管家刚提醒过后多久内不重复开口。
 ///
-/// 两个窗口都不能取 12 小时：12 小时的节奏已经由 `last_agent_init` 的退避
-/// 把关，这里只回答「现在插话会不会打断用户 / 重复刚才的话」。取 12 小时
-/// 会与 4 小时节拍叠加成 20 小时以上的实际周期——非静音窗口每天只有 16
-/// 小时，巡检几乎整天轮空。
+/// 频率本身已经由设置页的「每天/每周最多」与静音时段把关，这里只回答
+/// 「现在插话会不会打断用户 / 重复刚才的话」，所以窗口很短：用户刚聊完
+/// 2 小时内不插话，自己刚提醒过 1 小时内不重复。真正的最小节奏是
+/// `last_agent_init` 的 1 小时冷却——若这里也取几小时，设置页放宽的额度
+/// 会被内部窗口悄悄吃掉。
 const AGENT_INIT_CHAT_QUIET_HOURS: i64 = 2;
-const AGENT_INIT_SPEAK_QUIET_HOURS: i64 = 4;
+const AGENT_INIT_SPEAK_QUIET_HOURS: i64 = 1;
 
 /// 一句提问最多引用几份巡检报告，以及每份塞进上下文的上限。
 const MAX_REFERENCES: usize = 3;
@@ -485,7 +486,8 @@ async fn wake(
             chat.drain_pending(link, runtime).await;
         }
         // 确定性内核没有由头时，才让 agent 自己找话头。只认定时巡检与
-        // 失败重试：「刚记完一笔账」是账本事件，不该变成一次闲聊。
+        // agent-init 的尝试节拍/失败重试：「刚记完一笔账」是账本事件，
+        // 不该变成一次闲聊。
         Some(SpeakDecision::Silent(silent))
             if silent == SilentBecause::NothingToSay
                 && matches!(
@@ -739,11 +741,7 @@ async fn deliver_review(
             // `failed` 报告，让巡检页也看得到这一天为什么没有结论。
             if !retrying {
                 let mut report = ReviewReport::new("每日巡检", &outcome.date);
-                report.finish(
-                    "failed",
-                    format!("今日巡检没跑成：{error}"),
-                    None,
-                );
+                report.finish("failed", format!("今日巡检没跑成：{error}"), None);
                 if let Err(error) = review::save(&report) {
                     eprintln!("mns-butlerd: 失败报告保存失败：{error}");
                 }
@@ -768,9 +766,9 @@ async fn deliver_review(
 /// 拿到回答后必须过 `validate_talk` 与通知口径（≤60 字、无买卖话术），
 /// 任何一步不过都沉默——主动开口没有模板兜底，不说比说错好。
 ///
-/// 失败不再沉默 12 小时：结果（含失败原因）写进 `initlog.jsonl`，
-/// 下一次尝试按 `agent_init_backoff` 退避。模型说「无」是合法回答，
-/// 不算失败、不缩短节奏。
+/// 失败不沉默一整天：结果（含失败原因）写进 `initlog.jsonl`，
+/// 下一次尝试按 `agent_init_backoff` 退避。模型返回 `[SILENT]` 是合法
+/// 回答，不算失败、不缩短节奏。
 ///
 /// 锁只包「读-改-写」，绝不跨 await：等 agent 回答的 120 秒里不挡
 /// 别的写者。
@@ -851,13 +849,15 @@ async fn run_agent_init() -> Result<bool> {
             return Ok(false);
         }
     };
+    // 与模型约定的不回话标记：命中就到此为止——不进会话、不写投递队列、
+    // 不弹通知。它和「没答上来」不同，是合法的正常沉默，不计入失败退避。
+    if talk::is_silent_reply(&cleaned) {
+        record_init(AgentInitOutcome::Silent, Some("模型返回无话说标记"));
+        return Ok(false);
+    }
     // 这一条会进系统通知横幅：banner 是纯文本通道，星号会原样显示。会话
     // 气泡也复用同一条文本，单行提醒不需要 markdown。
     let text = talk::notification_text(&cleaned);
-    if text.is_empty() || text == "无" || text == "无。" {
-        record_init(AgentInitOutcome::Silent, Some("模型说无"));
-        return Ok(false);
-    }
     // banner 是被动打扰通道：长度与话术口径与会话不同，这里不降级、只沉默。
     if let Err(violation) = schedule::validate_notification(&text) {
         record_init(
@@ -970,14 +970,16 @@ async fn collect_message(
 /// 最近有没有「刚发生的往来」。
 ///
 /// 两个窗口分开：用户刚聊完（2 小时）不该被管家插话；管家自己刚提醒过
-/// （4 小时）不该马上重复。窗口刻意远短于 12 小时——真正的慢节奏由
-/// `last_agent_init` 的退避把关；这里若也取 12 小时，会和 4 小时节拍叠加成
-/// 20 小时以上的实际周期，静音时段（23–6）再把夜间节拍全部吃掉，巡检就
-/// 整天轮空。
+/// （1 小时）不该马上重复。更长的节奏交给 `last_agent_init` 的 1 小时冷却
+/// 和设置页的每日/每周额度；这里取短窗口，是为了不把那些显式设置悄悄
+/// 覆盖掉。
 fn recent_activity(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
     let chat_cutoff = now - chrono::Duration::hours(AGENT_INIT_CHAT_QUIET_HOURS);
     let speak_cutoff = now - chrono::Duration::hours(AGENT_INIT_SPEAK_QUIET_HOURS);
-    session.messages.iter().any(|message| message.at >= chat_cutoff)
+    session
+        .messages
+        .iter()
+        .any(|message| message.at >= chat_cutoff)
         || butler
             .state
             .ledger
@@ -986,11 +988,11 @@ fn recent_activity(butler: &Butler, session: &Session, now: DateTime<Local>) -> 
             .any(|record| record.at >= speak_cutoff)
 }
 
-/// 此刻该不该尝试 agent-init：距上次尝试 ≥ 退避时长（无失败 = 常规 12
-/// 小时；失败 1/2/≥3 次 = 15 分钟 / 1 小时 / 6 小时），且最近没有刚发生的
+/// 此刻该不该尝试 agent-init：距上次尝试 ≥ 退避时长（无失败 = 1 小时；
+/// 失败 1/2/≥3 次 = 15 分钟 / 1 小时 / 6 小时），且最近没有刚发生的
 /// 往来。两个条件分开看：管家不该在用户刚说完话时自己起话头，也不该在
-/// 模型连续失败时反复花一次会话成本；但「最近往来」只挡几小时，不会把
-/// 4 小时的定时巡检节拍一起挡掉。
+/// 模型连续失败时反复花一次会话成本。说多少由设置页的额度与静音时段决定，
+/// 这里的 1 小时只是尝试节拍的下限。
 fn agent_init_due(butler: &Butler, session: &Session, now: DateTime<Local>) -> bool {
     let cooldown = agent_init_backoff(butler.state.agent_init_failures);
     let attempted_recently = butler
@@ -1290,44 +1292,54 @@ mod tests {
         };
         assert!(!recent_activity(&empty, &Session::default(), now));
 
-        // 管家刚说过话：4 小时内不再自己起话头，哪怕会话文件还没更新。
-        let spoke = butler_with(vec![(now - chrono::Duration::minutes(1), "agent-init:2026-11-16:1")]);
+        // 管家刚说过话：1 小时内不再自己起话头，哪怕会话文件还没更新。
+        let spoke = butler_with(vec![(
+            now - chrono::Duration::minutes(1),
+            "agent-init:2026-11-16:1",
+        )]);
         assert!(recent_activity(&spoke, &Session::default(), now));
-        // 5 小时前说过：窗口已过，不能把 4 小时的巡检节拍一起挡掉。
-        let long_ago = butler_with(vec![(now - chrono::Duration::hours(5), "agent-init:2026-11-16:1")]);
+        // 70 分钟前说过：1 小时窗口已过。
+        let long_ago = butler_with(vec![(
+            now - chrono::Duration::minutes(70),
+            "agent-init:2026-11-16:1",
+        )]);
         assert!(!recent_activity(&long_ago, &Session::default(), now));
 
         // 用户 1 小时前聊过：2 小时内不插话。
         let mut session = Session::default();
-        session.messages.push(money_never_sleep::butler::Message::user(
-            now - chrono::Duration::hours(1),
-            "在吗",
-        ));
+        session
+            .messages
+            .push(money_never_sleep::butler::Message::user(
+                now - chrono::Duration::hours(1),
+                "在吗",
+            ));
         assert!(recent_activity(&empty, &session, now));
         // 用户 3 小时前聊过：可以开口。
         let mut session = Session::default();
-        session.messages.push(money_never_sleep::butler::Message::user(
-            now - chrono::Duration::hours(3),
-            "晚安",
-        ));
+        session
+            .messages
+            .push(money_never_sleep::butler::Message::user(
+                now - chrono::Duration::hours(3),
+                "晚安",
+            ));
         assert!(!recent_activity(&empty, &session, now));
     }
 
     #[test]
-    fn 尝试主动开口也要隔十二小时() {
+    fn 尝试主动开口要隔一小时() {
         let now = at(16, 10);
         let mut butler = butler_with(vec![]);
         assert!(agent_init_due(&butler, &Session::default(), now));
-        // 上一轮试过、模型说「无」：成功率不影响节奏，12 小时内不再试。
-        butler.state.last_agent_init = Some(at(16, 9));
+        // 上一轮试过、模型回了无话说标记：频率不影响尝试节拍，1 小时内不再试。
+        butler.state.last_agent_init = Some(now - chrono::Duration::minutes(30));
         assert!(!agent_init_due(&butler, &Session::default(), now));
-        // 13 小时后可以再试。
-        butler.state.last_agent_init = Some(at(15, 20));
+        // 过了 1 小时可以再试。
+        butler.state.last_agent_init = Some(now - chrono::Duration::minutes(70));
         assert!(agent_init_due(&butler, &Session::default(), now));
     }
 
     #[test]
-    fn 失败后退避而不是沉默十二小时() {
+    fn 失败后退避而不是沉默一整天() {
         let now = at(16, 10);
         let mut butler = butler_with(vec![]);
         // 1 小时前失败 1 次：15 分钟退避已过，应当再试。

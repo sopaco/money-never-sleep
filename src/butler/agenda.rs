@@ -7,7 +7,7 @@
 //! - 每日巡检：设置里的 `daily_review_time`（今天已跑过就是明天）；
 //! - 自设任务：最早一条还没被唤醒过的待办；
 //! - 承诺到期：到期日当天早上（静音时段之后）；
-//! - agent-init 失败重试：上次尝试 + 退避时长。
+//! - agent-init 下一次尝试：上次尝试 + 1 小时（失败后是退避时长）。
 //!
 //! 任何输入变化（账本事件、GUI 或 CLI 改了状态）都会让调用方重算，所以这里
 //! 是纯函数：不缓存、不持有状态、不写盘。
@@ -79,12 +79,11 @@ pub fn next(now: DateTime<Local>, butler: &Butler, review: Option<&DailyReview>)
         }
     }
 
-    // agent-init 失败重试：`last_agent_init + 退避`。只在有失败时排——
-    // 常规节奏（12 小时）由 4 小时一次的定时巡检顺带覆盖，不值得为它
-    // 单独醒；失败后的 15 分钟/1 小时比巡检间隔短，不排就永远等不到。
-    // id 绑定「上次尝试 + 退避」：重试没产生新尝试（用户刚聊过天）时，
-    // seen 集合挡住同一个时刻反复叫醒。
-    if butler.state.agent_init_failures > 0
+    // agent-init 的下一次尝试：常规节奏 1 小时，失败后按 15 分钟 / 1 小时 /
+    // 6 小时退避。1 小时比 4 小时的定时巡检更密，必须单独排——否则「放宽到
+    // 1 小时」只在巡检顺带触发时才生效。id 绑定「上次尝试 + 目标时刻」：
+    // 同一个到点只叫醒一次，跑不成（比如用户刚聊过天）时不会反复空转。
+    if butler.state.policy.enabled
         && let Some(last) = butler.state.last_agent_init
     {
         let at = last + agent_init_backoff(butler.state.agent_init_failures);
@@ -271,17 +270,27 @@ mod tests {
     }
 
     #[test]
-    fn 没有失败就不为agent_init单独醒() {
+    fn 没有失败也按一小时排下一次主动开口() {
         let mut butler = butler();
         butler.state.scheduler.last_scheduled = Some(at(9, 0));
         butler.state.last_agent_init = Some(at(9, 0));
         butler.state.agent_init_failures = 0;
         let agenda = next(at(9, 5), &butler, None).unwrap();
-        assert_eq!(
-            agenda.source,
-            WakeSource::Scheduled,
-            "常规 12 小时节奏由巡检顺带覆盖，不需要单独的重试唤醒"
+        assert!(
+            matches!(agenda.source, WakeSource::AgentInitRetry { .. }),
+            "常规节拍应在 4 小时巡检之前醒来，实际 {agenda:?}"
         );
+        assert_eq!(agenda.at, at(10, 0), "无失败时冷却 1 小时");
+    }
+
+    #[test]
+    fn 主动开口关闭时不为它单独醒() {
+        let mut butler = butler();
+        butler.state.scheduler.last_scheduled = Some(at(9, 0));
+        butler.state.last_agent_init = Some(at(9, 0));
+        butler.state.policy.enabled = false;
+        let agenda = next(at(9, 5), &butler, None).unwrap();
+        assert_eq!(agenda.source, WakeSource::Scheduled);
     }
 
     #[test]

@@ -133,13 +133,20 @@ fn clip_chars(text: &str, max: usize) -> String {
     out
 }
 
+/// 主动开口的「无话可说」标记。
+///
+/// 与模型约定：没有值得说的事时**只回这个标记**，不要解释。判定放在逻辑层
+/// （[`is_silent_reply`]），命中就既不进会话、也不写 outbox / pending，更不会
+/// 弹系统通知——「返回了结果但不需要聊」和「没返回」在投递层是同一件事。
+pub const SILENT_MARKER: &str = "[SILENT]";
+
 /// 主动开口的任务说明。它替代「用户的问题」那一节。
 const AGENT_INIT_QUESTION: &str = "\
 （这一次用户没有提问，是你主动开口。）挑一件此刻真正值得他知道的事，\
 对他说一句话。这一句会作为系统通知横幅出现：只写这一句，不超过 55 字，\
 不分行、不寒暄、不罗列、不要用 markdown；别照着上面的聊天示例展开，只要一句。\
 只报事实或一句提醒，不给买卖建议、不预测涨跌、不承诺收益。\
-如果确实没有值得说的事，只回「无」。";
+如果确实没有值得说的事，只回 [SILENT]（大写、带方括号，不要写别的、不要解释）。";
 
 fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str) -> String {
     let facts_text = facts_block(facts);
@@ -244,6 +251,30 @@ pub fn notification_text(text: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// agent 是否明确表示「这一次不需要对用户说话」。
+///
+/// 主动开口的约定标记是 [`SILENT_MARKER`]；模型偶尔会包上 markdown 或写成
+/// 全角括号，也兼容旧的「无」。判定看整段回答是否以标记开头——标记后面
+/// 即使多写一句解释也按沉默处理，避免把合法沉默误记成校验失败。
+pub fn is_silent_reply(text: &str) -> bool {
+    let flat: String = text
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '*' | '_' | '`' | '#' | '「' | '」' | '『' | '』' | '"' | '\''
+                )
+        })
+        .collect();
+    let upper = flat.replace('【', "[").replace('】', "]").to_uppercase();
+    upper.starts_with(SILENT_MARKER)
+        || matches!(
+            upper.as_str(),
+            "SILENT" | "NO_MESSAGE" | "NOMESSAGE" | "[无]" | "无" | "无。" | "无." | "NONE"
+        )
 }
 
 /// 渲染前清理：会话气泡显示的内容统一过一遍 `normalize`。
@@ -670,7 +701,7 @@ mod tests {
         assert!(goal.contains("用户：最近怎么样"), "最近对话要进上下文");
         assert!(goal.contains("不超过 55 字"), "必须约束成一句话");
         assert!(goal.contains("不要用 markdown"), "横幅是纯文本通道");
-        assert!(goal.contains("只回「无」"), "没话说要允许沉默");
+        assert!(goal.contains("只回 [SILENT]"), "没话说要允许沉默");
     }
 
     #[test]
@@ -788,5 +819,28 @@ allocation: 美股 45%";
     #[test]
     fn 空输出被拦下() {
         assert!(validate_talk("   \n  ").is_err());
+    }
+
+    #[test]
+    fn 主动开口的无话说标记被逻辑层识别() {
+        // 约定标记，以及模型常见的包装写法。
+        for text in [
+            "[SILENT]",
+            "  [silent]  ",
+            "**[SILENT]**",
+            "`[SILENT]`",
+            "【无】",
+            "无。",
+        ] {
+            assert!(is_silent_reply(text), "{text} 应被识别为无话说");
+        }
+        // 正常提醒里提到标记不算沉默。
+        assert!(!is_silent_reply("今天没有值得汇报的事，[SILENT] 只是标记"));
+        assert!(!is_silent_reply("美股偏离 6.2pp，等决策日再看。"));
+    }
+
+    #[test]
+    fn 主动开口的提示词约定了不回话标记() {
+        assert!(AGENT_INIT_QUESTION.contains(SILENT_MARKER));
     }
 }

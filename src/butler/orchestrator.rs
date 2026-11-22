@@ -432,24 +432,20 @@ pub struct ButlerState {
     /// agent 主动开口的连续失败次数。
     ///
     /// 失败（起不来、超时、回答过不了校验）按 [`agent_init_backoff`]
-    /// 退避重试，而不是静默 12 小时；成功开口或模型正常说「无」不改变
-    /// 这个计数——「无」是合法回答，不是故障。
+    /// 退避重试，而不是静默一整天；成功开口或模型返回 `[SILENT]` 不改变
+    /// 这个计数——正常沉默是合法回答，不是故障。
     #[serde(default)]
     pub agent_init_failures: u32,
 }
 
 /// agent-init 与上一次尝试之间至少隔这么久（常规节奏，无失败时）。
 ///
-/// 它只约束「尝试」本身：模型连续说「无」时也不该每轮巡检都花一次外部
-/// 会话。「用户刚聊完」由守护进程单独的短窗口处理，不能叠加在这里——否则
-/// 12 小时 × 4 小时节拍会把主动开口拖到 20 小时以上，整天轮空。
-pub const AGENT_INIT_MIN_IDLE_HOURS: i64 = 12;
+/// 它只约束「尝试」本身：模型每次回 `[SILENT]` 时也不该把外部会话打成
+/// 轮询。说多少由设置页的每日/每周额度与静音时段决定；这里保留 1 小时的
+/// 下限，避免频繁拉起 ACP runtime，同时不让内部冷却吃掉用户调高的额度。
+pub const AGENT_INIT_MIN_IDLE_HOURS: i64 = 1;
 
 /// agent-init 失败后的重试节奏：15 分钟 → 1 小时 → 6 小时封顶。
-///
-/// 失败一次就沉默 12 小时，用户看到的是「管家好几天不说话」；CLI 路径
-/// 配错这类问题修好后也该快点恢复。成功开口（`failures == 0`）回到常规
-/// 的 [`AGENT_INIT_MIN_IDLE_HOURS`]。
 pub fn agent_init_backoff(failures: u32) -> chrono::Duration {
     match failures {
         0 => chrono::Duration::hours(AGENT_INIT_MIN_IDLE_HOURS),
@@ -474,7 +470,7 @@ pub fn initlog_path() -> std::path::PathBuf {
 pub enum AgentInitOutcome {
     /// 开口了：已过校验并记入 ledger。
     Spoke,
-    /// 模型说「无」或额度已满：正常沉默，不算失败。
+    /// 模型返回 `[SILENT]` 或额度已满：正常沉默，不算失败。
     Silent,
     /// 起不来 / 超时 / 回答没过校验：计入退避。
     Failed,
@@ -494,7 +490,7 @@ impl AgentInitOutcome {
 pub struct AgentInitRecord {
     pub at: DateTime<Local>,
     pub outcome: AgentInitOutcome,
-    /// 失败原因或沉默原因（「模型说无」「额度已满」）。开口时为空。
+    /// 失败原因或沉默原因（「模型返回 [SILENT]」「额度已满」）。开口时为空。
     #[serde(default)]
     pub detail: Option<String>,
 }
@@ -1214,8 +1210,8 @@ mod tests {
     #[test]
     fn 失败退避从十五分钟起步六小时封顶() {
         use chrono::Duration;
-        // 没有失败：常规节奏 12 小时。
-        assert_eq!(agent_init_backoff(0), Duration::hours(12));
+        // 没有失败：常规节奏 1 小时。
+        assert_eq!(agent_init_backoff(0), Duration::hours(1));
         // 失败 1 次 15 分钟、2 次 1 小时、之后一直 6 小时。
         assert_eq!(agent_init_backoff(1), Duration::minutes(15));
         assert_eq!(agent_init_backoff(2), Duration::hours(1));

@@ -22,8 +22,9 @@ pub enum WakeSource {
     Task { id: String },
     /// 承诺到期（记忆里的 `Commitment`）。`id` 是 `promise:<日期>`。
     Commitment { id: String },
-    /// agent-init 失败后的重试到点。`id` 唯一定位一次重试（上次尝试时间
-    /// + 退避），避免同一条重试被重复叫醒。
+    /// agent-init 的下一次尝试到点（常规 1 小时节拍或失败后的退避）。
+    /// `id` 唯一定位一次尝试机会（上次尝试时间 + 退避），避免同一条
+    /// 到点被重复叫醒。
     AgentInitRetry { id: String },
     /// 每日巡检到点。`id` = `review:<日期>`，同一天只叫醒一次。
     DailyReview { id: String },
@@ -54,8 +55,8 @@ pub struct WakeScheduler {
     pub seen_tasks: BTreeSet<String>,
     /// 已消费的承诺 id。
     pub seen_commitments: BTreeSet<String>,
-    /// 已消费的 agent-init 重试 id。重试没跑成新一轮尝试（比如用户刚聊
-    /// 过天）时，防止同一个到点时刻把主循环打成空转。
+    /// 已消费的 agent-init 尝试到点 id。到点没跑成新一轮尝试（比如用户
+    /// 刚聊过天）时，防止同一个到点时刻把主循环打成空转。
     pub seen_agent_retries: BTreeSet<String>,
     /// 已消费的每日巡检 id（`review:<日期>`）。
     pub seen_reviews: BTreeSet<String>,
