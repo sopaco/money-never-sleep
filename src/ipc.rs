@@ -567,21 +567,33 @@ mod unix_impl {
             registry.insert(id, out_tx);
             let stream = Arc::new(stream);
 
-            let writer_stream = Arc::clone(&stream);
-            let writer_registry = Arc::clone(&registry);
-            tokio::spawn(async move {
-                let _ = write_loop(writer_stream.clone(), out_rx).await;
-                // 写半边收摊即整条连接收摊：读任务随之退出，对端看到 EOF。
-                let _ = writer_stream.shutdown(Shutdown::Both);
-                writer_registry.remove(id);
-            });
-
             let reader_stream = Arc::clone(&stream);
             let reader_registry = Arc::clone(&registry);
             let reader_tx = tx.clone();
-            tokio::spawn(async move {
+            let reader_task = tokio::spawn(async move {
                 read_loop(id, reader_stream, reader_tx).await;
                 reader_registry.remove(id);
+            });
+
+            let writer_stream = Arc::clone(&stream);
+            let writer_registry = Arc::clone(&registry);
+            let writer_tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = write_loop(writer_stream, out_rx).await;
+                // 写半边收摊即整条连接收摊：读任务多半正挂在 `readable()` 上，
+                // 不中止它，socket 就一直半开着。tokio 的 `UnixStream` 没有
+                // `&self` 版 `shutdown`（Windows 管道有 `disconnect(&self)`，
+                // 这里没有），两个任务共用 `Arc` 也拿不到 `&mut`——只能取消
+                // 读任务、放掉它那份 `Arc`，两份都释放后 fd 关闭，对端才会
+                // 看到 EOF。被拆掉的读任务来不及发 `Disconnected`，得由这边
+                // 补上：调用方只见「连接没了」这一种真相，不能靠读任务幸存
+                // 与否碰运气。读任务先走完（对端断开）则 `await` 返回 Ok，
+                // 不会重复发。
+                reader_task.abort();
+                if reader_task.await.is_err() {
+                    let _ = writer_tx.send(Event::Disconnected(id));
+                }
+                writer_registry.remove(id);
             });
         }
     }
@@ -1626,6 +1638,62 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(gone, "断开的连接最终应从注册表消失");
+        drop(listener);
+    }
+
+    /// 慢读者被拆线：出站队列堆满后 `send_to` 返回 `false` 并拆掉整条连接。
+    ///
+    /// 服务端拆线（不是客户端先断）是慢读者唯一的出路：有界队列不许无限
+    /// 积压，卡住的窗口必须被断开、自己去重连拿快照。拆线要完整收摊：
+    /// 事件侧收到 `Disconnected`（调用方靠它清挂载状态，不能只等客户端
+    /// 断开才有），客户端下行读到 EOF（通道关闭）。用大帧撑爆 socket
+    /// 缓冲，保证 64 帧的队列一定先满。
+    #[test]
+    fn 慢读者被拆线() {
+        let app = format!("mns-ipc-slow-{}", std::process::id());
+        let (listener, mut events) = listen(&app).expect("监听本地通道");
+        let (mut client, mut downstream) = connect_duplex(&app).expect("双向连接");
+
+        client.send(&Signal::ChatAttach).expect("上行发 attach");
+        let conn_id = loop {
+            match events.blocking_recv().expect("事件通道关闭") {
+                Event::Connected(_) => {}
+                Event::Signal(id, signal) => {
+                    assert_eq!(signal, Signal::ChatAttach, "应收到 attach");
+                    break id;
+                }
+                Event::Disconnected(_) => panic!("连接提前断开"),
+            }
+        };
+
+        // 客户端故意不读下行：socket 缓冲吸满后队列跟着满，下一次 send_to
+        // 拆线。帧要大（256KB，小于 1MB 上限），小帧会被 socket 缓冲整个
+        // 吸走，队列到不了满。
+        let big = Signal::ChatSnapshot {
+            json: "x".repeat(256 * 1024),
+        };
+        let mut torn = false;
+        for _ in 0..200 {
+            if !listener.send_to(conn_id, &big) {
+                torn = true;
+                break;
+            }
+        }
+        assert!(torn, "慢读者最终应被拆线");
+
+        // 客户端下行：先收走 socket 里已到的帧，随后 EOF——通道关闭。
+        while downstream.blocking_recv().is_some() {}
+        // 服务端事件侧：拆线必须报告 Disconnected，挂载状态才清得掉。
+        loop {
+            match events.blocking_recv().expect("事件通道关闭") {
+                Event::Disconnected(id) => {
+                    assert_eq!(id, conn_id);
+                    break;
+                }
+                Event::Connected(_) | Event::Signal(..) => continue,
+            }
+        }
+        drop(client);
         drop(listener);
     }
 }
