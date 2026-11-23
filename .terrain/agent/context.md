@@ -16,7 +16,7 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 | 引擎层（`lib.rs`） | 配置、账本、策略、信号、情绪、行情、绩效、回测、报告、纪律、护栏、审计；唯一规则来源 | `rusqlite`、`reqwest`、`chrono` |
 | 应用服务层（`app/`） | 无呈现的类型化服务（`Snapshot` / `Freshness`），CLI 与 GUI 共用 | 依赖引擎各模块 |
 | 呈现层 | CLI（`main.rs` 仅解析参数与表格）、GPUI 桌面壳、帮助查看器 | `clap`、`comfy-table`、`gpui-kit`、`gpui-tray` |
-| 管家子系统（`butler/`） | 确定性唤醒/开口判定、记忆、任务、会话、表达兜底、巡检报告 | 只读 SQLite、小 JSON 状态 |
+| 管家子系统（`butler/`） | 确定性唤醒/开口判定、记忆、任务、会话、表达兜底、巡检排程与报告 | 只读 SQLite、小 JSON 状态 |
 | 外部 Agent（`agent/`） | ACP runtime、prompt 契约、工作区 `AGENTS.md` 托管 | `agent-client-protocol` |
 
 **进程模型**
@@ -25,12 +25,12 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 |-----------|------|----------|
 | `mns` | 终端命令入口，薄呈现层 | 短命 |
 | `mns-gui` | 常驻宿主：托盘、菜单栏、Dock、通知投递、守护进程启停；二次启动只 poke | 常驻（无 AppShell 窗口） |
-| `mns-gui --window [--page]` / `--window --butler` | 主窗 / 管家窗，独立单实例通道 | 关窗即退出（Accessory、无第二 Dock 图标） |
+| `mns-gui --window [--page]` / `--window --butler [--notice <id>] [--ref <id>] [--ask <句>]` | 主窗 / 管家窗，独立单实例通道 | 关窗即退出（Accessory、无第二 Dock 图标） |
 | `mns-butler` | 管家确定性内核审计入口 | 短命 |
-| `mns-butlerd` | 事件驱动守护进程：只读账本、唯一会话写者、发通知前判定 | 常驻（由 GUI 拉起） |
+| `mns-butlerd` | 事件驱动守护进程：只读账本、唯一会话写者、定时巡检执行者、发通知前判定 | 常驻（由 GUI 拉起） |
 | `mns-help` | 独立 CHM 风格帮助查看器 | 短命 |
 
-**跨进程通道**：`ipc.rs` 定义 NDJSON `Signal` 协议（行长上限 1MB），Unix 走 `SOCK_STREAM`、Windows 走命名管道 `\\.\pipe\mns-<app>-<用户>`；连接关闭即存活信号。宿主、主窗、管家窗各用独立 `ipc::listen` 通道做单实例锁。管家窗口与守护进程之间是双向长连接（上行 `Chat*`，下行 `ChatSnapshot`/`ChatDelta`），窗口断开即 detach。
+**跨进程通道**：`ipc.rs` 定义 NDJSON `Signal` 协议（行长上限 1MB），Unix 走 `SOCK_STREAM`、Windows 走命名管道 `\\.\pipe\mns-<app>-<用户>`；连接关闭即存活信号。宿主、主窗、管家窗各用独立 `ipc::listen` 通道做单实例锁。管家窗口与守护进程之间是双向长连接（上行 `Chat*`，下行 `ChatSnapshot`/`ChatDelta`），窗口断开即 detach。连接拆除是整条收摊：每连接出站队列（64 帧）满或写半边收摊即断，调用方只看到「连接没了」，重连后由 `ChatAttach` 重建全量快照；`Signal::Bye` 是主动告别，不必等断开。
 
 ## 模块地图
 
@@ -45,8 +45,8 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 | 回测与审计 | 月频代理回测、实盘 point-in-time 日频审计 | `src/backtest.rs`、`src/audit.rs`、`src/live_data.rs` |
 | 桌面壳 | 六个页面、托盘/Dock/菜单、后台 worker | `src/gui/`、`src/gui/pages/` |
 | 管家确定性内核 | 唤醒调度、开口判定、记忆、任务、状态落盘 | `src/butler/`（`schedule`/`orchestrator`/`memory`/`tasks`/`agenda`/`store`） |
-| 管家会话与表达 | 会话唯一写者、意图路由模板、ACP 对话适配、巡检报告 | `src/butler/`（`chat`/`expression`/`talk`/`review`/`session`） |
-| 外部 Agent | ACP runtime、prompt 契约、工作区契约托管 | `src/agent/`（`runner`/`routine`/`workspace`） |
+| 管家会话与表达 | 会话唯一写者、意图路由模板、ACP 对话适配、巡检排程与报告存档 | `src/butler/`（`chat`/`expression`/`talk`/`review`/`session`） |
+| 外部 Agent | ACP runtime、prompt 契约（巡检 prompt 的 `questions` 上限 0–2）、工作区契约托管 | `src/agent/`（`runner`/`routine`/`workspace`） |
 | IPC、简报与通知 | 本地唤醒、托盘简报数据契约、系统通知送达 | `src/ipc.rs`、`src/brief.rs`、`src/notify.rs` |
 
 ## 核心流程
@@ -61,11 +61,12 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 
 **2. 管家主动开口（`mns-butlerd`）**
 
-1. `agenda` 汇总定时巡检、每日巡检、任务、承诺、`agent-init` 重试五类唤醒源，取最早时刻睡到点；账本事件/状态变更由 GUI/CLI 经 `Signal::Wake` 立即叫醒。
-2. `orchestrator` 用 `Database::open_read_only()` 从账本算 `AccountFacts`（与 CLI/GUI 同源 `Snapshot`），不读 `facts.json`。
+1. `agenda` 汇总定时巡检、每日巡检、任务、承诺、`agent-init` 重试五类唤醒源，取最早时刻睡到点；每日巡检时刻由 `review::schedule()`（纯函数，读 `agent/last-review` 与 `last-review-attempt.json`）给出，账本事件/状态变更由 GUI/CLI 经 `Signal::Wake` 立即叫醒。
+2. `orchestrator` 用 `Database::open_read_only()` 从账本算 `AccountFacts`（与 CLI/GUI 同源 `Snapshot`），不读 `facts.json`；读库在阻塞线程池内完成，成败都写健康标记供托盘红灯。
 3. `schedule` 两层判定：唤醒许可（`WakeSource` → `WakeVerdict`）与开口义务（`SpeakDecision`，多数唤醒应答「沉默」）。
-4. 开口则写 `outbox.jsonl`（审计）与 `pending.jsonl`（投递），并入 `conversation.json`；经 `DeliverNotice` 交宿主，宿主按 `notices.jsonl` 去重后由 GUI 发系统通知。
-5. 确定性内核无由头时可起一次 ACP `agent-init`（120 秒超时、≤60 字、无买卖话术）；失败按 15 分钟 → 1 小时 → 6 小时退避，runtime 每轮 `Shutdown`。
+4. `WakeSource::DailyReview` 不进确定性判定：到点先跑 `mns today --quiet` 刷价留档，再起一轮 ACP 复盘，报告写 `agent/reviews/<id>.json`、向会话追加一条消息、投一条 banner（文案不引用结论）；无人值守，权限请求一律拒绝、prompt 不提供 CLI 入口；当天最多 3 次尝试（失败按 30 分钟退避），`last-review` 只在成功时写。
+5. 开口则写 `outbox.jsonl`（审计）与 `pending.jsonl`（投递），并入 `conversation.json`；经 `DeliverNotice` 交宿主，宿主按 `notices.jsonl` 去重后由 GUI 发系统通知。
+6. 确定性内核无由头时可起一次 ACP `agent-init`（120 秒超时、≤60 字、无买卖话术）；失败按 15 分钟 → 1 小时 → 6 小时退避，runtime 每轮 `Shutdown`。
 
 **3. 桌面 GUI 数据流**
 
@@ -73,6 +74,7 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 2. 窗口只呈现：所有数字走 `app::Snapshot`；SQLite 读写、网络刷新、文件写入统一交给 `jobs` worker 线程，不阻塞 GPUI 主线程。
 3. 托盘简报走 `Signal::RequestBrief` → `butlerd` → `Signal::Brief`（`brief::BriefData`），宿主只排版；管家健康随 `Brief` 回传，异常时亮红灯并换带红点 Dock 图标。
 4. 通知点击带 `notice_id` 回宿主，记入 `notices.jsonl` 后拉起管家窗并定位消息。
+5. 巡检页只读回放，接力不搬正文：`Signal::ButlerRef { id, question }` → 宿主转给已开的管家窗，或拉起 `--window butler --ref <id> [--ask <句>]`；窗口按 id 读标题与正文，把结论里的第一条「待确认」预填进空输入框（不覆盖已有输入）。会话内 `@` 引用最近巡检时 IPC 只传 `{id,title}`，守护进程按 id 读正文（最多 3 份、各自截断）。
 
 **4. 回测与审计链**
 
@@ -95,9 +97,9 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 
 - **外部 API**：CNN Fear & Greed（情绪主源，失败降级本地快照表）；东方财富 `fundmobapi`（基金净值/估值）与行情接口（指数、个股）；均经 `reqwest` 访问，超时与重试有硬上限。
 - **本地数据**：`~/.mns/config.toml` 与 `~/.mns/mns.db` 是账户事实唯一来源；CLI/GUI 可写，`mns-butlerd` 仅持只读连接（`open_read_only`），无写路径。相对配置路径一律相对 `app_data_dir()` 解析，禁止相对 cwd 写入。
-- **文件根**：`~/.mns/` 为唯一可写根；`reports/`（每日报告）、`agent/reviews/`（巡检报告唯一存储）、`agent/workspace/`、`agent/runs/`、`agent/butler/`（state/memory/tasks/outbox/pending/conversation/health）与 `agent/events.jsonl`。
+- **文件根**：`~/.mns/` 为唯一可写根；`reports/`（每日报告）、`agent/reviews/`（巡检报告唯一存储）、`agent/workspace/`、`agent/runs/`、`agent/butler/`（state/memory/tasks/outbox/pending/conversation/health）、`agent/last-review` 与 `agent/last-review-attempt.json`（巡检去重与当日退避重试）以及 `agent/events.jsonl`。
 - **第三方运行时**：外部 ACP agent CLI（如 opencode）由用户提供路径，provider/模型/凭据在其自身配置；MNS 只传 prompt 与可选 model 字符串。工作区契约只写 `~/.mns/agent/**` 的受管块。
-- **信任边界**：管家判定与通知口径不依赖模型输出；模型文案须过数字白名单与 `validate_notification`，不得谎称下单；会话可给倾向性观点并自我标注，通知 banner 走最严话术。守护进程不发系统通知（macOS 拒绝 helper），投递只能由宿主完成。行为事件严格本地、无遥测；不使用 launchd/cron/计划任务做调度。
+- **信任边界**：管家判定与通知口径不依赖模型输出；模型文案须过数字白名单与 `validate_notification`，不得谎称下单；会话可给倾向性观点并自我标注，通知 banner 走最严话术。巡检 prompt 的 `questions`「待确认」是例外通道（0–2 条、只问会改变结论的封闭事实；正文不得反问用户）；无人值守的定时巡检拒绝一切权限请求。守护进程不发系统通知（macOS 拒绝 helper），投递只能由宿主完成。行为事件严格本地、无遥测；不使用 launchd/cron/计划任务做调度。
 
 ## 代码映射索引
 
@@ -118,6 +120,9 @@ MNS（Money Never Sleeps）是本机运行的个人逆情绪投资决策助手�
 | 实盘审计与数据集 | `src/audit.rs`、`src/live_data.rs` | point-in-time、通道成本 |
 | 桌面壳与页面 | `src/gui/mod.rs`、`src/gui/pages/` | 六页 + 托盘 + worker |
 | 管家编排/调度 | `src/butler/orchestrator.rs`、`src/butler/schedule.rs` | 确定性判定 |
+| 巡检排程与存档 | `src/butler/review.rs` | `schedule`、`last-review`、`ReviewAttempt` |
+| 巡检页与管家接力 | `src/gui/pages/review.rs`、`src/gui/mod.rs` | `Signal::ButlerRef`、`--ref`/`--ask` |
+| 巡检 prompt 契约 | `src/agent/routine.rs` | `daily_review_prompt`、`questions` |
 | 管家会话与表达 | `src/butler/chat.rs`、`src/butler/talk.rs`、`src/butler/expression.rs` | 会话唯一写者 |
 | 本地进程通道 | `src/ipc.rs` | `Signal` NDJSON 协议 |
 | 系统通知 | `src/notify.rs` | macOS / Windows 送达 |

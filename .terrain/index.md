@@ -19,84 +19,84 @@ source: .
 
 ## Structure
 
-  - AGENTS.md
-  - assets/
-    - app.ico
-    - AppIcon.icns
-    - app_icon.png
-    - butler-texture.png
-    - icon-128.png
-    - icon-512.png
-    - icon-dock-alert.png
-    - icon_butler.ico
-    - icon_butler.png
-    - icon_help.ico
-    - icon_help.png
-    - tray-22.rgba
-    - tray-32.rgba
-  - build.rs
-  - Cargo.lock
   - Cargo.toml
-  - CLAUDE.md
+  - LICENSE
+  - tests/
   - distribution/
-    - bin-darwin-arm64/
+    - skill/
+    - bin-win-x64/
     - bin-linux-x64/
     - bin-mns-cli/
-    - bin-win-x64/
-    - skill/
+    - bin-darwin-arm64/
     - skills/
-  - examples/
-    - agent_smoke.rs
-    - butler_talk_smoke.rs
-  - help/
-    - cli-backtest.md
-    - cli-butler.md
-    - cli-quickstart.md
-    - cli-reference.md
-    - desktop-butler.md
-    - desktop-overview.md
-    - desktop-plan.md
-    - desktop-portfolio.md
-    - desktop-review.md
-    - desktop-settings.md
-    - diagrams/
-    - finance-alternatives.md
-    - finance-benchmarks.md
-    - finance-bonds-wm.md
-    - finance-cash-deposit.md
-    - finance-concepts.md
-    - finance-funds.md
-    - finance-guide.md
-    - finance-insurance.md
-    - finance-intro.md
-    - finance-ladder.md
-    - finance-metrics.md
-    - finance-mistakes.md
-    - finance-qdii.md
-    - images/
-    - start.md
-    - strategy-philosophy.md
-    - strategy-rebalance.md
-    - strategy-sentiment.md
-  - LICENSE
+  - Cargo.lock
+  - build.rs
   - README.md
+  - examples/
+    - butler_talk_smoke.rs
+    - agent_smoke.rs
   - README_zh.md
   - scripts/
-    - installer/
-    - make-dmg.sh
-    - make-dock-alert.swift
-    - make-help-diagrams.sh
-    - make-icons.swift
     - make-installer.ps1
     - make-texture.py
+    - make-dock-alert.swift
+    - make-dmg.sh
+    - make-help-diagrams.sh
+    - make-icons.swift
+    - installer/
+  - AGENTS.md
+  - assets/
+    - icon-dock-alert.png
+    - tray-32.rgba
+    - app_icon.png
+    - tray-22.rgba
+    - icon_help.png
+    - AppIcon.icns
+    - icon_butler.png
+    - butler-texture.png
+    - app.ico
+    - icon_help.ico
+    - icon-128.png
+    - icon_butler.ico
+    - icon-512.png
+  - CLAUDE.md
+  - help/
+    - cli-quickstart.md
+    - finance-concepts.md
+    - desktop-settings.md
+    - desktop-overview.md
+    - finance-intro.md
+    - desktop-portfolio.md
+    - images/
+    - strategy-rebalance.md
+    - finance-cash-deposit.md
+    - diagrams/
+    - finance-benchmarks.md
+    - cli-backtest.md
+    - finance-funds.md
+    - strategy-philosophy.md
+    - finance-bonds-wm.md
+    - strategy-sentiment.md
+    - finance-ladder.md
+    - desktop-plan.md
+    - finance-metrics.md
+    - cli-reference.md
+    - finance-guide.md
+    - start.md
+    - finance-insurance.md
+    - desktop-butler.md
+    - finance-mistakes.md
+    - desktop-review.md
+    - finance-qdii.md
+    - finance-alternatives.md
+    - cli-butler.md
   - src/
-    - agent/
-    - app/
-    - audit.rs
-    - backtest.rs
-    - bin/
+    - notify.rs
+    - strategy.rs
     - brief.rs
-    - butler/
-    - cli.rs
-    - config.rs
+    - quote.rs
+    - market.rs
+    - app/
+    - ipc.rs
+    - bin/
   - …

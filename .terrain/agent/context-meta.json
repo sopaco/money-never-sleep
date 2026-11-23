@@ -2,9 +2,9 @@
   "project": "money-never-sleep",
   "repo_path": ".",
   "output_file": "context.md",
-  "generated_at": "2026-11-21T10:01:49.236316200+00:00",
+  "generated_at": "2026-11-23T13:15:48.616179+00:00",
   "section_count": 6,
-  "char_count": 11297,
-  "baseline_git_head": "9b1eaf6a1d53340e7a94ade5173e0bba3264be1f",
+  "char_count": 13301,
+  "baseline_git_head": "a9d7f4e53052e699fe349e8b1be496fec5e05546",
   "language": "zh-CN"
 }
