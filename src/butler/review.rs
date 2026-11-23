@@ -82,6 +82,21 @@ impl Default for ReviewReport {
 }
 
 impl ReviewReport {
+    /// 能不能被管家引用（`@` 选择器、巡检页接力、butlerd 取正文）。
+    ///
+    /// 只有跑完且正文非空的报告才算数：运行中的报告只有一个开工旁白，
+    /// 引用它会逼模型对着半截文本谈「报告为什么坏了」——那正是用户看到
+    /// 的那条不友好回答的起因。
+    pub fn is_quotable(&self) -> bool {
+        self.state == "finished" && !self.body.trim().is_empty()
+    }
+
+    /// 报告是否给出了结论（`mns-decision` 块）。模型只吐了旁白的报告没有。
+    pub fn concluded(&self) -> bool {
+        self.decision
+            .as_deref()
+            .is_some_and(|decision| !decision.trim().is_empty())
+    }
     /// 新报告：分配 id、写入创建时间与标题。
     pub fn new(source: impl Into<String>, date: impl Into<String>) -> Self {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -653,6 +668,27 @@ mod tests {
         let preview = preview_of(&body);
         assert!(!preview.contains('\n'));
         assert!(preview.chars().count() <= 49);
+    }
+
+    #[test]
+    fn 运行中或空正文的报告不可引用() {
+        let mut running = ReviewReport::new("手动巡检", "2026-11-23");
+        running.finish("running", "我先拉取持仓、现金、绩效。", None);
+        assert!(!running.is_quotable(), "运行中的报告只有开工旁白");
+
+        let mut finished = ReviewReport::new("每日巡检", "2026-11-23");
+        finished.finish("finished", "本周不操作。", Some("{}".to_owned()));
+        assert!(finished.is_quotable());
+        assert!(finished.concluded(), "有 decision 才算给了结论");
+
+        let mut no_decision = ReviewReport::new("每日巡检", "2026-11-23");
+        no_decision.finish("finished", "正文有了但没有结论块。", None);
+        assert!(no_decision.is_quotable(), "跑完了仍然可以引用");
+        assert!(!no_decision.concluded(), "没有 decision 时不给正文");
+
+        let mut empty = ReviewReport::new("每日巡检", "2026-11-23");
+        empty.finish("finished", "   ", None);
+        assert!(!empty.is_quotable(), "空正文不可引用");
     }
 
     #[test]

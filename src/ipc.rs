@@ -43,6 +43,16 @@ pub enum Signal {
     Open,
     /// 打开管家会话窗口。
     OpenButler,
+    /// 带着一份巡检报告去管家（接力）。
+    ///
+    /// 宿主负责拉起或置前管家窗口；窗口收到后把这份报告挂成待发送引用，
+    /// 有 `question` 时预填进输入框（巡检结论里的第一条待确认）。
+    /// 只传 id 与预填句：标题与正文由接收方按 id 读取，IPC 不搬运报告。
+    ButlerRef {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+    },
     /// 守护进程自我介绍。带上 `role`，将来 GUI 与管家可以共用一个监听。
     Hello {
         /// 老版本可能只发 `{"kind":"hello"}`，缺省角色保持兼容。
@@ -1265,6 +1275,20 @@ mod tests {
         let cases = [
             (Signal::Open, r#"{"kind":"open"}"#),
             (Signal::OpenButler, r#"{"kind":"open-butler"}"#),
+            (
+                Signal::ButlerRef {
+                    id: "r1".to_owned(),
+                    question: None,
+                },
+                r#"{"kind":"butler-ref","id":"r1"}"#,
+            ),
+            (
+                Signal::ButlerRef {
+                    id: "r1".to_owned(),
+                    question: Some("是否已入金？".to_owned()),
+                },
+                r#"{"kind":"butler-ref","id":"r1","question":"是否已入金？"}"#,
+            ),
             (
                 Signal::Hello {
                     role: "daemon".to_owned(),

@@ -1844,6 +1844,12 @@ enum Role {
     },
     ButlerWindow {
         notice: Option<String>,
+        /// `--ref <review-id>`：从巡检页「带着这份巡检去管家」进来，窗口
+        /// 打开即把这份报告挂成待发送引用。
+        review: Option<String>,
+        /// `--ask <句子>`：接力时顺带预填进输入框的那句话（结论里的第一条
+        /// 待确认）。没有就由窗口按 id 从报告里再读一次。
+        ask: Option<String>,
     },
 }
 
@@ -1868,8 +1874,12 @@ fn parse_role() -> Role {
     let kind = value_after("--window");
     if has("--butler") || kind.as_deref() == Some("butler") {
         // `--notice <id>`：用户点系统通知进来，窗口要落到那一条开口上。
+        // `--ref <id>`：从巡检页接力过来，窗口要挂上那份报告，
+        // `--ask` 是要预填的那句话。
         return Role::ButlerWindow {
             notice: value_after("--notice"),
+            review: value_after("--ref"),
+            ask: value_after("--ask"),
         };
     }
     Role::MainWindow {
@@ -1915,7 +1925,11 @@ pub fn run() {
             about,
             refresh,
         } => run_main_window(page, about, refresh),
-        Role::ButlerWindow { notice } => run_butler_window(notice),
+        Role::ButlerWindow {
+            notice,
+            review,
+            ask,
+        } => run_butler_window(notice, review, ask),
     }
 }
 
@@ -2139,15 +2153,16 @@ fn run_main_window(page: Option<Page>, about: bool, refresh: bool) {
         });
 }
 
-/// 管家窗口短命子进程：`mns-gui --window --butler [--notice <id>]`。
-fn run_butler_window(notice: Option<String>) {
+/// 管家窗口短命子进程：`mns-gui --window --butler [--notice <id>] [--ref <id>] [--ask <句>]`。
+fn run_butler_window(notice: Option<String>, review: Option<String>, ask: Option<String>) {
     let (listener, events) = match crate::ipc::listen("mns-gui-butler") {
         Ok(pair) => pair,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             // 窗口已经开着：把「定位到哪一条」交给它，自己退出。
-            let signal = match notice {
-                Some(notice_id) => crate::ipc::Signal::NoticeFocus { notice_id },
-                None => crate::ipc::Signal::Open,
+            let signal = match (notice, review) {
+                (Some(notice_id), _) => crate::ipc::Signal::NoticeFocus { notice_id },
+                (None, Some(id)) => crate::ipc::Signal::ButlerRef { id, question: ask },
+                (None, None) => crate::ipc::Signal::Open,
             };
             let _ = crate::ipc::poke("mns-gui-butler", &signal);
             return;
@@ -2194,7 +2209,9 @@ fn run_butler_window(notice: Option<String>) {
             cx.on_window_closed(|cx, _| release_listener(cx)).detach();
 
             register_window_actions(cx, false);
-            if let Err(error) = open_butler_window_view(cx, notice.clone()) {
+            if let Err(error) =
+                open_butler_window_view(cx, notice.clone(), review.clone(), ask.clone())
+            {
                 eprintln!("[mns-gui] failed to open butler window: {error}");
                 cx.quit();
                 return;
@@ -2318,6 +2335,11 @@ fn spawn_ipc_bridge(
                 }
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::OpenButler) => {
                     let _ = cx.update(|cx| open_butler_from_host(cx));
+                }
+                // 巡检页把接力棒递过来：带上报告 id 打开管家窗口（窗口已在
+                // 就只递引用）。`question` 是巡检页当前显示的那条待确认。
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::ButlerRef { id, question }) => {
+                    let _ = cx.update(|cx| open_butler_ref_from_host(cx, &id, question));
                 }
                 // Windows Toast 点击：系统拉起的新进程把 notice id 交回来，
                 // 和 macOS 的通知回调走同一条定位路径。
@@ -2484,6 +2506,12 @@ fn spawn_window_bridge(
                     // 窗口已在看这条：告诉宿主标记已读、清托盘提示。
                     let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::ButlerSeen);
                 }
+                crate::ipc::Event::Signal(_, crate::ipc::Signal::ButlerRef { id, question }) => {
+                    if let Some(view) = cx.global::<GuiState>().butler_view.clone() {
+                        view.update(cx, |view, cx| view.attach_review(id, question, cx));
+                    }
+                    activate_any_window(cx);
+                }
                 crate::ipc::Event::Signal(_, crate::ipc::Signal::Shutdown) => {
                     close_window(cx);
                 }
@@ -2646,6 +2674,26 @@ fn open_butler_notice_from_host(cx: &mut App, notice_id: &str) {
     spawn_window(&["butler", "--notice", notice_id]);
 }
 
+/// 带着一份巡检报告打开管家：窗口已在就只递引用，不在就带 `--ref` 拉起。
+///
+/// 与通知路径同一套「先 poke、失败再 spawn」：重开进程会把正在回答的那一轮
+/// 丢掉，而接力只是多挂一份报告。宿主不读报告文件：标题与正文由管家窗口按
+/// id 读，`question` 只是把接力那一刻的预填句一起带过去。
+fn open_butler_ref_from_host(cx: &mut App, id: &str, question: Option<String>) {
+    cx.activate(true);
+    let signal = crate::ipc::Signal::ButlerRef {
+        id: id.to_owned(),
+        question: question.clone(),
+    };
+    if crate::ipc::poke("mns-gui-butler", &signal).is_ok() {
+        return;
+    }
+    match question {
+        Some(question) => spawn_window(&["butler", "--ref", id, "--ask", &question]),
+        None => spawn_window(&["butler", "--ref", id]),
+    }
+}
+
 /// 向守护进程要一份托盘简报。`poke` 同时是存活探测：连不上就把托盘拉红。
 fn request_brief(cx: &mut App) {
     let alive = crate::ipc::poke("mns-butlerd", &crate::ipc::Signal::RequestBrief).is_ok();
@@ -2664,7 +2712,12 @@ fn request_brief(cx: &mut App) {
 
 /// 打开管家窗口实体。只跑在管家窗口子进程里：会话真相在 butlerd，
 /// 视图自己连守护进程拿快照（`ButlerView::new`），宿主不掺和。
-fn open_butler_window_view(cx: &mut App, notice: Option<String>) -> Result<()> {
+fn open_butler_window_view(
+    cx: &mut App,
+    notice: Option<String>,
+    review: Option<String>,
+    ask: Option<String>,
+) -> Result<()> {
     let facts = crate::butler::chat::current_facts(chrono::Local::now());
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
@@ -2690,6 +2743,12 @@ fn open_butler_window_view(cx: &mut App, notice: Option<String>) -> Result<()> {
         // 从系统通知点进来：撤掉宿主的托盘提示（会话已读由 butlerd 在
         // 挂载帧的 `ChatSeen` 里写）。
         let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::ButlerSeen);
+    }
+    // 从巡检页接力进来：第一帧就带着这份报告；输入框预填结论里的第一条
+    // 待确认（如果报告有），用户按回车即可开聊。标题由 id 读出，正文不搬运；
+    // `--ask` 只是把接力那一刻的那句话带过来，没带就按 id 再读一次报告。
+    if let Some(id) = review {
+        view.update(cx, |view, cx| view.attach_review(id, ask, cx));
     }
     Ok(())
 }

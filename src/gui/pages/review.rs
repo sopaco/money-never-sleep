@@ -15,7 +15,7 @@ use crate::agent::{DecisionReport, EntryKind, PermissionPolicy, RunState, Timeli
 use crate::butler::review::{ReviewSummary, strip_decision_block};
 use crate::gui::components::*;
 use crate::gui::theme::*;
-use crate::gui::{AppShell, CloseReviewPanel, ReviewPanel, ViewedReview};
+use crate::gui::{AppShell, CloseReviewPanel, ReviewPanel, ToastTone, ViewedReview};
 
 use super::{card_header, notice};
 
@@ -398,23 +398,28 @@ fn decision_card(report: Option<&DecisionReport>) -> Option<Div> {
         }
     }
 
-    if let Some(questions) = report.value.get("questions").and_then(|v| v.as_array()) {
+    let questions = report.questions();
+    if !questions.is_empty() {
         let items: Vec<String> = questions
-            .iter()
-            .filter_map(|q| q.as_str().map(str::trim).filter(|s| !s.is_empty()))
-            .map(|s| format!("· {s}"))
+            .into_iter()
+            .map(|text| format!("· {text}"))
             .collect();
-        if !items.is_empty() {
-            card = card.child(
-                div()
-                    .v_flex()
-                    .gap(px(4.))
-                    .child(overline("待确认"))
-                    .text_size(px(12.))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .children(items.into_iter().map(|text| div().child(text))),
-            );
-        }
+        card = card.child(
+            div()
+                .v_flex()
+                .gap(px(4.))
+                .child(overline("待确认"))
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_SECONDARY))
+                .children(items.into_iter().map(|text| div().child(text)))
+                .child(
+                    div()
+                        .pt(px(2.))
+                        .text_size(px(11.5))
+                        .text_color(rgb(TEXT_TERTIARY))
+                        .child("这些只有你知道；想展开可以去管家窗口引用这份巡检继续。"),
+                ),
+        );
     }
 
     Some(card)
@@ -513,7 +518,7 @@ fn conversation_card(
         .overflow_hidden()
         .child(header)
         .child(stream)
-        .child(review_guide_card(running, cx))
+        .child(review_guide_card(shell, running, cx))
 }
 
 /// 只读回放：不再还原执行轨迹，只显示报告正文与结论卡片。`body` 之外
@@ -1107,13 +1112,73 @@ fn review_delete_confirm(id: String, cx: &mut Context<AppShell>) -> Div {
 
 /// 原输入框的位置改成管家导流：巡检只按纪律出结论，自由对话与追问在
 /// 管家窗口，那里能看到账本和记忆。
-fn review_guide_card(running: bool, cx: &mut Context<AppShell>) -> Div {
+///
+/// 这是接力棒而不是一个空窗口：按钮带着当前报告 id（以及结论里的第一条
+/// 待确认）去管家，窗口打开即挂上这份报告、预填那句话。有 `questions` 时
+/// 文案直接点名「N 件只有你知道的事」，没有时保留通用入口，引用照带。
+fn review_guide_card(shell: &AppShell, running: bool, cx: &mut Context<AppShell>) -> Div {
     let stop = running.then(|| {
         Button::new("review-stop")
             .compact()
             .label("停止")
             .on_click(cx.listener(|shell, _, _, cx| shell.stop_review(cx)))
     });
+
+    let report_id = shell
+        .current_report
+        .as_ref()
+        .map(|meta| meta.report.id.clone())
+        .filter(|id| !id.trim().is_empty());
+    let questions = shell
+        .review
+        .decision
+        .as_ref()
+        .map(DecisionReport::questions)
+        .unwrap_or_default();
+    let first_question = questions.first().cloned();
+    let (title, subtitle) = if running {
+        (
+            "巡检还在跑".to_owned(),
+            "巡检完成后可带这份结论去管家继续追问；运行中的报告只有开场白。".to_owned(),
+        )
+    } else if questions.is_empty() {
+        (
+            "想看持仓、计划或随便聊聊？".to_owned(),
+            "巡检按纪律出结论；追问与自由对话在管家窗口，能结合账本与记忆。".to_owned(),
+        )
+    } else {
+        (
+            format!("有 {} 件只有你知道的事", questions.len()),
+            "带上这份巡检再回答，管家能结合账本与记忆把结论说完整。".to_owned(),
+        )
+    };
+    let label = if questions.is_empty() {
+        "去管家聊聊"
+    } else {
+        "带这份巡检问管家"
+    };
+    // 运行中的报告不能被引用：正文只有一句开工旁白，模型会拿它当依据，
+    // 然后被迫解释「报告为什么坏了」。跑完再给接力入口。
+    let relay = (!running).then(|| {
+        Button::new("review-open-butler")
+            .primary()
+            .label(label)
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                let Some(id) = report_id.clone() else {
+                    // 还没有报告（首启、未跑过巡检）：普通打开。
+                    let _ = crate::ipc::poke("mns-gui", &crate::ipc::Signal::OpenButler);
+                    return;
+                };
+                let signal = crate::ipc::Signal::ButlerRef {
+                    id,
+                    question: first_question.clone(),
+                };
+                if let Err(error) = crate::ipc::poke("mns-gui", &signal) {
+                    shell.show_toast(format!("无法打开管家窗口：{error}"), ToastTone::Error, cx);
+                }
+            }))
+    });
+
     div()
         .v_flex()
         .flex_none()
@@ -1139,15 +1204,13 @@ fn review_guide_card(running: bool, cx: &mut Context<AppShell>) -> Div {
                             div()
                                 .text_size(px(13.5))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child("想看持仓、计划或随便聊聊？"),
+                                .child(title),
                         )
                         .child(
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_TERTIARY))
-                                .child(
-                                    "巡检按纪律出结论；追问与自由对话在管家窗口，能结合账本与记忆。",
-                                ),
+                                .child(subtitle),
                         ),
                 )
                 .child(
@@ -1157,23 +1220,38 @@ fn review_guide_card(running: bool, cx: &mut Context<AppShell>) -> Div {
                         .items_center()
                         .gap(px(8.))
                         .children(stop)
-                        .child(
-                            Button::new("review-open-butler")
-                                .primary()
-                                .label("去管家聊聊")
-                                .on_click(cx.listener(|_, _, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::gui::OpenButlerWindow),
-                                        cx,
-                                    );
-                                })),
-                        ),
+                        .children(relay),
                 ),
         )
 }
 
-/// 回放时输入框本就不存在，这里只说明「在看什么」并给出返回入口。
+/// 回放时输入框本就不存在，这里说明「在看什么」，并允许把这份旧报告带去
+/// 管家继续问（同样只递 id 与第一条待确认），最后才是返回入口。
+///
+/// 只有跑完的报告才有接力入口：历史里可能留着被中断的运行中报告，正文只有
+/// 一句开工旁白，带去管家只会让模型对着半截文本解释「报告为什么坏了」。
 fn replay_footer(view: &ViewedReview, cx: &mut Context<AppShell>) -> Div {
+    let report_id = view.report.id.clone();
+    let question = view
+        .decision
+        .as_ref()
+        .and_then(|decision| decision.questions().into_iter().next());
+    let relay = (view.report.is_quotable() && !report_id.trim().is_empty()).then(|| {
+        let id = report_id.clone();
+        Button::new("review-replay-butler")
+            .compact()
+            .label("带这份巡检问管家")
+            .on_click(cx.listener(move |shell, _, _, cx| {
+                let signal = crate::ipc::Signal::ButlerRef {
+                    id: id.clone(),
+                    question: question.clone(),
+                };
+                if let Err(error) = crate::ipc::poke("mns-gui", &signal) {
+                    shell.show_toast(format!("无法打开管家窗口：{error}"), ToastTone::Error, cx);
+                }
+            }))
+    });
+
     div()
         .v_flex()
         .flex_none()
@@ -1205,14 +1283,26 @@ fn replay_footer(view: &ViewedReview, cx: &mut Context<AppShell>) -> Div {
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT_TERTIARY))
-                                .child("历史报告只读，不能继续追问；新的巡检会覆盖当前时间线。"),
+                                .child(
+                                    "历史报告只读；可以带着它去管家继续问，新的巡检会覆盖当前时间线。",
+                                ),
                         ),
                 )
                 .child(
-                    Button::new("review-back")
-                        .primary()
-                        .label("返回当前巡检")
-                        .on_click(cx.listener(|shell, _, _, cx| shell.exit_review_view(cx))),
+                    div()
+                        .h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.))
+                        .children(relay)
+                        .child(
+                            Button::new("review-back")
+                                .primary()
+                                .label("返回当前巡检")
+                                .on_click(cx.listener(|shell, _, _, cx| {
+                                    shell.exit_review_view(cx)
+                                })),
+                        ),
                 ),
         )
 }

@@ -141,12 +141,176 @@ fn clip_chars(text: &str, max: usize) -> String {
 pub const SILENT_MARKER: &str = "[SILENT]";
 
 /// 主动开口的任务说明。它替代「用户的问题」那一节。
+///
+/// 一次生成、两段产出：BANNER 是通知横幅（被打扰通道，口径最严），CHAT 是
+/// 会话气泡（对「你」说话，可以有人称与温度）。两段必须同源同时生成——
+/// 分两次跑会得到两条互相矛盾的话，还多花一轮会话。
 const AGENT_INIT_QUESTION: &str = "\
-（这一次用户没有提问，是你主动开口。）挑一件此刻真正值得他知道的事，\
-对他说一句话。这一句会作为系统通知横幅出现：只写这一句，不超过 55 字，\
-不分行、不寒暄、不罗列、不要用 markdown；别照着上面的聊天示例展开，只要一句。\
-只报事实或一句提醒，不给买卖建议、不预测涨跌、不承诺收益。\
+（这一次用户没有提问，是你主动开口。）挑一件此刻真正值得他知道的事，分两段写，\
+两段说同一件事：\n\
+[BANNER] 一句，不超过 55 字，不分行、不寒暄、不罗列、不要用 markdown，只报事实或一句提醒；\
+这一句会作为系统通知横幅出现。\n\
+[CHAT] 2–3 句，不超过 140 字，对「你」说话：这是什么情况、大不大、要不要动、我在盯着。\
+可以有人称、可以有温度，但只能承诺真的会发生的提醒，不给买卖建议、不预测涨跌、不承诺收益。\n\
+两个标记都必须写在行首，各占一行；不要写别的解释，也不要在标记外再写正文。\
 如果确实没有值得说的事，只回 [SILENT]（大写、带方括号，不要写别的、不要解释）。";
+
+/// 主动开口的双通道输出。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitReply {
+    /// 通知横幅用的那一句（还没过 `notification_text` 的原始单行）。
+    pub banner: String,
+    /// 会话里说给人听的那段；`None` = 模型没给第二段，会话退回 banner。
+    pub chat: Option<String>,
+}
+
+/// 拆分主动开口的 `[BANNER]` / `[CHAT]` 两段。
+///
+/// 确定性解析：只认行首标记（允许前面有 markdown 的 `#`、`*`、`>`），
+/// `BANNER` 取其所在行的剩余部分，`CHAT` 取其后全部内容。标记缺失、
+/// 顺序颠倒或 banner 为空时，整段按旧行为处理（横幅与会话都用全文），
+/// 保证协议没被遵守时不会变成沉默。
+pub fn split_init_reply(text: &str) -> InitReply {
+    let mut banner: Option<String> = None;
+    let mut chat_started = false;
+    let mut chat_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        if chat_started {
+            chat_lines.push(line.to_owned());
+            continue;
+        }
+        match channel_of(line) {
+            Some(Channel::Banner) if banner.is_none() => {
+                let rest = marker_rest(line);
+                // 模型偶尔把两段写在同一行：`[BANNER] … [CHAT] …`。
+                if let Some(at) = find_chat_marker(rest) {
+                    banner = Some(strip_marker_wrapper(&rest[..at]));
+                    chat_started = true;
+                    let tail = strip_marker_wrapper(marker_rest(&rest[at..]));
+                    if !tail.is_empty() {
+                        chat_lines.push(tail);
+                    }
+                } else {
+                    banner = Some(strip_marker_wrapper(rest));
+                }
+            }
+            // 顺序颠倒（先 CHAT 后 BANNER）不是合法两段式：整段回退。
+            Some(Channel::Chat) if banner.is_none() => return fallback_init_reply(text),
+            Some(Channel::Chat) => {
+                chat_started = true;
+                let first = strip_marker_wrapper(marker_rest(line));
+                if !first.is_empty() {
+                    chat_lines.push(first);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(banner) = banner.filter(|banner| !banner.is_empty()) else {
+        return fallback_init_reply(text);
+    };
+    let chat = if chat_started {
+        let joined = chat_lines.join("\n").trim().to_owned();
+        (!joined.is_empty()).then_some(joined)
+    } else {
+        None
+    };
+    InitReply { banner, chat }
+}
+
+fn fallback_init_reply(text: &str) -> InitReply {
+    InitReply {
+        banner: strip_init_markers(text),
+        chat: None,
+    }
+}
+
+/// 标记被 markdown 包起来时（`**[BANNER]** 正文`），把剩余的 `**` 去掉。
+fn strip_marker_wrapper(rest: &str) -> String {
+    let mut text = rest.trim();
+    if let Some(tail) = text.strip_prefix("**").or_else(|| text.strip_prefix("__")) {
+        if tail.starts_with([' ', '\u{3000}']) {
+            text = tail.trim_start();
+        }
+    }
+    if let Some(head) = text.strip_suffix("**").or_else(|| text.strip_suffix("__")) {
+        if head.ends_with([' ', '\u{3000}']) {
+            text = head.trim_end();
+        }
+    }
+    text.to_owned()
+}
+
+fn find_chat_marker(text: &str) -> Option<usize> {
+    ["[CHAT]", "【CHAT】"]
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+}
+
+enum Channel {
+    Banner,
+    Chat,
+}
+
+/// 行首标记。允许模型把标记包进 markdown（`**[BANNER]**`）、全角方括号
+/// 或小写（`[banner]`）。
+fn channel_of(line: &str) -> Option<Channel> {
+    marker_at(line).map(|(channel, _)| channel)
+}
+
+/// 去掉行首标记后的正文（保留行内其余内容）。
+fn marker_rest(line: &str) -> &str {
+    let rest = trim_line_start(line);
+    match marker_at(line) {
+        Some((_, len)) => rest.get(len..).unwrap_or_default(),
+        None => rest,
+    }
+}
+
+fn trim_line_start(line: &str) -> &str {
+    line.trim_start_matches([' ', '\t', '#', '*', '_', '>', '-'])
+}
+
+/// 行首标记及其字节长度（标记本身不计入正文）。
+fn marker_at(line: &str) -> Option<(Channel, usize)> {
+    const BANNERS: [&str; 2] = ["[BANNER]", "【BANNER】"];
+    const CHATS: [&str; 2] = ["[CHAT]", "【CHAT】"];
+    let rest = trim_line_start(line);
+    for (channel, markers) in [(Channel::Banner, BANNERS), (Channel::Chat, CHATS)] {
+        for marker in markers {
+            let len = marker.len();
+            if rest
+                .get(..len)
+                .is_some_and(|head| head.eq_ignore_ascii_case(marker))
+            {
+                return Some((channel, len));
+            }
+        }
+    }
+    None
+}
+
+/// 回退路径：把可能残留的标记从正文里剥掉，避免横幅上出现 `[BANNER]`。
+///
+/// 两段式校验不过时，调用方拿它当「整段按旧行为处理」的文案。
+pub fn strip_init_markers(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if channel_of(line).is_some() {
+                marker_rest(line).trim()
+            } else {
+                line.trim_end()
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
 
 fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str) -> String {
     let facts_text = facts_block(facts);
@@ -159,10 +323,12 @@ fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str
          {TOOLS_BLOCK}\n\n\
          {context}\
          【怎么说】\n\
+         - 用户的话里带质疑、焦虑、自责时，第一句先接住（一句就够），第二句起照常给结论。\n\
          - 先给结论，再给一两句理由；像面对面聊天，不像写报告。\n\
          - 默认 2–4 个短段落，全文约 300 字以内。只有用户明确说「展开」「细说」「详细讲讲」\
          才展开；没被要求就别写长。\n\
          - 一次最多点 2–3 个关键数字，别把所有腿、所有指标都念一遍；其余用一句话带过。\n\
+         - 术语首次出现配一句大白话；「pp」「腿」「带宽」不裸写。\n\
          - 可以用简单的 markdown：**把关键数字加粗**、短列表、少量小标题；\
          不要表格、不要代码块、不要 JSON。\n\
          - 用中文回答。不要写「我先查一下」「接下来我会…」「已完成」「涉及命令」这类过程旁白，\
@@ -175,7 +341,11 @@ fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str
          到点任务只送一句话：`--talk` 是一句问候，不是长聊；别承诺「到点陪你聊两句」。\n\
          - 数字照抄上面的清单，不要心算、不要四舍五入、不要凭记忆补。\n\
          - 数据不是今天的时候，先用一句话提醒先更新，再回答。\n\
-         - 上面的事实够答就直接答；缺数据用 mns 查，查不到就直说没有，不要猜。\n\n\
+         - 上面的事实够答就直接答；缺数据用 mns 查，查不到就直说没有，不要猜。\n\
+         - 引用材料没结论或只有半截时：一句话说清「还没结论，别拿它当依据」，然后直接\
+         按账本事实回答；不要评价 MNS 或巡检功能本身。\n\
+         - 结尾给一个可执行的具体下一步（如「等 27 日决策日再看」），不复述免责声明、\
+         不反问。免责声明只在触及能力边界时出现一次。\n\n\
          【示例】\n\
          用户：明天 A 股怎么看？\n\
          管家：我的看法是继续震荡，方向说不准。**这不影响你的计划**——按带宽走就行，\
@@ -183,6 +353,13 @@ fn compose_goal(label: &str, question: &str, facts: &AccountFacts, context: &str
          用户：我该不该把黄金卖了？\n\
          管家：我的看法是别急着卖。黄金在你的组合里是对冲腿，不是收益来源，跌了不等于该砍。\
          真要动，等决策日看它有没有出带宽；现在卖只是被短期波动牵着走。\n\n\
+         用户：我是不是搞砸了？\n\
+         管家：先说结论：你没搞砸。操作本身在计划内，账面也还在带宽里，只是赶上回调\
+         看着吓人。真要挑毛病，是执行时机早了几天，不是方向错了。我盯着，不用你现在\
+         补动作。\n\n\
+         用户：你看靠谱吗？（引用了一份还没跑完的巡检）\n\
+         管家：这一问该问——这份引用确实还没跑完，数字没落地，先别拿它当依据。账本\
+         这边是实时的：偏离和计划都在该在的位置，我按账本说给你听。\n\n\
          {label}\n\
          {question}"
     )
@@ -842,5 +1019,65 @@ allocation: 美股 45%";
     #[test]
     fn 主动开口的提示词约定了不回话标记() {
         assert!(AGENT_INIT_QUESTION.contains(SILENT_MARKER));
+    }
+
+    #[test]
+    fn 主动开口提示词要求横幅与会话两段() {
+        assert!(AGENT_INIT_QUESTION.contains("[BANNER]"));
+        assert!(AGENT_INIT_QUESTION.contains("[CHAT]"));
+        assert!(AGENT_INIT_QUESTION.contains("不超过 55 字"), "横幅口径不变");
+        assert!(
+            AGENT_INIT_QUESTION.contains("不超过 140 字"),
+            "会话段要短，别把电报换成报告"
+        );
+    }
+
+    #[test]
+    fn 两段式按行首标记拆分() {
+        let reply = split_init_reply(
+            "[BANNER] 美股偏离 6.9pp，等决策日处理。\n[CHAT] 这一腿现在低于目标，超出你定的容忍范围。不用现在动，等 27 日再看。",
+        );
+        assert_eq!(reply.banner, "美股偏离 6.9pp，等决策日处理。");
+        assert_eq!(
+            reply.chat.as_deref(),
+            Some("这一腿现在低于目标，超出你定的容忍范围。不用现在动，等 27 日再看。")
+        );
+
+        // markdown 包装与全角括号也认。
+        let wrapped = split_init_reply("**【BANNER】** 偏离 6.9pp。\n\n【CHAT】不用慌，我盯着。");
+        assert_eq!(wrapped.banner, "偏离 6.9pp。");
+        assert_eq!(wrapped.chat.as_deref(), Some("不用慌，我盯着。"));
+
+        // 小写标记同样认（模型偶尔不按大写写）。
+        let lower = split_init_reply("[banner] 偏离 6.9pp。\n[chat] 我盯着。");
+        assert_eq!(lower.banner, "偏离 6.9pp。");
+        assert_eq!(lower.chat.as_deref(), Some("我盯着。"));
+    }
+
+    #[test]
+    fn 同一行的两段也能拆() {
+        let reply = split_init_reply("[BANNER] 偏离 6.9pp。[CHAT] 不用慌，我盯着。");
+        assert_eq!(reply.banner, "偏离 6.9pp。");
+        assert_eq!(reply.chat.as_deref(), Some("不用慌，我盯着。"));
+    }
+
+    #[test]
+    fn 缺会话段时只回横幅() {
+        let reply = split_init_reply("[BANNER] 今天不是决策日，先不动。");
+        assert_eq!(reply.banner, "今天不是决策日，先不动。");
+        assert!(reply.chat.is_none(), "没有第二段时会话退回横幅");
+    }
+
+    #[test]
+    fn 标记缺失时整段回退且不残留标记() {
+        let reply = split_init_reply("今天不是决策日，先不动。");
+        assert_eq!(reply.banner, "今天不是决策日，先不动。");
+        assert!(reply.chat.is_none());
+
+        // 顺序颠倒不是合法两段式，但标记本身不能出现在横幅上。
+        let reversed = split_init_reply("[CHAT] 先说情况。\n[BANNER] 偏离 6.9pp。");
+        assert_eq!(reversed.banner, "先说情况。\n偏离 6.9pp。");
+        assert!(reversed.chat.is_none());
+        assert!(!reversed.banner.contains("[CHAT]"));
     }
 }

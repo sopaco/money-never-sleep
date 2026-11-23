@@ -47,6 +47,10 @@ pub const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ChatReference {
     pub title: String,
     pub body: String,
+    /// 报告是否给出了结论（`mns-decision`）。半截报告（运行中、模型只吐了
+    /// 开工旁白）没有结论：正文不进上下文，只留一句提示，避免模型拿旁白
+    /// 当依据，或被引着去评价产品本身。
+    pub concluded: bool,
 }
 
 /// 管家会话的账户事实：与守护进程判定、CLI 审计同一条路径
@@ -89,7 +93,14 @@ fn reference_block(references: &[ChatReference]) -> String {
         out.push_str("· ");
         out.push_str(item.title.trim());
         out.push('\n');
-        out.push_str(item.body.trim());
+        if item.concluded {
+            out.push_str(item.body.trim());
+        } else {
+            // 兜底：入口已经拦过 running / 无结论的报告，这里再守一层。
+            // 只给一句提示，不把半截正文交给模型——否则它会顺着旁白谈
+            // 「报告为什么坏了」，那正是用户截图里最不友好的一种回答。
+            out.push_str("（这份巡检没有结论，不要引用其内容；按上面的账本事实回答。）");
+        }
         out.push_str("\n\n");
     }
     out.trim_end().to_owned() + "\n"
@@ -323,7 +334,7 @@ impl ChatService {
             text.clone()
         } else {
             format!(
-                "{text}\n\n> 引用巡检：{}",
+                "{text}\n\n> 引用：{}",
                 references
                     .iter()
                     .map(|item| item.title.as_str())
@@ -473,7 +484,15 @@ impl ChatService {
             self.session.push(Message {
                 at: notice.at,
                 role: Role::Butler,
-                text: notice.draft.clone(),
+                // 主动开口可以给两版：横幅走最严口径，会话说人话。没有
+                // 会话版的旧条目（以及确定性内核的开口）沿用横幅那一条。
+                text: notice
+                    .chat
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|chat| !chat.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| notice.draft.clone()),
                 reason: Some(notice.reason),
                 trigger: Some(notice.trigger.clone()),
                 notice_id: Some(notice.notice_id.clone()),
@@ -1204,6 +1223,7 @@ mod tests {
             reason: SpeakReason::ActionableStep,
             trigger: "drift:2026-11-20".to_owned(),
             draft: "美股偏离 6.2pp".to_owned(),
+            chat: None,
             notice_id: "n-merge-1".to_owned(),
         };
 
@@ -1248,6 +1268,38 @@ mod tests {
         );
     }
 
+    /// 主动开口的双通道：会话里用会话版，横幅那一条只留审计。
+    #[test]
+    fn merge_notices优先用会话版() {
+        let mut service = open("merge-chat");
+        let notice = Notice {
+            at: Local
+                .with_ymd_and_hms(2026, 11, 23, 12, 13, 0)
+                .single()
+                .unwrap(),
+            reason: SpeakReason::AgentInit,
+            trigger: "agent-init:2026-11-23".to_owned(),
+            draft: "美股偏离 6.9pp，等决策日处理。".to_owned(),
+            chat: Some(
+                "这一腿现在低于目标，超出你定的容忍范围。不用现在动，等 27 日再看。".to_owned(),
+            ),
+            notice_id: "n-merge-chat".to_owned(),
+        };
+
+        let effects = service.merge_notices(&[notice], false);
+        let data = snapshot_of(&effects);
+        assert_eq!(
+            data.session.messages[0].text,
+            "这一腿现在低于目标，超出你定的容忍范围。不用现在动，等 27 日再看。",
+            "会话里不该出现横幅电报"
+        );
+        assert_eq!(
+            data.session.messages[0].notice_id.as_deref(),
+            Some("n-merge-chat"),
+            "点通知仍要能定位到这一条"
+        );
+    }
+
     /// 巡检结果并入会话：完整正文落一条，且不替用户标已读。
     #[test]
     fn 巡检结果并入会话且不标已读() {
@@ -1285,6 +1337,7 @@ mod tests {
         let references = [ChatReference {
             title: "巡检 · 2026-11-21".to_owned(),
             body: "美股低配 6.2pp，本周不操作。".to_owned(),
+            concluded: true,
         }];
         let effects =
             service.send_with_context("帮我看看要不要补".to_owned(), &facts(), &references);
@@ -1303,7 +1356,7 @@ mod tests {
         assert!(
             data.session.messages[0]
                 .text
-                .contains("引用巡检：巡检 · 2026-11-21"),
+                .contains("引用：巡检 · 2026-11-21"),
             "用户消息应留引用说明，实际 {}",
             data.session.messages[0].text
         );
@@ -1322,6 +1375,37 @@ mod tests {
         assert!(
             command.contains("美股低配 6.2pp"),
             "续问也要带正文：{command}"
+        );
+    }
+
+    /// 没有结论的引用（运行中的报告）只留提示，正文不进模型上下文。
+    ///
+    /// 兜底：入口已经拦过这类报告，但任何路径漏进来时，模型也不能拿
+    /// 一句开工旁白当依据去评价产品。
+    #[cfg(feature = "agent")]
+    #[test]
+    fn 没有结论的引用只留提示不喂正文() {
+        let mut service = open("context-broken");
+        let references = [ChatReference {
+            title: "巡检 · 2026-11-23".to_owned(),
+            body: "我先拉取持仓、现金、绩效和买入冷静期状态。".to_owned(),
+            concluded: false,
+        }];
+        let effects = service.send_with_context("你看靠谱吗".to_owned(), &facts(), &references);
+        let command = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChatEffect::Runtime(command) => Some(format!("{command:?}")),
+                _ => None,
+            })
+            .expect("应起 runtime");
+        assert!(
+            command.contains("没有结论"),
+            "要明确告诉模型这份引用不可用：{command}"
+        );
+        assert!(
+            !command.contains("我先拉取持仓"),
+            "半截旁白不能进上下文：{command}"
         );
     }
 

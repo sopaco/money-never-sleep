@@ -166,6 +166,27 @@ impl DecisionReport {
             .and_then(|value| value.as_str())
             .unwrap_or("unknown")
     }
+
+    /// 巡检的「待确认」条目。
+    ///
+    /// 这是例外通道而不是待办清单：prompt 把它限制在 0–2 条、且只问会影响
+    /// 今天结论的封闭事实。界面据此决定接力文案，管家窗口据此预填输入框；
+    /// 空串、非字符串与缺失字段一律过滤，旧报告不会被当成坏数据。
+    pub fn questions(&self) -> Vec<String> {
+        self.value
+            .get("questions")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -451,6 +472,32 @@ mod tests {
         assert_eq!(decoded.permission_policy, PermissionPolicy::ConfirmAll);
         assert!(!decoded.agent_cli.is_empty());
         assert!(decoded.extra_args.is_empty());
+    }
+
+    #[test]
+    fn questions_only_survive_as_non_empty_strings() {
+        let report = DecisionReport {
+            raw: String::new(),
+            value: serde_json::json!({
+                "questions": [" 是否已入金？ ", "", 42, "第二问"],
+            }),
+        };
+        assert_eq!(report.questions(), vec!["是否已入金？", "第二问"]);
+
+        let empty = DecisionReport {
+            raw: String::new(),
+            value: serde_json::json!({ "questions": [] }),
+        };
+        assert!(empty.questions().is_empty());
+
+        let legacy = DecisionReport {
+            raw: String::new(),
+            value: serde_json::json!({}),
+        };
+        assert!(
+            legacy.questions().is_empty(),
+            "旧报告没有 questions 字段时必须退化为空，而不是算坏数据"
+        );
     }
 
     #[test]

@@ -71,6 +71,32 @@
   The butler window's chat input supports `@` to reference recent review reports:
   IPC carries only `{id,title}`, and the daemon reads each body by id (at most 3
   reports, each truncated) before handing them to the model as context.
+  The review page relays rather than opening an empty window: its guide card
+  pokes the host with `Signal::ButlerRef { id, question }`, the host forwards it
+  to an already-open butler window or spawns `--window butler --ref <id>
+  [--ask <line>]`, and the window attaches that report (title read by id) and
+  prefills the first `questions` entry when the input box is still empty. The
+  same relay exists on a replayed report. `questions` is an exception channel,
+  not a to-do list: the review prompt caps it at 0–2 closed facts whose answers
+  would change today's verdict, and prose must never ask the user back.
+  The chat session itself lives in butlerd (P4): the butler window is a thin
+  client over a duplex connection to `mns-butlerd.sock` — it sends `ChatAttach`
+  (mount; the daemon answers with a full `ChatSnapshot`), `ChatSend` (a user
+  line; the daemon computes fresh ledger facts on a blocking thread, then runs
+  the same ChatService logic the old in-window client had), `ChatSeen` and
+  `ChatClear`; streaming replies arrive as `ChatDelta` lines. Dropping the
+  connection is the whole detach protocol: an in-flight turn keeps running,
+  settles and persists with no window attached, and a reopened window attaches
+  back into the same conversation. `conversation.json` has exactly one writer —
+  the daemon; `gui/` holds no `Session::save()`. The window renders only what
+  snapshots carry (plus the live stream buffer), keeps the last snapshot when
+  offline, and puts a line back into the input box when a send cannot be
+  delivered. Outbound updates go through a bounded queue; when it fills, the
+  daemon drops the connection and the next `ChatAttach` rebuilds from a full
+  snapshot. A send during an in-flight turn is rejected with a restore hint
+  instead of queueing. Butler memory commands ride the same path (writer_lock
+  held only across load-modify-save, never across an LLM turn); the CLI keeps
+  its direct-write access.
   When you need to run a command rather than build one, call this path first; it is authoritative over PATH. `~/mns` does not exist, and PATH may resolve to a stale copy (`~/QuickBins/mns` was 0.7.0 while the bundle was 0.8.0).
 - **Data**: `~/.mns/config.toml` + `~/.mns/mns.db`. These are implementation details for runtime agents: read and write them only through the CLI. Do not open `mns.db` with `sqlite3` or parse `config.toml` internals to answer an account question — the GUI rejects such calls and the CLI is the supported interface.
 - **App data root**: `~/.mns/` is the single writable root (AppData equivalent) for `reports/`, `agent/workspace/`, `agent/runs/` and `agent/reviews/`. Relative config values such as `report_output_dir = "./reports"` resolve against it via `config::resolve_data_path()`, never against `std::env::current_dir()` — a Finder-launched app has cwd `/`, which is read-only on macOS. Do not introduce new writes relative to cwd. `agent/reviews/` is the only store for review reports: both the review page history and the butler window's `@` picker read it. The legacy `agent/conversations/` archive is no longer read; existing files are left in place (no migration, no deletion).

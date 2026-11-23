@@ -1,8 +1,10 @@
 //! 管家对话链路的无窗口验证：用真实的人设与账本上下文起一次 ACP 会话，
-//! 再追问一句，确认 `Ask` 复用同一个 session 不会被拒。
+//! 按亲和力升级的三条验收问句各问一轮，最后再跑一轮主动开口，确认
+//! `[BANNER]` / `[CHAT]` 两段能被确定性拆开。
 //!
 //! ```text
 //! cargo run --example butler_talk_smoke --features agent
+//! cargo run --example butler_talk_smoke --features agent -- --init-only
 //! ```
 
 use std::time::Duration;
@@ -15,6 +17,17 @@ use money_never_sleep::butler::orchestrator::{AccountFacts, DriftRow};
 use money_never_sleep::butler::talk;
 
 const TIMEOUT: Duration = Duration::from_secs(150);
+
+/// 亲和力升级的三条验收问句：情绪接住、术语翻译、引用半截报告。
+///
+/// 第三条把「引用了一份没跑完的巡检」写进问题里：真正的引用注入在
+/// `chat::reference_block`，这里的目的是验提示词口径（有接住句、不评价
+/// 产品、无「别当依据看」式命令）。
+const QUESTIONS: [&str; 3] = [
+    "我是不是搞砸了？",
+    "现在偏离多少",
+    "你看靠谱吗？（引用了一份还没跑完的巡检，正文只有一句「我先拉取持仓、现金、绩效和买入冷静期状态」）",
+];
 
 fn facts() -> AccountFacts {
     AccountFacts {
@@ -94,58 +107,90 @@ async fn run_turn(
     buffer
 }
 
+/// 与 GUI 同一份设置：工作目录固定到管家数据目录。
+///
+/// 不在仓库根上跑，否则 opencode 会读到项目的 AGENTS.md 并套用复盘契约。
+fn settings() -> money_never_sleep::agent::AgentSettings {
+    let mut settings = load_settings();
+    let dir = money_never_sleep::config::app_data_dir().join("agent/butler");
+    let _ = std::fs::create_dir_all(&dir);
+    settings.working_dir = dir.to_string_lossy().into_owned();
+    settings
+}
+
+/// 对话链路：首轮 `Start` + 两轮 `Ask`（同一个 session）。
+async fn conversation(facts: &AccountFacts, memory: &[String], recent: &[String]) {
+    let (handle, mut events) = start_runtime();
+    let settings = settings();
+    for (index, question) in QUESTIONS.iter().enumerate() {
+        println!("\n=== 第 {} 问：{question} ===", index + 1);
+        let started = std::time::Instant::now();
+        let command = if index == 0 {
+            AgentCommand::Start {
+                goal: talk::opening_goal(question, facts, memory, recent),
+                settings: settings.clone(),
+                source: GoalSource::Conversation,
+            }
+        } else {
+            AgentCommand::Ask {
+                text: talk::follow_up(question),
+            }
+        };
+        run_turn(&handle, &mut events, command).await;
+        println!("耗时 {:?}", started.elapsed());
+    }
+    let _ = handle.send(AgentCommand::Shutdown);
+}
+
+/// 主动开口：单独一个 runtime。
+///
+/// 复用一个刚跑完的 runtime 会赶上上一轮的收尾，runner 回「已有任务在运行」——
+/// 那是 harness 的时序问题，不是产品行为；真实链路里 agent-init 每次都是新起的。
+async fn init(facts: &AccountFacts, memory: &[String], recent: &[String]) {
+    let (handle, mut events) = start_runtime();
+    println!("\n=== 主动开口（双通道）===");
+    let raw = run_turn(
+        &handle,
+        &mut events,
+        AgentCommand::Start {
+            goal: talk::agent_init_goal(facts, memory, recent),
+            settings: settings(),
+            source: GoalSource::Conversation,
+        },
+    )
+    .await;
+    let _ = handle.send(AgentCommand::Shutdown);
+
+    let reply = talk::split_init_reply(&talk::validate_talk(&raw).unwrap_or(raw));
+    let banner = talk::notification_text(&reply.banner);
+    println!("BANNER（{} 字）：{banner}", banner.chars().count());
+    println!(
+        "CHAT（{} 字）：{}",
+        reply.chat.as_deref().unwrap_or("").chars().count(),
+        reply.chat.as_deref().unwrap_or("（回落为横幅同文）")
+    );
+    match money_never_sleep::butler::schedule::validate_notification(&banner) {
+        Ok(()) => println!("横幅口径：通过"),
+        Err(violation) => println!("横幅口径：{violation}"),
+    }
+    if reply.chat.is_none() {
+        println!("两段式：未拆出 CHAT（会走回退，横幅与会话同文）");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let facts = facts();
-    // 管家现在有真实工具：账户用 mns 查，提醒用 mns-butler task add 落成到点任务。
-    let question = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "现在偏离多少".to_owned());
     // 与 GUI 同一条注入路径：记忆与最近对话也进首轮（这里从账户目录读
     // 真实记忆，空记忆则注入为空）。
     let today = Local::now().date_naive();
     let memory = money_never_sleep::butler::Memory::load().unwrap_or_default();
     let session = money_never_sleep::butler::Session::load().unwrap_or_default();
-    let goal = talk::opening_goal(
-        &question,
-        &facts,
-        &talk::memory_lines(&memory, today),
-        &talk::recent_lines(&session),
-    );
-    println!("--- 第一轮 goal 长度 {} 字 ---", goal.chars().count());
+    let memory_lines = talk::memory_lines(&memory, today);
+    let recent_lines = talk::recent_lines(&session);
 
-    let (handle, mut events) = start_runtime();
-    // 与 GUI 保持一致：工作目录固定到管家数据目录，不在仓库根上跑，
-    // 否则 opencode 会读到项目的 AGENTS.md 并套用复盘契约。
-    let mut settings = load_settings();
-    let dir = money_never_sleep::config::app_data_dir().join("agent/butler");
-    let _ = std::fs::create_dir_all(&dir);
-    settings.working_dir = dir.to_string_lossy().into_owned();
-
-    let started = std::time::Instant::now();
-    run_turn(
-        &handle,
-        &mut events,
-        AgentCommand::Start {
-            goal,
-            settings,
-            source: GoalSource::Conversation,
-        },
-    )
-    .await;
-    println!("第一轮耗时 {:?}", started.elapsed());
-
-    println!("\n=== 追问 ===");
-    let started = std::time::Instant::now();
-    run_turn(
-        &handle,
-        &mut events,
-        AgentCommand::Ask {
-            text: talk::follow_up("那 A 股呢"),
-        },
-    )
-    .await;
-    println!("追问耗时 {:?}", started.elapsed());
-
-    let _ = handle.send(AgentCommand::Shutdown);
+    if !std::env::args().any(|arg| arg == "--init-only") {
+        conversation(&facts, &memory_lines, &recent_lines).await;
+    }
+    init(&facts, &memory_lines, &recent_lines).await;
 }

@@ -22,7 +22,7 @@ const DECISION_SCHEMA: &str = r#"{
   "actions": [
     { "code": "007605", "side": "buy | sell", "amount_cny": 0, "reason": "必须来自报告的偏离或现金流事件" }
   ],
-  "questions": ["需要用户确认的事实，没有就给空数组"]
+  "questions": ["0–2 条：只有你知道、且答案会改变今天结论的事实缺口；没有就给 []"]
 }"#;
 
 /// Cap on how much report text goes into the prompt. A full report is a few
@@ -68,7 +68,15 @@ pub fn daily_review_prompt(date: &str, weekday: &str, report: &str, cli: Option<
          约束：\n\
          - 金额、份额、日期一律照抄报告，不重算、不四舍五入、不凭记忆填写。\n\
          - verdict 只能是 hold / adjust / wait；没有触发条件就填 hold，并在 headline 写明「今天不操作」。\n\
-         - 不确定的事实写进 questions，不要写成断言。\n\
+         - questions 是例外通道，不是待办清单：最多 2 条，能不问就不问。\n\
+         只问「只有用户本人知道、且答案会改变今天 verdict 或 actions」的封闭事实\
+         （是否已成交 / 已入金、某笔限购是否解除、资金何时到账），\
+         每条都必须能用一个「是/否、一个数字或一个日期」回答。\n\
+         - 不要问观点、偏好、预测或复盘理由，也不要问报告里已经写明的事实；\
+         想展开讨论的不要塞进 questions——用户会带这份巡检去管家窗口追问。\n\
+         - 不确定但会影响结论的事实才写进 questions；不影响结论的不确定，在正文说明即可，不要占用 questions。\n\
+         - 正文里不要向用户提问，也不要说「请回复 / 请告诉我」：巡检页没有对话入口。\n\
+         需要用户确认的只放进 questions；展开讨论由用户自己去管家窗口发起。\n\
          - 工作目录可写，但不要写任何文件：结论只通过 mns-decision 块回传，MNS 负责保存与展示。"
     )
 }
@@ -117,6 +125,39 @@ mod tests {
         );
         assert!(prompt.contains("\"verdict\""));
         assert!(prompt.contains("不要写任何文件"));
+    }
+
+    #[test]
+    fn questions_are_a_rare_exception_channel_not_a_chat_entry() {
+        let prompt = daily_review_prompt("2026-11-09", "周一", "报告", None);
+        assert!(
+            prompt.contains("最多 2 条"),
+            "the cap must be stated, otherwise a model fills it"
+        );
+        assert!(
+            prompt.contains("能不问就不问"),
+            "zero questions must be the preferred default"
+        );
+        assert!(
+            prompt.contains("管家窗口"),
+            "depth belongs to the butler, not the review card"
+        );
+        assert!(
+            prompt.contains("不要问观点、偏好、预测"),
+            "open-ended advice questions must be excluded"
+        );
+        assert!(
+            prompt.contains("报告里已经写明的事实"),
+            "facts the report already answers are not questions"
+        );
+        assert!(
+            !prompt.contains("不确定的事实写进 questions"),
+            "the old blanket rule invited a list of every uncertainty"
+        );
+        assert!(
+            prompt.contains("巡检页没有对话入口"),
+            "prose must not ask the user to answer in a page that cannot reply"
+        );
     }
 
     #[test]

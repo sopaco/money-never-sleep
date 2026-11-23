@@ -205,6 +205,9 @@ pub struct SpeakCandidate {
     /// 稳定标识（事件 id / 日期 + 腿），用于同一事件去重。
     pub trigger: String,
     pub draft: String,
+    /// 会话版文案（主动开口双通道）。`None` = 会话与横幅同文。
+    /// 横幅（`draft`）仍走最严口径；这一段只进管家会话。
+    pub chat: Option<String>,
 }
 
 /// 开口频控。默认：每日 ≤3、每周 ≤10、静音 22:00–08:00、同一事件 3 天内
@@ -541,6 +544,7 @@ mod tests {
             reason,
             trigger: trigger.to_owned(),
             draft: "草稿".to_owned(),
+            chat: None,
         }
     }
 

@@ -401,6 +401,7 @@ fn candidate(
         reason,
         trigger,
         draft,
+        chat: None,
     }
 }
 
@@ -541,6 +542,10 @@ pub struct Notice {
     pub reason: SpeakReason,
     pub trigger: String,
     pub draft: String,
+    /// 会话里说给人听的那一段（主动开口双通道）。缺省 = 沿用 `draft`：
+    /// 确定性内核与旧 pending 行都只有一条文案，行为不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
     /// 稳定通知 id：落盘时生成一次，之后不可变。旧版 pending 行没有这个
     /// 字段，读取时用 `notice_id_for` 补出来——同样的 `at + trigger` 得到
     /// 同样的 id，重读不会漂移。
@@ -579,6 +584,7 @@ pub fn enqueue_notice(at: DateTime<Local>, candidate: &SpeakCandidate) -> Result
         reason: candidate.reason,
         trigger: candidate.trigger.clone(),
         draft: candidate.draft.clone(),
+        chat: candidate.chat.clone(),
         notice_id: notice_id_for(at, &candidate.trigger),
     };
     let line = serde_json::to_string(&notice)?;
@@ -599,6 +605,7 @@ pub fn enqueue_pending(at: DateTime<Local>, candidate: &SpeakCandidate) -> Resul
         reason: candidate.reason,
         trigger: candidate.trigger.clone(),
         draft: candidate.draft.clone(),
+        chat: candidate.chat.clone(),
         notice_id: notice_id_for(at, &candidate.trigger),
     };
     let line = serde_json::to_string(&notice)?;
@@ -1269,6 +1276,46 @@ mod tests {
     }
 
     #[test]
+    fn 会话版文案随pending往返且旧行没有它() {
+        let dir = std::env::temp_dir().join(format!("mns-butler-chat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending.jsonl");
+        let notice = Notice {
+            at: at(23, 12),
+            reason: SpeakReason::AgentInit,
+            trigger: "agent-init:2026-11-23".to_owned(),
+            draft: "美股偏离 6.9pp，等决策日处理。".to_owned(),
+            chat: Some("不用现在动，等 27 日再看。".to_owned()),
+            notice_id: notice_id_for(at(23, 12), "agent-init:2026-11-23"),
+        };
+        let old = serde_json::json!({
+            "at": at(23, 13),
+            "reason": "AgentInit",
+            "trigger": "agent-init:old",
+            "draft": "旧格式",
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&notice).unwrap(),
+                serde_json::to_string(&old).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let notices = take_pending_at(&path, 0).unwrap().1;
+        assert_eq!(
+            notices[0].chat.as_deref(),
+            Some("不用现在动，等 27 日再看。")
+        );
+        assert_eq!(notices[1].chat, None, "旧行没有会话版，回退到横幅文案");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 通知id由时间与触发派生且稳定() {
         let first = notice_id_for(at(20, 9), "task:abc");
         assert_eq!(first, notice_id_for(at(20, 9), "task:abc"), "同源必须同 id");
@@ -1329,6 +1376,7 @@ mod tests {
             reason: SpeakReason::TaskDue,
             trigger: "task:x".to_owned(),
             draft: "该看计划了".to_owned(),
+            chat: None,
             notice_id: notice_id_for(at(20, 9), "task:x"),
         };
 

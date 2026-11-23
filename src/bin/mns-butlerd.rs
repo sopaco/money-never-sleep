@@ -657,18 +657,19 @@ fn review_settings() -> money_never_sleep::agent::AgentSettings {
     settings
 }
 
-/// 把窗口传来的引用解析成正文。报告已被删除或读不出来就跳过；最多 3 份，
-/// 每份截断到 6,000 字，避免一条消息把 ACP 会话撑爆。
+/// 把窗口传来的引用解析成正文。报告已被删除、还在运行或正文为空就跳过；
+/// 最多 3 份，每份截断到 6,000 字，避免一条消息把 ACP 会话撑爆。
 fn load_references(attachments: &[ReviewRef]) -> Vec<ChatReference> {
     let mut out = Vec::new();
     for item in attachments.iter().take(MAX_REFERENCES) {
         let Ok(report) = review::load(&item.id) else {
             continue;
         };
-        let body = report.body.trim();
-        if body.is_empty() {
+        // 与 `@` 选择器同一条规则：只有跑完的报告能被引用。
+        if !report.is_quotable() {
             continue;
         }
+        let body = report.body.trim();
         let title = if report.title.trim().is_empty() {
             item.title.clone()
         } else {
@@ -677,6 +678,7 @@ fn load_references(attachments: &[ReviewRef]) -> Vec<ChatReference> {
         out.push(ChatReference {
             title,
             body: clip_text(body, MAX_REFERENCE_CHARS),
+            concluded: report.concluded(),
         });
     }
     out
@@ -713,6 +715,7 @@ async fn deliver_review(
                 reason: SpeakReason::DailyReview,
                 trigger,
                 draft: "今日巡检已完成，点开管家窗口看结论。".to_owned(),
+                chat: None,
             };
             if let Err(error) = orchestrator::enqueue_notice(now, &candidate) {
                 eprintln!("mns-butlerd: 巡检通知写入失败：{error:#}");
@@ -855,16 +858,27 @@ async fn run_agent_init() -> Result<bool> {
         record_init(AgentInitOutcome::Silent, Some("模型返回无话说标记"));
         return Ok(false);
     }
-    // 这一条会进系统通知横幅：banner 是纯文本通道，星号会原样显示。会话
-    // 气泡也复用同一条文本，单行提醒不需要 markdown。
-    let text = talk::notification_text(&cleaned);
-    // banner 是被动打扰通道：长度与话术口径与会话不同，这里不降级、只沉默。
+    // 一次生成两段：横幅走最严口径（纯文本、≤60 字），会话版可以说人话。
+    // 协议没被遵守、或横幅本身过不了通知口径时，整段回退成旧行为（横幅
+    // 与会话同文）；旧行为也过不了，就和以前一样沉默。
+    let reply = talk::split_init_reply(&cleaned);
+    let mut text = talk::notification_text(&reply.banner);
+    let mut chat = reply.chat.and_then(|chat| {
+        talk::validate_talk(&chat)
+            .ok()
+            .filter(|chat| !chat.trim().is_empty())
+    });
     if let Err(violation) = schedule::validate_notification(&text) {
-        record_init(
-            AgentInitOutcome::Failed,
-            Some(&format!("回答没过通知口径：{violation}")),
-        );
-        return Ok(false);
+        let fallback = talk::notification_text(&talk::strip_init_markers(&cleaned));
+        if schedule::validate_notification(&fallback).is_err() {
+            record_init(
+                AgentInitOutcome::Failed,
+                Some(&format!("回答没过通知口径：{violation}")),
+            );
+            return Ok(false);
+        }
+        text = fallback;
+        chat = None;
     }
 
     // 等待回答期间别的路径可能已经开过口：重新加载后再查一次额度，并把
@@ -881,6 +895,7 @@ async fn run_agent_init() -> Result<bool> {
             reason: SpeakReason::AgentInit,
             trigger: agent_init_trigger(&butler.state.ledger, now),
             draft: text,
+            chat,
         };
         butler.state.ledger.record(now, &candidate);
         butler.state.ledger.trim(now, 30);
@@ -1276,6 +1291,7 @@ mod tests {
                     reason: SpeakReason::AgentInit,
                     trigger: trigger.to_owned(),
                     draft: "x".to_owned(),
+                    chat: None,
                 },
             );
         }

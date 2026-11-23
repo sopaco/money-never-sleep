@@ -87,6 +87,9 @@ pub(crate) struct ButlerView {
     /// 被拒/断线时没递出去的话：render 时放回输入框（`set_value` 需要
     /// `&mut Window`，只能在渲染阶段应用）。
     pending_restore: Option<String>,
+    /// 从巡检页接力过来时预填的那句话（结论里的第一条待确认）。同样等到
+    /// render 才能 `set_value`；输入框里已有字就不覆盖。
+    pending_prefill: Option<String>,
     /// 点系统通知进来时要定位的那条。等快照解析：会话真相到了才能定位。
     pending_notice: Option<String>,
     /// `pending_notice` 已经等过的快照帧数，防无限等待。
@@ -152,6 +155,7 @@ impl ButlerView {
             waiting: false,
             stream_buffer: String::new(),
             pending_restore: None,
+            pending_prefill: None,
             pending_notice: None,
             pending_notice_frames: 0,
             snapshot_instance: None,
@@ -208,6 +212,42 @@ impl ButlerView {
         }
         self.pending_notice = None;
         self.notice_focus = Some(NoticeFocus { index, at, text });
+        cx.notify();
+    }
+
+    /// 带着一份巡检报告进来（巡检页的接力入口）。
+    ///
+    /// 只收 id 与可选的预填句：标题始终从存档读，IPC / 命令行不搬运正文。
+    /// 没带预填句时（例如窗口由 `--ref` 冷启动）再从报告里取第一条待确认。
+    /// 窗口已开时再次接力只是追加引用；输入框已有字就不覆盖用户正在打的半句。
+    ///
+    /// 只接跑完的报告（`ReviewReport::is_quotable`）：运行中的报告正文只有
+    /// 一句开工旁白，引用它会逼模型对着半截文本解释「报告为什么坏了」。
+    pub(crate) fn attach_review(
+        &mut self,
+        id: String,
+        question: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(report) = crate::butler::review::load(&id) else {
+            return;
+        };
+        if !report.is_quotable() {
+            return;
+        }
+        let title = if report.title.trim().is_empty() {
+            "巡检报告".to_owned()
+        } else {
+            report.title.clone()
+        };
+        attach_ref(&mut self.attached, ReviewRef { id, title });
+        let question = question
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .or_else(|| first_question(report.decision.as_deref()));
+        if let Some(question) = question {
+            self.pending_prefill = Some(question);
+        }
         cx.notify();
     }
 
@@ -852,6 +892,16 @@ impl Render for ButlerView {
             // 恢复的话不算「刚输入」：哪怕它正好以 `@` 结尾，也不该重新弹层。
             self.last_input = text;
         }
+        // 接力预填：只在输入框为空时填，绝不覆盖用户已经打的半句。取走即
+        // 清零，只填一次；焦点一并给过去，用户按回车就能发。
+        if let Some(text) = self.pending_prefill.take() {
+            let empty = self.input.read(cx).value().trim().is_empty();
+            if empty {
+                self.input
+                    .update(cx, |input, cx| input.set_value(text.as_str(), window, cx));
+            }
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
         // 输入框没有变更回调：和上一帧对比，新值以 `@` 结尾才打开选择器。
         // `last_input` 同时兼作去抖——输入法组合期间的重绘不会反复弹层。
         let value = self.input.read(cx).value().to_string();
@@ -1161,6 +1211,23 @@ fn attach_ref(attached: &mut Vec<ReviewRef>, candidate: ReviewRef) -> bool {
     }
     attached.push(candidate);
     true
+}
+
+/// 从巡检结论的原始 JSON 里取第一条待确认。
+///
+/// `questions` 是巡检唯一的「需要你回答」通道，界面已经把它收成 0–2 条；
+/// 接力时把它预填进输入框，用户按回车就能带着整份报告继续问。
+fn first_question(decision: Option<&str>) -> Option<String> {
+    let raw = decision?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    // 与结论卡片同一套过滤规则：空串与非字符串都不算问句。
+    crate::agent::DecisionReport {
+        raw: raw.to_owned(),
+        value,
+    }
+    .questions()
+    .into_iter()
+    .next()
 }
 
 /// 空态的三个一键提问。文案与 `expression::intent_for` 的主干意图对齐：
@@ -2078,7 +2145,7 @@ mod tests {
 /// `@` 引用的纯规则测试：不建窗口、不读报告目录，`--features gui` 即可跑。
 #[cfg(test)]
 mod attach_rules {
-    use super::{MAX_REFS, attach_ref};
+    use super::{MAX_REFS, attach_ref, first_question};
     use crate::butler::review::ReviewRef;
 
     fn reference(id: &str) -> ReviewRef {
@@ -2086,6 +2153,19 @@ mod attach_rules {
             id: id.to_owned(),
             title: format!("巡检 · {id}"),
         }
+    }
+
+    #[test]
+    fn 接力预填只取结论里的第一条待确认() {
+        let raw = r#"{"questions":[" ","是否已入金？","第二问"]}"#;
+        assert_eq!(
+            first_question(Some(raw)).as_deref(),
+            Some("是否已入金？"),
+            "空串要跳过，第一条有效问句才是预填"
+        );
+        assert_eq!(first_question(Some(r#"{"questions":[]}"#)), None);
+        assert_eq!(first_question(Some("不是 json")), None);
+        assert_eq!(first_question(None), None);
     }
 
     #[test]
